@@ -86,6 +86,7 @@ type ConfirmationInput = {
   baseSha: string;
   gates: unknown;
   budget: unknown;
+  immutableRequest?: unknown;
 };
 
 function canonicalJson(value: unknown): string {
@@ -114,7 +115,7 @@ export function buildConfirmationSummary(input: ConfirmationInput) {
   return Object.freeze({
     ...payload,
     requestHash: createHash("sha256")
-      .update(canonicalJson(payload))
+      .update(canonicalJson(input.immutableRequest ?? payload))
       .digest("hex"),
   });
 }

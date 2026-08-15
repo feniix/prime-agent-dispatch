@@ -50,6 +50,25 @@ test("dispatcher preview binds resolved SHA and immutable request hash", async (
   );
 });
 
+test("confirmed start rejects mutation after the resolved preview", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const preview = await dispatcher.preview(
+    PrimeStartInputSchema.parse({
+      task: "authorized task",
+      repoPath: repo,
+      repoRoots: [root],
+      fixture: true,
+      authorization: { channelId: "local", senderId: "local" },
+    }),
+  );
+  preview.input.task = "mutated after confirmation";
+  await assert.rejects(
+    () => dispatcher.startConfirmed(preview, preview.summary.requestHash),
+    /prepared request changed after preview/,
+  );
+});
+
 test("CLI refuses launch without confirmation and --yes is explicit fixture acceptance", async () => {
   const { root, repo, stateRoot } = await fixture();
   const args = [

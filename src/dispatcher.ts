@@ -59,13 +59,7 @@ export class PrimeDispatcher {
     return {
       input: parsed,
       repository,
-      summary: buildConfirmationSummary({
-        task: parsed.task,
-        canonicalRepoPath: repository.canonicalRepoPath,
-        baseSha: repository.baseSha,
-        gates: parsed.gates,
-        budget: parsed.budget,
-      }),
+      summary: summarizePreparedStart(parsed, repository),
     };
   }
 
@@ -73,7 +67,13 @@ export class PrimeDispatcher {
     prepared: PreparedStart,
     confirmationHash: string,
   ): Promise<{ jobId: string; state: unknown }> {
-    if (prepared.summary.requestHash !== confirmationHash)
+    const currentSummary = summarizePreparedStart(
+      prepared.input,
+      prepared.repository,
+    );
+    if (currentSummary.requestHash !== prepared.summary.requestHash)
+      throw new Error("prepared request changed after preview");
+    if (currentSummary.requestHash !== confirmationHash)
       throw new Error("confirmation hash mismatch; request was not authorized");
     return await this.launch(prepared);
   }
@@ -175,3 +175,17 @@ export type PreparedStart = {
   repository: ResolvedRepository;
   summary: ReturnType<typeof buildConfirmationSummary>;
 };
+
+function summarizePreparedStart(
+  input: PrimeStartInput,
+  repository: ResolvedRepository,
+) {
+  return buildConfirmationSummary({
+    task: input.task,
+    canonicalRepoPath: repository.canonicalRepoPath,
+    baseSha: repository.baseSha,
+    gates: input.gates,
+    budget: input.budget,
+    immutableRequest: { ...input, ...repository },
+  });
+}
