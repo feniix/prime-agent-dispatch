@@ -79,4 +79,6 @@ test("CLI refuses launch without confirmation and --yes is explicit fixture acce
   );
   const launched = await exec(process.execPath, [...args, "--yes"]);
   assert.match(JSON.parse(launched.stdout).jobId, /./);
+  assert.match(launched.stderr, /resolvedRequest/);
+  assert.match(launched.stderr, /requestHash/);
 });

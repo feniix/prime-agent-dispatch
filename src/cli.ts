@@ -97,6 +97,9 @@ async function main(): Promise<void> {
       agent: hostPolicy?.agent ?? { kind: "fake" },
     });
     const preview = await dispatcher.preview(input);
+    process.stderr.write(
+      `${JSON.stringify({ resolvedRequest: preview.summary }, null, 2)}\n`,
+    );
     const suppliedHash = one(parsed.flags, "--confirm-hash");
     const explicitYes = one(parsed.flags, "--yes") === "true";
     if (!explicitYes && !suppliedHash) {
