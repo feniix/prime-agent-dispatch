@@ -56,7 +56,7 @@ A final adversarial review produced additional RED/GREEN slices before integrati
 - Result: trusted `fixture-output` gate passed and a local commit was created as `Prime Dispatch <prime-dispatch@local.invalid>`, unsigned.
 - Remote proof: the configured `https://example.invalid/never-contact.git` remained unchanged; the source checkout remained clean.
 - Cancellation exercise: terminal `cancelled`; broker recorded `abortedUpstreams: 1`; no Prime/worker process remained.
-- Deterministic verification after review remediation: 63 tests passed with the opt-in live test skipped; the real disposable-fixture acceptance also passed after process-quiescence changes.
+- Deterministic verification after review remediation: 65 tests passed with the opt-in live test skipped; the real disposable-fixture acceptance also passed after process-quiescence and two-step confirmation changes.
 
 ## Remaining risks
 
