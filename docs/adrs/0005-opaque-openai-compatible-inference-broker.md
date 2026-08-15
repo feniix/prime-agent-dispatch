@@ -42,7 +42,9 @@ The proxy must pin the upstream and model server-side, forward supported bodies 
 
 ### Confirmation
 
-The prototype currently contains only the `InferenceBackend` contract and an intentionally throwing broker stub. Compliance is not achieved until a live disposable-fixture test proves streaming tool calls, server-side model pinning, token revocation, budget enforcement, and credential non-disclosure. Prime must never be configured against OpenClaw's agent HTTP endpoint.
+The core currently contains only the `InferenceBackend` contract and an intentionally throwing broker stub. The tracked [Codex subscription spike](../../spikes/001-codex-subscription/README.md) validates the critical feasibility seam with Prime Agent `0.7.2`: OpenClaw-resolved OAuth remains in the trusted broker process, Prime receives only a scoped token, `gpt-5.6-sol` with high reasoning completes a streamed tool call, RPC cancellation aborts upstream work, revocation rejects token reuse, and provider credentials do not appear in Prime's environment or files.
+
+The spike broker is not yet integrated with the core or thin OpenClaw adapter. Full compliance still requires integrated cumulative budget enforcement, durable lifecycle control, and the same fixture proof through the installed adapter. Prime must never be configured against OpenClaw's agent HTTP endpoint.
 
 ## More Information
 

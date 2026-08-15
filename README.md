@@ -10,9 +10,11 @@ This is not production-ready. The default execution backend is intentionally nam
 
 The vertical slice validates detached per-job workers, reconnectable Unix-socket control, JSON/Zod state, Git worktrees, structured verification gates, cancellation, local commits, result artifacts, path policy, and a Prime-compatible JSONL RPC subprocess driver.
 
-It does not validate real Prime/model execution because Prime and provider credentials were deliberately absent. It also does not provide filesystem/network containment, worker-death recovery, a safe OpenClaw inference broker, Apple containers, or an installed OpenClaw plugin.
+The original control-plane vertical slice did not validate real Prime/model execution because Prime and provider credentials were deliberately absent from that test suite. It also does not provide filesystem/network containment, worker-death recovery, a production OpenClaw inference broker, Apple containers, or an installed OpenClaw plugin.
 
-Recommendation: retain the interfaces and test evidence, but rewrite/harden the lifecycle for production. The next meaningful experiment is a real Prime fixture run inside an Apple container with a narrow opaque inference proxy.
+Recommendation: retain the interfaces and test evidence, but rewrite/harden the lifecycle for production. The next implementation step is to integrate the validated subscription-broker seam with the OpenClaw adapter and real Prime backend while keeping live use limited to trusted local repositories. Containment remains deferred.
+
+The tracked [Codex subscription spike](spikes/001-codex-subscription/README.md) subsequently validated a real Prime `0.7.2` fixture run through an OpenClaw-authenticated, scoped loopback broker using `gpt-5.6-sol` with high reasoning. That clears the subscription-auth feasibility gate, but it does not make this overall control-plane prototype production-ready or add containment.
 
 ## Scope and architecture
 
@@ -199,7 +201,7 @@ The `unsafe-local` backend is **not a sandbox**. A model-driven process can read
 
 The OpenClaw adapter is a compile-time contract, not an installed plugin. It consumes trusted `channelId`, `requesterSenderId`, owner status, repository roots, fixture policy, and agent selection from the host integration; those values must never come from model tool arguments. Model-supplied attempts to override roots, unsafe-local permission, agent executable, or authorization are stripped by the adapter schema and replaced with policy-owned values.
 
-The inference interface includes an intentionally unsupported `OpenClawOpaqueBrokerBackend`. A future broker must pass through raw OpenAI-compatible streaming/tool calls, pin the upstream/model server-side, issue revocable per-job tokens, enforce cumulative budgets, prevent SSRF, and never expose or log provider credentials. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority.
+The control-plane inference interface still includes an intentionally unsupported `OpenClawOpaqueBrokerBackend`. The tracked subscription spike validates the required raw streaming/tool-call and scoped-token protocol in isolation, but it has not yet been wired into the core or adapter. The integrated broker must pin the upstream/model server-side, issue revocable per-job tokens, enforce cumulative budgets, prevent SSRF, and never expose or log provider credentials. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority.
 
 ## Known limitations
 
@@ -213,11 +215,11 @@ The inference interface includes an intentionally unsupported `OpenClawOpaqueBro
 - Worktrees and branches are intentionally preserved. There is no cleanup command yet.
 - The Apple container backend and opaque inference broker are stubs.
 - Editable Discord status cards are deferred behind `NotificationSink`; only console/no-op sinks exist.
-- No real Prime binary, model endpoint, provider credential, OpenClaw installation, EVP change, network call from a job, or real-repository write was used.
+- The original fake-backend control-plane test suite uses no real Prime binary, model endpoint, provider credential, or job network call. The separate tracked subscription spike exercises real Prime and brokered subscription inference only against a disposable fixture; it makes no EVP change or real-repository write.
 
 ## Production exit criteria
 
-Before adopting this design, add Apple-container confinement, a safe inference proxy, stable worker supervision/recovery, PID-safe leases, external token/cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Then run a real Prime job only against a disposable fixture before considering a deliberately selected real repository.
+Before adopting this design, integrate the validated inference proxy, add stable worker supervision/recovery, PID-safe leases, external token/cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 ## Spike verdict template
 
