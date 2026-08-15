@@ -48,6 +48,9 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   private readonly maxTurns: number;
   private turnsUsed = 0;
   private aborting?: Promise<void>;
+  private acceptingSteer = false;
+  private readonly maxRpcLineBytes = 256 * 1024;
+  private readonly maxTerminalFieldBytes = 64 * 1024;
 
   constructor(options: {
     kind: string;
@@ -87,12 +90,17 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
+    this.acceptingSteer = true;
     this.child.stdout.on("data", (chunk: Buffer) => this.consume(chunk));
     this.child.stderr.on("data", (chunk: Buffer) => {
       this.stderr = (this.stderr + chunk.toString("utf8")).slice(-16_384);
     });
     this.child.on("error", (error) => this.rejectPending(error));
+    this.child.stdin.on("error", (error) => {
+      if (!this.aborting) this.rejectPending(error);
+    });
     this.child.on("exit", (code, signalName) => {
+      this.acceptingSteer = false;
       if (this.pending) {
         this.rejectPending(
           new Error(
@@ -106,7 +114,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     });
     const onAbort = () => void this.abort(this.abortGraceMs);
     signal.addEventListener("abort", onAbort, { once: true });
-    this.send({
+    await this.send({
       id: "initial-prompt",
       type: "prompt",
       message:
@@ -120,8 +128,9 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 
   async steer(message: string): Promise<void> {
-    this.requireChild();
-    this.send({ type: "steer", message });
+    if (!this.acceptingSteer || !this.pending)
+      throw new Error("agent is not accepting steering");
+    await this.send({ type: "steer", message });
   }
 
   async abort(graceMs: number): Promise<void> {
@@ -130,26 +139,17 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 
   private async abortProcess(graceMs: number): Promise<void> {
-    if (!this.child || this.child.exitCode !== null) return;
-    this.send({ type: "abort" });
-    const exited = await Promise.race([
-      new Promise<boolean>((resolve) =>
-        this.child?.once("exit", () => resolve(true)),
-      ),
-      new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), graceMs),
-      ),
-    ]);
-    if (!exited) await this.terminateProcessTree("SIGTERM");
-    const terminated = await Promise.race([
-      new Promise<boolean>((resolve) =>
-        this.child?.once("exit", () => resolve(true)),
-      ),
-      new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), Math.min(graceMs, 1_000)),
-      ),
-    ]);
-    if (!terminated) await this.terminateProcessTree("SIGKILL");
+    this.acceptingSteer = false;
+    if (!this.child) return;
+    if (this.isChildRunning())
+      await this.send({ type: "abort" }).catch(() => undefined);
+    await this.waitForExit(graceMs);
+    await this.terminateProcessTree("SIGTERM");
+    if (!(await this.waitForProcessTreeExit(Math.min(graceMs, 1_000)))) {
+      await this.terminateProcessTree("SIGKILL");
+      if (!(await this.waitForProcessTreeExit(1_000)))
+        throw new Error("agent process tree did not exit after SIGKILL");
+    }
   }
 
   async dispose(): Promise<void> {
@@ -157,20 +157,36 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 
   private requireChild(): ChildProcessWithoutNullStreams {
-    if (!this.child || this.child.exitCode !== null)
+    if (!this.child || !this.isChildRunning())
       throw new Error("agent process is not running");
     return this.child;
   }
 
-  private send(message: Record<string, unknown>): void {
-    this.requireChild().stdin.write(`${JSON.stringify(message)}\n`);
+  private async send(message: Record<string, unknown>): Promise<void> {
+    const child = this.requireChild();
+    await new Promise<void>((resolve, reject) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`, (error) =>
+        error ? reject(error) : resolve(),
+      );
+    });
   }
 
   private consume(chunk: Buffer): void {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     while (true) {
       const lf = this.buffer.indexOf(0x0a);
-      if (lf < 0) return;
+      if (lf < 0) {
+        if (this.buffer.length > this.maxRpcLineBytes) {
+          this.rejectPending(new Error("agent RPC line exceeded input limit"));
+          void this.abort(this.abortGraceMs);
+        }
+        return;
+      }
+      if (lf > this.maxRpcLineBytes) {
+        this.rejectPending(new Error("agent RPC line exceeded input limit"));
+        void this.abort(this.abortGraceMs);
+        return;
+      }
       const line = this.buffer.subarray(0, lf).toString("utf8");
       this.buffer = this.buffer.subarray(lf + 1);
       if (!line) continue;
@@ -184,18 +200,20 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
         return;
       }
       if (envelope.type === "agent_end") {
-        const summary =
+        this.acceptingSteer = false;
+        const unboundedSummary =
           typeof envelope.data?.lastAssistantText === "string"
             ? envelope.data.lastAssistantText
             : typeof envelope.data?.summary === "string"
               ? envelope.data.summary
               : (extractLastAssistantText(envelope.messages) ??
                 "Prime RPC run ended");
-        this.pending?.resolve({
-          summary,
-          metadata: { ...(envelope.data ?? {}), turnsUsed: this.turnsUsed },
-        });
-        this.pending = undefined;
+        const summary = boundUtf8(unboundedSummary, this.maxTerminalFieldBytes);
+        const metadata = boundMetadata(
+          { ...(envelope.data ?? {}), turnsUsed: this.turnsUsed },
+          this.maxTerminalFieldBytes,
+        );
+        void this.finishPending({ summary, metadata });
       } else if (envelope.type === "turn_start") {
         this.turnsUsed += 1;
         if (this.turnsUsed > this.maxTurns) {
@@ -212,8 +230,58 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 
   private rejectPending(error: unknown): void {
+    this.acceptingSteer = false;
     this.pending?.reject(error);
     this.pending = undefined;
+  }
+
+  private async finishPending(result: AgentRunResult): Promise<void> {
+    const pending = this.pending;
+    if (!pending) return;
+    this.pending = undefined;
+    try {
+      await this.abort(this.abortGraceMs);
+      pending.resolve(result);
+    } catch (error) {
+      pending.reject(error);
+    }
+  }
+
+  private isChildRunning(): boolean {
+    return this.child?.exitCode === null && this.child.signalCode === null;
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (!this.isChildRunning()) return true;
+    return await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      this.child?.once("exit", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+      if (!this.isChildRunning()) {
+        clearTimeout(timer);
+        resolve(true);
+      }
+    });
+  }
+
+  private processTreeExists(): boolean {
+    if (!this.child?.pid) return false;
+    if (process.platform === "win32") return this.isChildRunning();
+    try {
+      process.kill(-this.child.pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  private async waitForProcessTreeExit(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.processTreeExists() && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    return !this.processTreeExists();
   }
 
   private async terminateProcessTree(signal: NodeJS.Signals): Promise<void> {
@@ -225,6 +293,26 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
   }
+}
+
+function boundUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  return bytes.length <= maxBytes
+    ? value
+    : bytes.subarray(0, maxBytes).toString("utf8");
+}
+
+function boundMetadata(
+  value: Record<string, unknown>,
+  maxBytes: number,
+): Record<string, unknown> {
+  const encoded = JSON.stringify(value);
+  if (Buffer.byteLength(encoded) <= maxBytes) return value;
+  return {
+    truncated: true,
+    originalBytes: Buffer.byteLength(encoded),
+    turnsUsed: value.turnsUsed,
+  };
 }
 
 function extractLastAssistantText(messages: unknown): string | undefined {
