@@ -126,3 +126,59 @@ test("CLI refuses launch without confirmation and --yes is explicit fixture acce
   assert.match(launched.stderr, /resolvedRequest/);
   assert.match(launched.stderr, /requestHash/);
 });
+
+test("CLI rejects --yes for host-configured real Prime jobs", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const hostConfig = join(root, "host.json");
+  await writeFile(
+    hostConfig,
+    JSON.stringify({
+      schemaVersion: 1,
+      repoRoots: [root],
+      prime: {
+        executable: "/trusted/prime.js",
+        releaseArtifact: "/trusted/prime.tgz",
+      },
+      repositories: [
+        {
+          path: repo,
+          fixture: true,
+          gates: [
+            {
+              name: "test",
+              command: "/usr/bin/true",
+              args: [],
+              timeoutMs: 1000,
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  await assert.rejects(
+    () =>
+      exec(process.execPath, [
+        cli,
+        "start",
+        "--state-root",
+        stateRoot,
+        "--host-config",
+        hostConfig,
+        "--agent",
+        "prime",
+        "--task",
+        "fixture",
+        "--repo",
+        repo,
+        "--channel",
+        "local",
+        "--sender",
+        "local",
+        "--yes",
+      ]),
+    (error) => {
+      assert.match(error.stderr, /--yes is limited to fake fixture jobs/);
+      return true;
+    },
+  );
+});

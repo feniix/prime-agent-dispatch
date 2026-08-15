@@ -192,14 +192,16 @@ export class PrimeDispatcher {
     const state = await this.store.readState(jobId);
     if (!state.socketPath)
       throw new Error("job worker socket is not available");
+    const request = await this.store.readRequest(jobId);
     return await sendWorkerCommand(
       state.socketPath,
       { operation: "prime_cancel", jobId },
-      10_000,
+      request.budget.cancellationGraceMs + 2_500,
     );
   }
 
   async result(jobId: string): Promise<unknown> {
+    await this.status(jobId);
     return await this.store.readResult(jobId);
   }
 }

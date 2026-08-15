@@ -81,7 +81,7 @@ async function main(): Promise<void> {
       ...(one(parsed.flags, "--base")
         ? { baseRef: one(parsed.flags, "--base") }
         : {}),
-      fixture: one(parsed.flags, "--fixture") === "true",
+      fixture: hostPolicy?.fixture ?? one(parsed.flags, "--fixture") === "true",
       unsafeAllowLiveRepo:
         one(parsed.flags, "--unsafe-allow-live-repo") === "true",
       gates: hostPolicy?.gates ?? callerGates,
@@ -102,6 +102,10 @@ async function main(): Promise<void> {
     );
     const suppliedHash = one(parsed.flags, "--confirm-hash");
     const explicitYes = one(parsed.flags, "--yes") === "true";
+    if (explicitYes && input.agent.kind !== "fake")
+      throw new Error(
+        "--yes is limited to fake fixture jobs; real Prime requires a reviewed --confirm-hash",
+      );
     if (!explicitYes && !suppliedHash) {
       throw new Error(
         `confirmation required; review this immutable resolved request and rerun with --confirm-hash ${preview.summary.requestHash}:\n${JSON.stringify(preview.summary, null, 2)}`,

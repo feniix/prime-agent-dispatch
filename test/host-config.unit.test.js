@@ -22,6 +22,7 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
       repositories: [
         {
           path: repo,
+          fixture: true,
           gates: [
             {
               name: "test",
@@ -42,9 +43,46 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
     releaseArtifact: "/trusted/prime.tgz",
   });
   assert.equal(policy.gates[0].command, "/usr/bin/test");
+  assert.equal(policy.fixture, true);
   assert.deepEqual(policy.repoRoots, [root]);
   await assert.rejects(
     () => resolveHostRepositoryPolicy(config, join(root, "not-configured")),
     /not present in trusted host configuration/,
   );
+});
+
+test("trusted host config defaults repositories to non-fixtures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-host-config-live-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  const path = join(root, "host.json");
+  await writeFile(
+    path,
+    JSON.stringify({
+      schemaVersion: 1,
+      repoRoots: [root],
+      prime: {
+        executable: "/trusted/prime.js",
+        releaseArtifact: "/trusted/prime.tgz",
+      },
+      repositories: [
+        {
+          path: repo,
+          gates: [
+            {
+              name: "test",
+              command: "/usr/bin/true",
+              args: [],
+              timeoutMs: 1000,
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  const policy = await resolveHostRepositoryPolicy(
+    await loadHostConfig(path),
+    repo,
+  );
+  assert.equal(policy.fixture, false);
 });

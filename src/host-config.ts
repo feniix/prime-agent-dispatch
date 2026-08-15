@@ -14,6 +14,7 @@ export const HostConfigSchema = z
       .array(
         z.object({
           path: z.string().min(1),
+          fixture: z.boolean().default(false),
           gates: z.array(GateSchema).min(1),
         }),
       )
@@ -38,6 +39,7 @@ export async function resolveHostRepositoryPolicy(
     if (configured === canonicalRepo) {
       return {
         repoRoots: [...config.repoRoots],
+        fixture: repository.fixture,
         gates: repository.gates,
         agent: {
           kind: "prime-rpc" as const,

@@ -61,6 +61,7 @@ test(
           repositories: [
             {
               path: repo,
+              fixture: true,
               gates: [
                 {
                   name: "fixture-output",
@@ -77,7 +78,7 @@ test(
       )}\n`,
       { mode: 0o600 },
     );
-    const started = await exec(process.execPath, [
+    const startArgs = [
       cli,
       "start",
       "--state-root",
@@ -92,10 +93,24 @@ test(
       "local-acceptance",
       "--sender",
       "owner",
-      "--fixture",
       "--wall-clock-ms",
       "300000",
-      "--yes",
+    ];
+    let confirmationHash;
+    await assert.rejects(
+      () => exec(process.execPath, startArgs),
+      (error) => {
+        confirmationHash = /--confirm-hash ([0-9a-f]{64})/.exec(
+          error.stderr,
+        )?.[1];
+        assert.match(confirmationHash ?? "", /^[0-9a-f]{64}$/);
+        return true;
+      },
+    );
+    const started = await exec(process.execPath, [
+      ...startArgs,
+      "--confirm-hash",
+      confirmationHash,
     ]);
     const { jobId } = JSON.parse(started.stdout);
     const dispatcher = new PrimeDispatcher(stateRoot);
