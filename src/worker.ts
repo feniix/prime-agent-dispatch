@@ -14,6 +14,7 @@ import {
 } from "./schemas.js";
 import { terminalStatuses } from "./state-machine.js";
 import { git, runCommand } from "./process.js";
+import { GlobalJobLease } from "./lease.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -288,6 +289,7 @@ async function main(): Promise<void> {
       (resolve) => server?.close(() => resolve()) ?? resolve(),
     );
     await rm(socketPath, { force: true });
+    await new GlobalJobLease(stateRoot).release(jobId).catch(() => undefined);
   }
 }
 

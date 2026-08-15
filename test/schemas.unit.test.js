@@ -27,6 +27,8 @@ test("prime_start applies bounded defaults", () => {
     wallClockMs: 1_200_000,
     cancellationGraceMs: 2_000,
     maxOutputBytes: 1_000_000,
+    maxTokens: 250_000,
+    maxTurns: 50,
   });
 });
 

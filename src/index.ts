@@ -2,6 +2,7 @@ export * from "./agent.js";
 export * from "./dispatcher.js";
 export * from "./execution.js";
 export * from "./inference.js";
+export * from "./lease.js";
 export * from "./notifications.js";
 export * from "./openclaw-adapter.js";
 export * from "./policy.js";

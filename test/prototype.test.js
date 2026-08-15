@@ -175,6 +175,38 @@ test("a fresh CLI process reconnects to a surviving worker for steer and cancel"
   assert.equal((await dispatcher.result(jobId)).status, "cancelled");
 });
 
+test("dispatcher enforces one active job globally and releases after terminal state", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const first = await dispatcher.start(input(repo, root, "SLOW lease holder"));
+  await waitFor(dispatcher, first.jobId, (value) => value.status === "running");
+  await assert.rejects(
+    () => dispatcher.start(input(repo, root, "must wait")),
+    /active job already holds global lease/,
+  );
+  await dispatcher.cancel(first.jobId);
+  await waitFor(
+    dispatcher,
+    first.jobId,
+    (value) => value.status === "cancelled",
+  );
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      const second = await dispatcher.start(input(repo, root, "after release"));
+      await waitFor(
+        dispatcher,
+        second.jobId,
+        (value) => value.status === "succeeded",
+      );
+      return;
+    } catch (error) {
+      if (!String(error).includes("active job already holds")) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  assert.fail("global lease was not released after terminal state");
+});
+
 test("the external wall-clock budget aborts a slow agent", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
