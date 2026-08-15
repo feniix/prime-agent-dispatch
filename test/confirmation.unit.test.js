@@ -70,6 +70,30 @@ test("confirmed start rejects mutation after the resolved preview", async () => 
   );
 });
 
+test("confirmed start launches an internal snapshot across await boundaries", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const preview = await dispatcher.preview(
+    PrimeStartInputSchema.parse({
+      task: "authorized snapshot",
+      repoPath: repo,
+      repoRoots: [root],
+      fixture: true,
+      authorization: { channelId: "local", senderId: "local" },
+    }),
+  );
+  const launching = dispatcher.startConfirmed(
+    preview,
+    preview.summary.requestHash,
+  );
+  preview.input.task = "mutated while lease acquisition yielded";
+  const started = await launching;
+  assert.equal(
+    (await dispatcher.store.readRequest(started.jobId)).task,
+    "authorized snapshot",
+  );
+});
+
 test("CLI refuses launch without confirmation and --yes is explicit fixture acceptance", async () => {
   const { root, repo, stateRoot } = await fixture();
   const args = [

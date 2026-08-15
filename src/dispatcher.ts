@@ -60,15 +60,14 @@ export class PrimeDispatcher {
     prepared: PreparedStart,
     confirmationHash: string,
   ): Promise<{ jobId: string; state: unknown }> {
-    const currentSummary = summarizePreparedStart(
-      prepared.input,
-      prepared.repository,
-    );
+    const input = PrimeStartInputSchema.parse(prepared.input);
+    const repository = { ...prepared.repository };
+    const currentSummary = summarizePreparedStart(input, repository);
     if (currentSummary.requestHash !== prepared.summary.requestHash)
       throw new Error("prepared request changed after preview");
     if (currentSummary.requestHash !== confirmationHash)
       throw new Error("confirmation hash mismatch; request was not authorized");
-    return await this.launch(prepared);
+    return await this.launch({ input, repository, summary: currentSummary });
   }
 
   private async launch(
