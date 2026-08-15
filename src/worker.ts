@@ -240,8 +240,11 @@ async function main(): Promise<void> {
     }
     assertJobActive();
     agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
-    const agentResult = await agent
-      .start(request.task, execution.worktreePath, controller.signal);
+    const agentResult = await agent.start(
+      request.task,
+      execution.worktreePath,
+      controller.signal,
+    );
     assertJobActive();
     await store.appendEvent(jobId, "agent_completed", {
       summary: agentResult.summary,

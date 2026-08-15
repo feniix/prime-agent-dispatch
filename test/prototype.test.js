@@ -348,8 +348,7 @@ test("event reader ignores only a partial final JSONL record and rejects middle 
   await waitForEvent(
     dispatcher.store,
     started.jobId,
-    (event) =>
-      event.type === "state_changed" && event.data.to === "succeeded",
+    (event) => event.type === "state_changed" && event.data.to === "succeeded",
   );
   const path = join(stateRoot, "jobs", started.jobId, "events.jsonl");
   const count = (await dispatcher.store.readEvents(started.jobId)).length;

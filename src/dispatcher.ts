@@ -111,7 +111,8 @@ export class PrimeDispatcher {
       closeSync(logFd);
       let spawnError: Error | undefined;
       child.once("error", (error) => (spawnError = error));
-      if (!child.pid) throw new Error("job worker did not receive a process id");
+      if (!child.pid)
+        throw new Error("job worker did not receive a process id");
       const startupDeadline = Date.now() + 5_000;
       while (Date.now() < startupDeadline) {
         const current = await this.store.readState(jobId);
