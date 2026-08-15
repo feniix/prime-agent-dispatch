@@ -268,8 +268,10 @@ export class ProductionInferenceBroker implements InferenceBackend {
         this.counters.sawToolCallEvent ||=
           /"type"\s*:\s*"(?:function_call|custom_tool_call)"/.test(observed);
       }
+      let responseTokens = 0;
       for (const match of observed.matchAll(/"total_tokens"\s*:\s*(\d+)/g))
-        lease.usedTokens = Math.max(lease.usedTokens, Number(match[1]));
+        responseTokens = Math.max(responseTokens, Number(match[1]));
+      lease.usedTokens += responseTokens;
       response.end();
     } catch (error) {
       if (!response.headersSent)

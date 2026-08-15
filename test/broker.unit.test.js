@@ -173,3 +173,41 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
   await broker.close();
   await fake.close();
 });
+
+test("broker accumulates observable token usage across Responses calls", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"response":{"usage":{"total_tokens":3}}}\n\n');
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("cumulative", {
+    wallClockMs: 1000,
+    maxTokens: 5,
+  });
+  const options = {
+    method: "POST",
+    headers: { authorization: `Bearer ${lease.opaqueToken}` },
+    body: "{}",
+  };
+  try {
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      429,
+    );
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
