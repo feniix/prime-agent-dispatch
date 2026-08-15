@@ -170,7 +170,10 @@ test("terminal intent reconciles a durable result after a worker crash window", 
     gateResults: [],
     completedAt: new Date().toISOString(),
   });
-  const state = await new PrimeDispatcher(root).status(jobId);
+  const dispatcher = new PrimeDispatcher(root);
+  const result = await dispatcher.result(jobId);
+  assert.equal(result.status, "succeeded");
+  const state = await dispatcher.store.readState(jobId);
   assert.equal(state.status, "succeeded");
   assert.equal(state.terminalIntentStatus, undefined);
 });
