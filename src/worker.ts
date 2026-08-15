@@ -19,6 +19,10 @@ import { ProductionInferenceBroker, type InferenceLease } from "./inference.js";
 import { resolveCodexSubscriptionAuth } from "./openclaw-auth.js";
 import { verifyPrimeInstallation } from "./release.js";
 import { writePrimeModelsConfig } from "./prime-runtime.js";
+import {
+  buildRemoteInertGitEnvironment,
+  installRemoteInertGitGuard,
+} from "./policy.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -146,6 +150,7 @@ async function main(): Promise<void> {
           configDir: string;
           sessionDir: string;
           tmpDir: string;
+          path: string;
         }
       | undefined;
     if (request.agent.kind === "prime-rpc") {
@@ -189,7 +194,12 @@ async function main(): Promise<void> {
         brokerBaseUrl: inferenceLease.endpoint.toString(),
         scopedToken: inferenceLease.opaqueToken,
       });
-      primeRuntime = { homeDir, configDir, sessionDir, tmpDir };
+      const path = await installRemoteInertGitGuard(
+        join(store.jobDir(jobId), "artifacts", "prime-agent", "bin"),
+        "/usr/bin/git",
+        process.env.PATH ?? "/usr/bin:/bin",
+      );
+      primeRuntime = { homeDir, configDir, sessionDir, tmpDir, path };
     }
     agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
     const controller = new AbortController();
@@ -236,6 +246,7 @@ async function main(): Promise<void> {
     for (const gate of request.gates) {
       const command = await runCommand(gate.command, gate.args, {
         cwd: execution.worktreePath,
+        env: buildRemoteInertGitEnvironment(),
         timeoutMs: gate.timeoutMs,
         maxOutputBytes: request.budget.maxOutputBytes,
       });
@@ -271,9 +282,11 @@ async function main(): Promise<void> {
     if (!noChanges) {
       await git(execution.worktreePath, [
         "-c",
-        "user.name=Prime Dispatch Prototype",
+        "user.name=Prime Dispatch",
         "-c",
         "user.email=prime-dispatch@local.invalid",
+        "-c",
+        "commit.gpgsign=false",
         "commit",
         "-m",
         `prime dispatch ${jobId}`,

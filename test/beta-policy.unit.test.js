@@ -9,6 +9,7 @@ import {
   buildConfirmationSummary,
   buildPrimeEnvironment,
   buildRemoteInertGitEnvironment,
+  installRemoteInertGitGuard,
   verifyPrimeRelease,
 } from "../dist/index.js";
 
@@ -30,6 +31,33 @@ test("Prime release is pinned and checksum verified", async () => {
     PRIME_AGENT_SHA256,
     "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
   );
+});
+
+test("Git guard rejects fetch, pull, and push while allowing local operations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-git-guard-"));
+  const bin = join(root, "bin");
+  const guardedPath = await installRemoteInertGitGuard(bin, "/usr/bin/git");
+  const local = await new Promise((resolve) => {
+    import("node:child_process").then(({ execFile }) =>
+      execFile(join(bin, "git"), ["--version"], (error, stdout, stderr) =>
+        resolve({ error, stdout, stderr }),
+      ),
+    );
+  });
+  assert.equal(local.error, null);
+  assert.match(local.stdout, /git version/);
+  const remote = await new Promise((resolve) => {
+    import("node:child_process").then(({ execFile }) =>
+      execFile(
+        join(bin, "git"),
+        ["push", "origin", "main"],
+        (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+      ),
+    );
+  });
+  assert.notEqual(remote.error, null);
+  assert.match(remote.stderr, /remote Git operations are disabled/);
+  assert.equal(guardedPath, `${bin}:/usr/bin:/bin`);
 });
 
 test("Prime gets a job-private root-only scrubbed environment", () => {

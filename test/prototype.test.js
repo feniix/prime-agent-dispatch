@@ -96,6 +96,16 @@ test("happy path creates a worktree, passes gates, commits, and records root-onl
     (value) => value.status === "succeeded",
   );
   assert.match(state.commitSha, /^[0-9a-f]{40}$/);
+  assert.equal(
+    await git(
+      state.worktreePath,
+      "show",
+      "-s",
+      "--format=%an <%ae>|%G?",
+      "HEAD",
+    ),
+    "Prime Dispatch <prime-dispatch@local.invalid>|N",
+  );
   assert.equal(state.noChanges, false);
   assert.equal(
     await readFile(join(state.worktreePath, "prototype-output.txt"), "utf8"),
@@ -131,6 +141,7 @@ test("a fresh CLI process reconnects to a surviving worker for steer and cancel"
     "--sender",
     "test-sender",
     "--fixture",
+    "--yes",
     "--wall-clock-ms",
     "10000",
   ]);

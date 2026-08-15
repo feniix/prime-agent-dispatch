@@ -227,6 +227,7 @@ export function createAgentBackend(
     configDir: string;
     sessionDir: string;
     tmpDir: string;
+    path: string;
   },
 ): AgentBackend {
   const codingAgentDir = `${jobDir}/artifacts/prime-agent`;
@@ -250,7 +251,7 @@ export function createAgentBackend(
       configDir: primeRuntime.configDir,
       sessionDir: primeRuntime.sessionDir,
       tmpDir: primeRuntime.tmpDir,
-      path: process.env.PATH ?? "/usr/bin:/bin",
+      path: primeRuntime.path,
     }),
   });
 }

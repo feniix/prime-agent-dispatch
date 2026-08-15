@@ -14,6 +14,8 @@ import { resolveRepository } from "./repository.js";
 import { sendWorkerCommand } from "./ipc.js";
 import { terminalStatuses } from "./state-machine.js";
 import { GlobalJobLease } from "./lease.js";
+import { buildConfirmationSummary } from "./policy.js";
+import type { ResolvedRepository } from "./repository.js";
 
 function processExists(pid: number): boolean {
   try {
@@ -43,12 +45,43 @@ export class PrimeDispatcher {
   async start(
     input: PrimeStartInput,
   ): Promise<{ jobId: string; state: unknown }> {
+    const prepared = await this.preview(input);
+    return await this.launch(prepared);
+  }
+
+  async preview(input: PrimeStartInput): Promise<PreparedStart> {
     const parsed = PrimeStartInputSchema.parse(input);
     const repository = await resolveRepository(
       parsed.repoPath,
       parsed.repoRoots,
       parsed.baseRef,
     );
+    return {
+      input: parsed,
+      repository,
+      summary: buildConfirmationSummary({
+        task: parsed.task,
+        canonicalRepoPath: repository.canonicalRepoPath,
+        baseSha: repository.baseSha,
+        gates: parsed.gates,
+        budget: parsed.budget,
+      }),
+    };
+  }
+
+  async startConfirmed(
+    prepared: PreparedStart,
+    confirmationHash: string,
+  ): Promise<{ jobId: string; state: unknown }> {
+    if (prepared.summary.requestHash !== confirmationHash)
+      throw new Error("confirmation hash mismatch; request was not authorized");
+    return await this.launch(prepared);
+  }
+
+  private async launch(
+    prepared: PreparedStart,
+  ): Promise<{ jobId: string; state: unknown }> {
+    const { input: parsed, repository } = prepared;
     const jobId = createJobId();
     const lease = new GlobalJobLease(this.stateRoot);
     await lease.acquire(jobId);
@@ -132,3 +165,9 @@ export class PrimeDispatcher {
     return await this.store.readResult(jobId);
   }
 }
+
+export type PreparedStart = {
+  input: PrimeStartInput;
+  repository: ResolvedRepository;
+  summary: ReturnType<typeof buildConfirmationSummary>;
+};

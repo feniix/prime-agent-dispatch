@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export const PRIME_MODEL = "gpt-5.6-sol" as const;
 export const PRIME_REASONING_EFFORT = "high" as const;
@@ -13,9 +15,7 @@ export function buildPrimeEnvironment(options: {
   sessionDir?: string;
 }): NodeJS.ProcessEnv {
   return {
-    PATH: options.path,
-    LANG: "C.UTF-8",
-    LC_ALL: "C.UTF-8",
+    ...buildRemoteInertGitEnvironment({ PATH: options.path }),
     HOME: options.jobHome,
     TMPDIR: options.tmpDir,
     PRIME_AGENT_CODING_AGENT_DIR: options.configDir ?? options.jobHome,
@@ -29,6 +29,29 @@ export function buildPrimeEnvironment(options: {
       : {}),
     ...(options.brokerToken ? { OPENAI_API_KEY: options.brokerToken } : {}),
   };
+}
+
+export async function installRemoteInertGitGuard(
+  binDir: string,
+  gitExecutable = "/usr/bin/git",
+  basePath = "/usr/bin:/bin",
+): Promise<string> {
+  await mkdir(binDir, { recursive: true, mode: 0o700 });
+  const path = join(binDir, "git");
+  const script = `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+if (args.some((value) => ["fetch", "pull", "push"].includes(value))) {
+  process.stderr.write("prime-dispatch: remote Git operations are disabled\\n");
+  process.exit(73);
+}
+const result = spawnSync(${JSON.stringify(gitExecutable)}, args, { stdio: "inherit" });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`;
+  await writeFile(path, script, { mode: 0o700 });
+  await chmod(path, 0o700);
+  return `${binDir}:${basePath}`;
 }
 
 export function buildRemoteInertGitEnvironment(
