@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { chmod, mkdir, realpath, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative } from "node:path";
 import { runCommand } from "./process.js";
 
 export const PRIME_AGENT_VERSION = "0.7.2" as const;
@@ -79,97 +77,4 @@ export async function verifyPrimeInstallation(options: {
     throw new Error(
       `Prime Agent version mismatch: expected ${PRIME_AGENT_VERSION}, got ${version || "no version"}`,
     );
-}
-
-export async function prepareVerifiedPrimeRuntime(options: {
-  artifactPath: string;
-  runtimeDir: string;
-  expectedSha256?: string;
-  expectedExecutableSha256?: string;
-  signal?: AbortSignal;
-  terminationGraceMs?: number;
-}): Promise<{ runtimeRoot: string; executablePath: string }> {
-  await verifyPrimeRelease({
-    artifactPath: options.artifactPath,
-    expectedVersion: PRIME_AGENT_VERSION,
-    expectedSha256: options.expectedSha256 ?? PRIME_AGENT_SHA256,
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
-  const listing = await runCommand(
-    "/usr/bin/tar",
-    ["-tzf", options.artifactPath],
-    {
-      timeoutMs: 30_000,
-      maxOutputBytes: 4 * 1024 * 1024,
-      ...(options.signal ? { signal: options.signal } : {}),
-      ...(options.terminationGraceMs !== undefined
-        ? { terminationGraceMs: options.terminationGraceMs }
-        : {}),
-    },
-  );
-  if (listing.exitCode !== 0 || listing.timedOut || listing.aborted)
-    throw new Error(
-      `could not inspect verified Prime archive: ${listing.stderr.trim()}`,
-    );
-  for (const entry of listing.stdout.split("\n").filter(Boolean)) {
-    if (isAbsolute(entry) || entry.split("/").includes(".."))
-      throw new Error(`unsafe path in verified Prime archive: ${entry}`);
-  }
-
-  await rm(options.runtimeDir, { recursive: true, force: true });
-  await mkdir(options.runtimeDir, { recursive: true, mode: 0o700 });
-  await chmod(options.runtimeDir, 0o700);
-  try {
-    const extraction = await runCommand(
-      "/usr/bin/tar",
-      ["-xzf", options.artifactPath, "-C", options.runtimeDir],
-      {
-        timeoutMs: 60_000,
-        maxOutputBytes: 64 * 1024,
-        ...(options.signal ? { signal: options.signal } : {}),
-        ...(options.terminationGraceMs !== undefined
-          ? { terminationGraceMs: options.terminationGraceMs }
-          : {}),
-      },
-    );
-    if (extraction.exitCode !== 0 || extraction.timedOut || extraction.aborted)
-      throw new Error(
-        `could not extract verified Prime archive: ${extraction.stderr.trim()}`,
-      );
-    const executablePath = join(
-      options.runtimeDir,
-      "package",
-      "dist",
-      "bundle",
-      "cli.js",
-    );
-    const resolvedRoot = await realpath(options.runtimeDir);
-    const resolvedExecutable = await realpath(executablePath);
-    const executableRelative = relative(resolvedRoot, resolvedExecutable);
-    if (
-      executableRelative.startsWith("..") ||
-      isAbsolute(executableRelative) ||
-      dirname(resolvedExecutable) !==
-        join(resolvedRoot, "package", "dist", "bundle")
-    )
-      throw new Error("verified Prime executable escaped its private runtime");
-    await verifyPrimeInstallation({
-      artifactPath: options.artifactPath,
-      executablePath: resolvedExecutable,
-      ...(options.expectedSha256
-        ? { expectedSha256: options.expectedSha256 }
-        : {}),
-      ...(options.expectedExecutableSha256
-        ? { expectedExecutableSha256: options.expectedExecutableSha256 }
-        : {}),
-      ...(options.signal ? { signal: options.signal } : {}),
-      ...(options.terminationGraceMs !== undefined
-        ? { terminationGraceMs: options.terminationGraceMs }
-        : {}),
-    });
-    return { runtimeRoot: resolvedRoot, executablePath: resolvedExecutable };
-  } catch (error) {
-    await rm(options.runtimeDir, { recursive: true, force: true });
-    throw error;
-  }
 }
