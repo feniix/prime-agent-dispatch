@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import {
   PRIME_AGENT_SHA256,
   PRIME_AGENT_VERSION,
@@ -12,6 +15,8 @@ import {
   installRemoteInertGitGuard,
   verifyPrimeRelease,
 } from "../dist/index.js";
+
+const exec = promisify(execFile);
 
 test("Prime release is pinned and checksum verified", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-release-"));
@@ -33,7 +38,7 @@ test("Prime release is pinned and checksum verified", async () => {
   );
 });
 
-test("Git guard rejects fetch, pull, and push while allowing local operations", async () => {
+test("Git guard rejects remote-capable commands while allowing local operations", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-git-guard-"));
   const bin = join(root, "bin");
   const guardedPath = await installRemoteInertGitGuard(bin, "/usr/bin/git");
@@ -46,18 +51,49 @@ test("Git guard rejects fetch, pull, and push while allowing local operations", 
   });
   assert.equal(local.error, null);
   assert.match(local.stdout, /git version/);
-  const remote = await new Promise((resolve) => {
-    import("node:child_process").then(({ execFile }) =>
-      execFile(
-        join(bin, "git"),
-        ["push", "origin", "main"],
-        (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+  for (const command of [
+    "clone",
+    "fetch",
+    "fetch-pack",
+    "ls-remote",
+    "pull",
+    "push",
+    "remote",
+    "send-pack",
+    "submodule",
+  ]) {
+    await assert.rejects(
+      () => exec(join(bin, "git"), [command]),
+      (error) => {
+        assert.match(error.stderr, /remote Git operations are disabled/);
+        return true;
+      },
+    );
+  }
+  assert.equal(guardedPath, `${bin}:/usr/bin:/bin`);
+});
+
+test("Git environment blocks transports even when the wrapper is bypassed", async () => {
+  let contacted = false;
+  const server = createServer((_request, response) => {
+    contacted = true;
+    response.writeHead(200);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  try {
+    await assert.rejects(() =>
+      exec(
+        "/usr/bin/git",
+        ["ls-remote", `http://127.0.0.1:${address.port}/repository`],
+        { env: buildRemoteInertGitEnvironment() },
       ),
     );
-  });
-  assert.notEqual(remote.error, null);
-  assert.match(remote.stderr, /remote Git operations are disabled/);
-  assert.equal(guardedPath, `${bin}:/usr/bin:/bin`);
+    assert.equal(contacted, false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("Prime gets a job-private root-only scrubbed environment", () => {
@@ -87,10 +123,12 @@ test("Git child environment disables prompts, credential helpers, and pushes", (
   const env = buildRemoteInertGitEnvironment({ PATH: "/usr/bin:/bin" });
   assert.equal(env.GIT_TERMINAL_PROMPT, "0");
   assert.equal(env.GIT_ASKPASS, "/usr/bin/false");
-  assert.equal(env.GIT_CONFIG_COUNT, "4");
+  assert.equal(env.GIT_CONFIG_COUNT, "5");
   assert.equal(env.GIT_CONFIG_KEY_0, "credential.helper");
   assert.equal(env.GIT_CONFIG_KEY_2, "remote.origin.pushurl");
   assert.match(env.GIT_CONFIG_VALUE_2, /^disabled:/);
+  assert.equal(env.GIT_CONFIG_KEY_4, "protocol.allow");
+  assert.equal(env.GIT_CONFIG_VALUE_4, "never");
   assert.equal(env.SSH_AUTH_SOCK, undefined);
 });
 

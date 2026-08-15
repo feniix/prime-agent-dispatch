@@ -41,7 +41,20 @@ export async function installRemoteInertGitGuard(
   const script = `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
-if (args.some((value) => ["fetch", "pull", "push"].includes(value))) {
+const remoteCommands = new Set([
+  "clone",
+  "fetch",
+  "fetch-pack",
+  "http-fetch",
+  "http-push",
+  "ls-remote",
+  "pull",
+  "push",
+  "remote",
+  "send-pack",
+  "submodule",
+]);
+if (args.some((value) => remoteCommands.has(value))) {
   process.stderr.write("prime-dispatch: remote Git operations are disabled\\n");
   process.exit(73);
 }
@@ -68,7 +81,7 @@ export function buildRemoteInertGitEnvironment(
     GIT_SSH_COMMAND:
       "ssh -o BatchMode=yes -o IdentityAgent=none -o IdentitiesOnly=yes",
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_COUNT: "4",
+    GIT_CONFIG_COUNT: "5",
     GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
     GIT_CONFIG_KEY_1: "commit.gpgsign",
@@ -77,6 +90,8 @@ export function buildRemoteInertGitEnvironment(
     GIT_CONFIG_VALUE_2: "disabled://prime-dispatch/no-remote",
     GIT_CONFIG_KEY_3: "push.default",
     GIT_CONFIG_VALUE_3: "nothing",
+    GIT_CONFIG_KEY_4: "protocol.allow",
+    GIT_CONFIG_VALUE_4: "never",
   };
 }
 
