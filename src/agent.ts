@@ -45,6 +45,8 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   private readonly codingAgentDir: string;
   private readonly environment: NodeJS.ProcessEnv | undefined;
   private readonly abortGraceMs: number;
+  private readonly maxTurns: number;
+  private turnsUsed = 0;
   private aborting?: Promise<void>;
 
   constructor(options: {
@@ -54,6 +56,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     codingAgentDir: string;
     environment?: NodeJS.ProcessEnv;
     abortGraceMs?: number;
+    maxTurns?: number;
   }) {
     this.kind = options.kind;
     this.command = options.command;
@@ -61,6 +64,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     this.codingAgentDir = options.codingAgentDir;
     this.environment = options.environment;
     this.abortGraceMs = options.abortGraceMs ?? 1_000;
+    this.maxTurns = options.maxTurns ?? 50;
   }
 
   async start(
@@ -187,8 +191,22 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
               ? envelope.data.summary
               : (extractLastAssistantText(envelope.messages) ??
                 "Prime RPC run ended");
-        this.pending?.resolve({ summary, metadata: envelope.data ?? {} });
+        this.pending?.resolve({
+          summary,
+          metadata: { ...(envelope.data ?? {}), turnsUsed: this.turnsUsed },
+        });
         this.pending = undefined;
+      } else if (envelope.type === "turn_start") {
+        this.turnsUsed += 1;
+        if (this.turnsUsed > this.maxTurns) {
+          this.rejectPending(
+            new Error(
+              `Prime turn budget exceeded (${this.turnsUsed}/${this.maxTurns})`,
+            ),
+          );
+          void this.abort(this.abortGraceMs);
+          return;
+        }
       }
     }
   }
@@ -250,6 +268,7 @@ export function createAgentBackend(
       args: request.agent.executable ? [] : [fakePath],
       codingAgentDir,
       abortGraceMs: request.budget.cancellationGraceMs,
+      maxTurns: request.budget.maxTurns,
     });
   }
   if (!primeRuntime) throw new Error("Prime runtime was not prepared");
@@ -266,5 +285,6 @@ export function createAgentBackend(
       path: primeRuntime.path,
     }),
     abortGraceMs: request.budget.cancellationGraceMs,
+    maxTurns: request.budget.maxTurns,
   });
 }

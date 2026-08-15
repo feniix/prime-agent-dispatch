@@ -5,10 +5,41 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  PrimeJsonlRpcBackend,
   verifyPrimeInstallation,
   writePrimeModelsConfig,
   primeRpcLaunchArguments,
 } from "../dist/index.js";
+
+test("Prime RPC backend enforces the configured assistant-turn budget", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-turn-budget-"));
+  const executable = join(root, "turns.js");
+  await writeFile(
+    executable,
+    [
+      'process.stdin.once("data", () => {',
+      '  for (const type of ["agent_start", "turn_start", "turn_end", "turn_start", "agent_end"])',
+      '    process.stdout.write(JSON.stringify({ type, data: { lastAssistantText: "too many turns" } }) + "\\n");',
+      "});",
+    ].join("\n"),
+  );
+  const backend = new PrimeJsonlRpcBackend({
+    kind: "turn-fixture",
+    command: process.execPath,
+    args: [executable],
+    codingAgentDir: join(root, "agent"),
+    maxTurns: 1,
+    abortGraceMs: 50,
+  });
+  try {
+    await assert.rejects(
+      () => backend.start("task", root, new AbortController().signal),
+      /Prime turn budget exceeded/,
+    );
+  } finally {
+    await backend.dispose();
+  }
+});
 
 test("Prime installation verifies release artifact checksum and executable version", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-install-"));
