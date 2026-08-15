@@ -72,7 +72,7 @@ pnpm run typecheck
 pnpm test
 ```
 
-The tests use only temporary fixture repositories and the deterministic fake Prime process. They cover:
+The test suite has two layers. Focused unit tests cover schema defaults and bounds, the complete state-transition matrix, store revisions and locking, artifact path safety, command execution limits, and adapter authorization policy. Integration tests use only temporary fixture repositories and the deterministic fake Prime process. Together they cover:
 
 - happy path, gate, worktree, commit, report and result;
 - `RLM_MAX_DEPTH=0` and dedicated `PRIME_AGENT_CODING_AGENT_DIR` observation;

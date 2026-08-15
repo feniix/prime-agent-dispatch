@@ -1,0 +1,81 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  JobStateSchema,
+  PrimeStartInputSchema,
+  WorkerCommandSchema,
+} from "../dist/index.js";
+
+function minimalStart() {
+  return {
+    task: "bounded fixture",
+    repoPath: "/tmp/repo",
+    repoRoots: ["/tmp"],
+    authorization: { channelId: "channel", senderId: "sender" },
+  };
+}
+
+test("prime_start applies bounded defaults", () => {
+  const parsed = PrimeStartInputSchema.parse(minimalStart());
+  assert.equal(parsed.schemaVersion, 1);
+  assert.equal(parsed.operation, "prime_start");
+  assert.deepEqual(parsed.agent, { kind: "fake" });
+  assert.deepEqual(parsed.gates, []);
+  assert.equal(parsed.fixture, false);
+  assert.equal(parsed.unsafeAllowLiveRepo, false);
+  assert.deepEqual(parsed.budget, {
+    wallClockMs: 1_200_000,
+    cancellationGraceMs: 2_000,
+    maxOutputBytes: 1_000_000,
+  });
+});
+
+test("prime_start rejects unbounded or malformed values", () => {
+  assert.throws(() =>
+    PrimeStartInputSchema.parse({
+      ...minimalStart(),
+      task: "",
+      budget: {
+        wallClockMs: 86_400_001,
+        cancellationGraceMs: 2_000,
+        maxOutputBytes: 1_000_000,
+      },
+    }),
+  );
+  assert.throws(() =>
+    PrimeStartInputSchema.parse({ ...minimalStart(), repoRoots: [] }),
+  );
+});
+
+test("state snapshots reject unknown schema versions and invalid revisions", () => {
+  const base = {
+    schemaVersion: 1,
+    revision: 0,
+    jobId: "job",
+    status: "queued",
+    createdAt: "2026-08-15T10:00:00.000Z",
+    updatedAt: "2026-08-15T10:00:00.000Z",
+  };
+  assert.doesNotThrow(() => JobStateSchema.parse(base));
+  assert.throws(() => JobStateSchema.parse({ ...base, schemaVersion: 2 }));
+  assert.throws(() => JobStateSchema.parse({ ...base, revision: -1 }));
+});
+
+test("worker IPC accepts only status, steer, and cancel operations", () => {
+  assert.doesNotThrow(() =>
+    WorkerCommandSchema.parse({ operation: "prime_status", jobId: "job" }),
+  );
+  assert.doesNotThrow(() =>
+    WorkerCommandSchema.parse({
+      operation: "prime_steer",
+      jobId: "job",
+      message: "bounded",
+    }),
+  );
+  assert.throws(() =>
+    WorkerCommandSchema.parse({ operation: "prime_start", jobId: "job" }),
+  );
+  assert.throws(() =>
+    WorkerCommandSchema.parse({ operation: "prime_result", jobId: "job" }),
+  );
+});
