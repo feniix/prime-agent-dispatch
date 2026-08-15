@@ -2,7 +2,7 @@
 
 Verdict: **COMPLETE for the disposable-fixture CLI scope**.
 
-The milestone connects the existing detached JSON/Zod control plane to a verified Prime Agent `0.7.2`, the Codex subscription through OpenClaw's public auth runtime, a scoped production inference broker, trusted host repository policy, immutable confirmation, local worktree/gates/commit/report, and bounded cancellation. It does not install the later Discord/OpenClaw adapter and does not claim host containment.
+The milestone connects the existing detached JSON/Zod control plane to a verified Prime Agent `0.7.2`, the Codex subscription through OpenClaw's public auth runtime, a scoped production inference broker, trusted host repository policy, immutable confirmation, local worktree/gates/commit/report, and bounded cancellation. Both the official release archive and launched Prime executable are checksum-pinned. It does not install the later Discord/OpenClaw adapter and does not claim host containment.
 
 ## Implemented flow
 
@@ -34,15 +34,29 @@ flowchart LR
 
 No intentionally failing state was committed.
 
+## Review hardening
+
+A final adversarial review produced additional RED/GREEN slices before integration:
+
+- Confirmation hashes now bind the complete normalized prepared request, mutation after preview is rejected, and the unconfirmed dispatcher launch path was removed.
+- The wall-clock deadline covers provisioning, Prime, gates, and commit/report processing. Cancellation aborts active gates and applies the configured grace period before killing the process tree.
+- Git transport is disabled through both the wrapper and inherited `protocol.allow=never`, including when `/usr/bin/git` bypasses the wrapper.
+- Dead global-lease owners are reclaimed atomically, workers claim leases with their own PID, and queued jobs with dead launch owners reconcile to `interrupted`.
+- Worker control sockets live in private `0700` directories, use `0600` socket permissions, and reject commands larger than 64 KiB.
+- Active inference requests are aborted when their lease expires, and actual Prime `turn_start` events enforce the assistant-turn ceiling.
+- The event-tail recovery test now waits for the terminal journal checkpoint rather than racing the terminal state snapshot.
+
 ## Live acceptance evidence
 
 - Test command: `PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test test/live-prime.acceptance.test.js`
 - Result: 1/1 passed in approximately 14 seconds.
 - Prime release checksum: `bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e`.
+- Prime executable checksum: `a6144570af2554b537530372cb3080b4f7713875e8d9d4677e453bb1040f1ec5`.
 - Inference event: two authorized requests; streaming, function-call event and high reasoning all observed.
 - Result: trusted `fixture-output` gate passed and a local commit was created as `Prime Dispatch <prime-dispatch@local.invalid>`, unsigned.
 - Remote proof: the configured `https://example.invalid/never-contact.git` remained unchanged; the source checkout remained clean.
 - Cancellation exercise: terminal `cancelled`; broker recorded `abortedUpstreams: 1`; no Prime/worker process remained.
+- Deterministic verification: 53 tests passed with the opt-in live test skipped; formatting, typecheck, dependency audit, and `git diff --check` passed.
 
 ## Remaining risks
 

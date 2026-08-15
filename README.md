@@ -127,12 +127,15 @@ pnpm run build
 pnpm run test:live
 ```
 
-The test suite has deterministic unit/integration layers plus an opt-in real acceptance. Focused tests cover schema defaults and bounds, broker policy, release verification, host configuration, confirmation, the state-transition matrix, store revisions and locking, artifact path safety, command limits, and adapter authorization. Deterministic integration tests use only temporary fixture repositories and fake Prime; the opt-in test uses real Prime and Codex subscription auth against a disposable fixture.
+The test suite has deterministic unit/integration layers plus an opt-in real acceptance. Focused tests cover schema defaults and bounds, broker policy, release and executable verification, host configuration, complete confirmation binding, Prime turn limits, the state-transition matrix, stale-lease recovery, store revisions and locking, private IPC, Git transport blocking, artifact path safety, full-lifecycle command limits, and adapter authorization. Deterministic integration tests use only temporary fixture repositories and fake Prime; the opt-in test uses real Prime and Codex subscription auth against a disposable fixture.
 
 - happy path, gate, worktree, commit, report and result;
 - `RLM_MAX_DEPTH=0` and dedicated `PRIME_AGENT_CODING_AGENT_DIR` observation;
 - a new CLI process steering and cancelling a surviving worker;
+- cancellation of an active verification gate and full-job wall-clock enforcement;
 - final partial JSONL handling and middle-record corruption;
+- stale global-lease and dead-launch reconciliation;
+- remote transport rejection even when the Git wrapper is bypassed;
 - repo-root and symlink-escape rejection;
 - the fixture-only execution guard;
 - trusted channel plus sender authorization in the OpenClaw adapter contract.
@@ -190,7 +193,7 @@ The driver uses strict LF-delimited JSONL and the official command shapes:
 - `{"type":"abort"}`
 - terminal `agent_end` events
 
-For real Prime, provide `--host-config` containing the trusted release artifact, executable, repository roots, and gates. Callers cannot choose the model or reasoning level. The worker verifies the pinned tarball checksum and executable version, launches JSONL RPC with `gpt-5.6-sol`/high, uses a job-private HOME/config/session directory plus a short private macOS TMPDIR, exposes only IPython, and sets `RLM_MAX_DEPTH=0`.
+For real Prime, provide `--host-config` containing the trusted release artifact, executable, repository roots, and gates. Callers cannot choose the model or reasoning level. The worker verifies the pinned tarball and executable checksums plus the reported version, launches JSONL RPC with `gpt-5.6-sol`/high, uses a job-private HOME/config/session directory plus a short private macOS TMPDIR, exposes only IPython, and sets `RLM_MAX_DEPTH=0`.
 
 ## Security and threat model
 
@@ -200,6 +203,7 @@ The code assumes Discord text, model output, repository contents and Git refs ar
 - rejects symlink escapes and requires the canonical Git worktree root;
 - resolves the selected base to an immutable commit SHA before dispatch;
 - never fetches, pushes, opens PRs or imports dirty source-checkout changes;
+- disables Git transports in the inherited process environment, even if the wrapper is bypassed;
 - creates a dedicated branch and worktree for each job;
 - represents gates as an executable plus argv, never an interpolated shell string;
 - limits gate time and captured output;
@@ -217,9 +221,9 @@ The production inference broker resolves Codex subscription OAuth through OpenCl
 
 - A surviving job worker can be reached by later CLI/adapter processes. If the job worker itself dies, automatic reconciliation and transcript/worktree resume are not implemented; the last durable state and artifacts remain for inspection.
 - Worker PID identity is not protected against PID reuse. Locks require both age and a missing PID before reclamation, but production needs OS process-start identity or leases.
-- The dispatcher is not a resident scheduler. A spawn failure can leave a queued job requiring manual diagnosis from `artifacts/logs/worker.log`.
+- The dispatcher is not a resident scheduler. A failed worker is reconciled when status is next queried, not proactively while no client is running.
 - Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`, but crash injection around every transition has not been exhaustively tested.
-- Token/cost accounting is only an interface concern. The implemented hard limit is wall-clock time plus gate/output limits.
+- Token usage is observable only after an upstream response, so a single response can overshoot the remaining token budget. Wall-clock, turn, gate, output, concurrency, and cumulative observable-token limits are enforced.
 - Event sequencing scans the journal and is suitable only for a small spike ledger.
 - Concurrent writers in separate worktrees of the same repository are not serialized; repository-local build services can still conflict.
 - Worktrees and branches are intentionally preserved. There is no cleanup command yet.
@@ -229,7 +233,7 @@ The production inference broker resolves Codex subscription OAuth through OpenCl
 
 ## Production exit criteria
 
-Before adopting this design, integrate the validated inference proxy, add stable worker supervision/recovery, PID-safe leases, external token/cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
+Before adopting this design, add stable worker supervision/recovery, PID-start-identity leases, authoritative cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 ## Spike verdict template
 
