@@ -209,6 +209,11 @@ test("event reader ignores only a partial final JSONL record and rejects middle 
     count,
   );
 
+  await dispatcher.store.appendEvent(started.jobId, "after_tail_repair", {});
+  const repaired = await dispatcher.store.readEvents(started.jobId);
+  assert.equal(repaired.length, count + 1);
+  assert.equal(repaired.at(-1).type, "after_tail_repair");
+
   const original = await readFile(path, "utf8");
   await writeFile(path, `not-json\n${original}`);
   await assert.rejects(
@@ -273,6 +278,9 @@ test("OpenClaw contract requires channel plus sender for writes", async () => {
   const tools = createOpenClawTools(client, {
     allowedChannelIds: new Set(["allowed-channel"]),
     allowedWriterSenderIds: new Set(["allowed-sender"]),
+    allowedRepoRoots: ["/trusted/repos"],
+    fixtureOnly: true,
+    agent: { kind: "fake" },
   });
   const cancel = tools.find((tool) => tool.name === "prime_cancel");
   await assert.rejects(
@@ -292,8 +300,10 @@ test("OpenClaw contract requires channel plus sender for writes", async () => {
     {
       task: "fixture",
       repoPath: "/fixture",
-      repoRoots: ["/"],
-      fixture: true,
+      repoRoots: ["/spoofed"],
+      fixture: false,
+      unsafeAllowLiveRepo: true,
+      agent: { kind: "prime-rpc", executable: "/tmp/evil" },
       authorization: { channelId: "spoofed", senderId: "spoofed" },
     },
     { channelId: "allowed-channel", requesterSenderId: "allowed-sender" },
@@ -303,6 +313,38 @@ test("OpenClaw contract requires channel plus sender for writes", async () => {
     channelId: "allowed-channel",
     senderId: "allowed-sender",
   });
+  assert.deepEqual(calls[1][1].repoRoots, ["/trusted/repos"]);
+  assert.equal(calls[1][1].fixture, true);
+  assert.equal(calls[1][1].unsafeAllowLiveRepo, false);
+  assert.deepEqual(calls[1][1].agent, { kind: "fake" });
+});
+
+test("a gate that ignores SIGTERM is killed after the hard timeout", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const bounded = input(repo, root, "reach stubborn gate");
+  bounded.gates = [
+    {
+      name: "ignores-term",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+      ],
+      timeoutMs: 100,
+    },
+  ];
+  const startedAt = Date.now();
+  const started = await dispatcher.start(bounded);
+  const state = await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "failed",
+  );
+  assert.match(state.error, /verification gate failed/);
+  assert.ok(Date.now() - startedAt < 3_000);
+  const result = await dispatcher.result(started.jobId);
+  assert.equal(result.gateResults[0].timedOut, true);
 });
 
 test("state transitions are idempotent but reject invalid jumps", () => {

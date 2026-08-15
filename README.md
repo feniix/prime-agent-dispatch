@@ -153,7 +153,7 @@ The code assumes Discord text, model output, repository contents and Git refs ar
 
 The `unsafe-local` backend is **not a sandbox**. A model-driven process can read any host file available to its OS user and can access the network. A minimal environment does not change filesystem permissions. Therefore live repositories are rejected unless `--unsafe-allow-live-repo` is explicitly supplied, and this spike intentionally performs no real-repository smoke test.
 
-The OpenClaw adapter is a compile-time contract, not an installed plugin. It consumes trusted `channelId`, `requesterSenderId`, and owner status from the host integration; those values must never come from model tool arguments.
+The OpenClaw adapter is a compile-time contract, not an installed plugin. It consumes trusted `channelId`, `requesterSenderId`, owner status, repository roots, fixture policy, and agent selection from the host integration; those values must never come from model tool arguments. Model-supplied attempts to override roots, unsafe-local permission, agent executable, or authorization are stripped by the adapter schema and replaced with policy-owned values.
 
 The inference interface includes an intentionally unsupported `OpenClawOpaqueBrokerBackend`. A future broker must pass through raw OpenAI-compatible streaming/tool calls, pin the upstream/model server-side, issue revocable per-job tokens, enforce cumulative budgets, prevent SSRF, and never expose or log provider credentials. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority.
 

@@ -27,6 +27,7 @@ export async function runCommand(
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let timedOut = false;
+    let killTimer: NodeJS.Timeout | undefined;
     const max = options.maxOutputBytes ?? 1_000_000;
     const collect = (
       current: Buffer<ArrayBufferLike>,
@@ -57,9 +58,19 @@ export async function runCommand(
             } catch {
               // It may have exited between the timeout and signal.
             }
+            killTimer = setTimeout(() => {
+              try {
+                if (child.pid && process.platform !== "win32")
+                  process.kill(-child.pid, "SIGKILL");
+                else child.kill("SIGKILL");
+              } catch {
+                // It may have exited during the termination grace period.
+              }
+            }, 250);
           }, options.timeoutMs);
     child.on("close", (exitCode) => {
       if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({
         exitCode,
         stdout: stdout.toString("utf8"),

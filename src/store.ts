@@ -232,6 +232,7 @@ export class JobStore {
     type: string,
     data: Record<string, unknown>,
   ): Promise<JobEvent> {
+    await this.repairPartialEventTail(jobId);
     const event = EventSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       sequence: await this.nextEventSequence(jobId),
@@ -249,6 +250,26 @@ export class JobStore {
       await handle.close();
     }
     return event;
+  }
+
+  private async repairPartialEventTail(jobId: string): Promise<void> {
+    const path = join(this.jobDir(jobId), "events.jsonl");
+    let contents: Buffer;
+    try {
+      contents = await readFile(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (contents.length === 0 || contents.at(-1) === 0x0a) return;
+    const finalLf = contents.lastIndexOf(0x0a);
+    const handle = await open(path, "r+");
+    try {
+      await handle.truncate(finalLf + 1);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   async appendEvent(

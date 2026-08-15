@@ -4,6 +4,7 @@ import {
   PrimeStartInputSchema,
   PrimeStatusInputSchema,
   PrimeSteerInputSchema,
+  type PrimeStartInput,
 } from "./schemas.js";
 
 export type TrustedOpenClawContext = {
@@ -16,6 +17,9 @@ export type AdapterPolicy = {
   allowedChannelIds: ReadonlySet<string>;
   allowedWriterSenderIds: ReadonlySet<string>;
   ownerMayWrite?: boolean;
+  allowedRepoRoots: readonly string[];
+  fixtureOnly?: boolean;
+  agent?: PrimeStartInput["agent"];
 };
 
 export interface PrimeDispatchClient {
@@ -39,6 +43,10 @@ export type TypedTool = {
 
 const PrimeStartToolInputSchema = PrimeStartInputSchema.omit({
   authorization: true,
+  repoRoots: true,
+  fixture: true,
+  unsafeAllowLiveRepo: true,
+  agent: true,
 });
 
 function authorize(
@@ -72,6 +80,9 @@ export function createOpenClawTools(
   client: PrimeDispatchClient,
   policy: AdapterPolicy,
 ): TypedTool[] {
+  if (policy.allowedRepoRoots.length === 0) {
+    throw new Error("OpenClaw adapter requires configured repository roots");
+  }
   return [
     {
       name: "prime_start",
@@ -82,6 +93,10 @@ export function createOpenClawTools(
         return await client.start(
           PrimeStartInputSchema.parse({
             ...parsed,
+            repoRoots: [...policy.allowedRepoRoots],
+            fixture: policy.fixtureOnly === true,
+            unsafeAllowLiveRepo: false,
+            agent: policy.agent ?? { kind: "fake" },
             authorization: {
               channelId: context.channelId,
               senderId: context.requesterSenderId,
