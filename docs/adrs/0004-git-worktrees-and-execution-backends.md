@@ -43,7 +43,9 @@ The dispatcher canonicalizes the repository and configured roots, rejects symlin
 
 ### Confirmation
 
-Tests cover canonical repo roots, symlink escape rejection, immutable base resolution, worktree creation, gate execution, local commit, and final diff/report capture. No real repository is executed without an explicit unsafe local override. Real Prime execution remains blocked on a containment backend and narrow inference path.
+Tests cover canonical repo roots, symlink escape rejection, immutable base resolution, worktree creation, gate execution, dedicated unsigned commit identity, and final diff/report capture. The Prime environment uses a Git guard that rejects `fetch`, `pull`, and `push`, removes inherited authentication, and leaves configured remotes unchanged. The opt-in real Prime acceptance ran only against a disposable fixture and left its source checkout and inert remote configuration untouched.
+
+This current-user backend remains explicitly unsafe-local: it is not a sandbox and has normal host networking. Existing real repositories require separate explicit selection; containers remain deferred.
 
 ## More Information
 

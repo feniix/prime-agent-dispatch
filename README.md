@@ -6,13 +6,15 @@ A bounded spike for this question:
 
 This is not production-ready. The default execution backend is intentionally named `unsafe-local` and accepts fixture repositories only.
 
-## Verdict: PARTIAL
+## Verdict: Beta Milestone 1 COMPLETE for disposable fixtures
 
-The vertical slice validates detached per-job workers, reconnectable Unix-socket control, JSON/Zod state, Git worktrees, structured verification gates, cancellation, local commits, result artifacts, path policy, and a Prime-compatible JSONL RPC subprocess driver.
+The vertical slice now validates detached per-job workers, reconnectable Unix-socket control, JSON/Zod state, Git worktrees, structured verification gates, cancellation, local commits, result artifacts, path policy, a real Prime JSONL RPC subprocess, and Codex-subscription inference through a scoped host broker.
 
-The original control-plane vertical slice did not validate real Prime/model execution because Prime and provider credentials were deliberately absent from that test suite. It also does not provide filesystem/network containment, worker-death recovery, a production OpenClaw inference broker, Apple containers, or an installed OpenClaw plugin.
+Ordinary tests remain deterministic and use fake Prime/local upstreams. The opt-in real acceptance is fixture-only. This beta does not provide filesystem/network containment, automatic worker-death resume, Apple containers, or an installed OpenClaw plugin.
 
-Recommendation: retain the interfaces and test evidence, but rewrite/harden the lifecycle for production. The next implementation step is to integrate the validated subscription-broker seam with the OpenClaw adapter and real Prime backend while keeping live use limited to trusted local repositories. Containment remains deferred.
+Recommendation: keep live use limited to disposable fixtures until an operator explicitly selects a trusted repository. The next implementation step is the thin OpenClaw adapter and Discord confirmation/status UX. Containment remains deferred.
+
+See the [Beta Milestone 1 report](docs/beta-milestone-1.md) for TDD evidence, live acceptance evidence, and remaining risks.
 
 The tracked [Codex subscription spike](spikes/001-codex-subscription/README.md) subsequently validated a real Prime `0.7.2` fixture run through an OpenClaw-authenticated, scoped loopback broker using `gpt-5.6-sol` with high reasoning. That clears the subscription-auth feasibility gate, but it does not make this overall control-plane prototype production-ready or add containment.
 
@@ -118,7 +120,14 @@ pnpm run typecheck
 pnpm test
 ```
 
-The test suite has two layers. Focused unit tests cover schema defaults and bounds, the complete state-transition matrix, store revisions and locking, artifact path safety, command execution limits, and adapter authorization policy. Integration tests use only temporary fixture repositories and the deterministic fake Prime process. Together they cover:
+The real Codex-subscription fixture is opt-in:
+
+```bash
+pnpm run build
+pnpm run test:live
+```
+
+The test suite has deterministic unit/integration layers plus an opt-in real acceptance. Focused tests cover schema defaults and bounds, broker policy, release verification, host configuration, confirmation, the state-transition matrix, store revisions and locking, artifact path safety, command limits, and adapter authorization. Deterministic integration tests use only temporary fixture repositories and fake Prime; the opt-in test uses real Prime and Codex subscription auth against a disposable fixture.
 
 - happy path, gate, worktree, commit, report and result;
 - `RLM_MAX_DEPTH=0` and dedicated `PRIME_AGENT_CODING_AGENT_DIR` observation;
@@ -153,6 +162,7 @@ node dist/cli.js start \
   --channel local-test \
   --sender local-test \
   --fixture \
+  --yes \
   --gate '{"name":"output","command":"test","args":["-f","prototype-output.txt"],"timeoutMs":2000}'
 ```
 
@@ -180,7 +190,7 @@ The driver uses strict LF-delimited JSONL and the official command shapes:
 - `{"type":"abort"}`
 - terminal `agent_end` events
 
-For real Prime, pass `--agent prime` and optionally `--agent-executable` and `--model`. The worker launches `prime-agent --mode rpc`, sets a job-private home/config directory, and sets `RLM_MAX_DEPTH=0`. This environment-level limit is intended to exercise Prime's enforced recursion check. The test fake records the environment so the harness side is verified; a future real-Prime test must also attempt child creation and prove that Prime rejects it.
+For real Prime, provide `--host-config` containing the trusted release artifact, executable, repository roots, and gates. Callers cannot choose the model or reasoning level. The worker verifies the pinned tarball checksum and executable version, launches JSONL RPC with `gpt-5.6-sol`/high, uses a job-private HOME/config/session directory plus a short private macOS TMPDIR, exposes only IPython, and sets `RLM_MAX_DEPTH=0`.
 
 ## Security and threat model
 
@@ -201,7 +211,7 @@ The `unsafe-local` backend is **not a sandbox**. A model-driven process can read
 
 The OpenClaw adapter is a compile-time contract, not an installed plugin. It consumes trusted `channelId`, `requesterSenderId`, owner status, repository roots, fixture policy, and agent selection from the host integration; those values must never come from model tool arguments. Model-supplied attempts to override roots, unsafe-local permission, agent executable, or authorization are stripped by the adapter schema and replaced with policy-owned values.
 
-The control-plane inference interface still includes an intentionally unsupported `OpenClawOpaqueBrokerBackend`. The tracked subscription spike validates the required raw streaming/tool-call and scoped-token protocol in isolation, but it has not yet been wired into the core or adapter. The integrated broker must pin the upstream/model server-side, issue revocable per-job tokens, enforce cumulative budgets, prevent SSRF, and never expose or log provider credentials. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority.
+The production inference broker resolves Codex subscription OAuth through OpenClaw's public provider-auth runtime, fixes the upstream/model/reasoning server-side, issues revocable per-job tokens, enforces expiry/request/concurrency/observable-token limits, and never exposes or logs provider credentials or bodies. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority.
 
 ## Known limitations
 
@@ -213,9 +223,9 @@ The control-plane inference interface still includes an intentionally unsupporte
 - Event sequencing scans the journal and is suitable only for a small spike ledger.
 - Concurrent writers in separate worktrees of the same repository are not serialized; repository-local build services can still conflict.
 - Worktrees and branches are intentionally preserved. There is no cleanup command yet.
-- The Apple container backend and opaque inference broker are stubs.
+- The Apple container backend remains a stub; the scoped inference broker is implemented.
 - Editable Discord status cards are deferred behind `NotificationSink`; only console/no-op sinks exist.
-- The original fake-backend control-plane test suite uses no real Prime binary, model endpoint, provider credential, or job network call. The separate tracked subscription spike exercises real Prime and brokered subscription inference only against a disposable fixture; it makes no EVP change or real-repository write.
+- Ordinary tests use no real Prime binary, provider credential, or job network call. The opt-in acceptance test exercises the production real-Prime/broker path only against a disposable fixture; it makes no EVP change or real-repository write.
 
 ## Production exit criteria
 

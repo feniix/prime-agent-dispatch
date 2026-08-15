@@ -1,0 +1,53 @@
+# Beta Milestone 1 report
+
+Verdict: **COMPLETE for the disposable-fixture CLI scope**.
+
+The milestone connects the existing detached JSON/Zod control plane to a verified Prime Agent `0.7.2`, the Codex subscription through OpenClaw's public auth runtime, a scoped production inference broker, trusted host repository policy, immutable confirmation, local worktree/gates/commit/report, and bounded cancellation. It does not install the later Discord/OpenClaw adapter and does not claim host containment.
+
+## Implemented flow
+
+```mermaid
+flowchart LR
+    CLI["CLI start + resolved confirmation"]
+    Host["Trusted host config<br/>roots · gates · Prime paths"]
+    Worker["Detached per-job worker<br/>Unix socket + JSON/Zod journal"]
+    Broker["Scoped loopback broker<br/>OpenClaw-held Codex OAuth"]
+    Prime["Prime Agent 0.7.2<br/>gpt-5.6-sol · high · root only"]
+    Worktree["Disposable Git worktree<br/>remote-inert environment"]
+    Result["Gate · local commit/no-change<br/>diff · report · result"]
+
+    Host --> CLI --> Worker
+    Worker --> Broker --> Prime --> Worktree --> Result
+```
+
+## RED/GREEN evidence
+
+| Slice                                             | RED                                                                                                                                                                        | GREEN                                                                                                                                                                                                                                          |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Release, environment, Git and confirmation policy | `node --test test/beta-policy.unit.test.js` failed because pinned release/policy exports did not exist.                                                                    | 4 focused tests passed; later Git-guard and commit-identity tests passed.                                                                                                                                                                      |
+| Inference broker                                  | `node --test test/broker.unit.test.js` failed because `ProductionInferenceBroker` did not exist.                                                                           | Authorization/pinning/normalization, revocation/expiry/limits, cancellation, redaction and stream/tool observations passed.                                                                                                                    |
+| Global lease and reconciliation                   | `node --test test/control-plane-beta.unit.test.js` failed because `GlobalJobLease` did not exist; the focused lifecycle test then showed a second active job was accepted. | Lease, host ceilings, missing-worker interruption, and one-global-job lifecycle passed.                                                                                                                                                        |
+| Prime runtime                                     | `node --test test/prime-runtime.unit.test.js` failed because installation/config/launch helpers did not exist.                                                             | Checksum/version verification and fixed private Prime configuration passed.                                                                                                                                                                    |
+| Confirmation                                      | `node --test test/confirmation.unit.test.js` failed because preview/confirmed start did not exist and CLI launched without confirmation.                                   | Resolved hash binding, refusal without confirmation, and explicit `--yes` fixture acceptance passed.                                                                                                                                           |
+| Trusted host policy                               | `node --test test/host-config.unit.test.js` failed because host config loading/policy resolution did not exist.                                                            | Roots, gates and Prime paths resolve only from strict trusted config.                                                                                                                                                                          |
+| Live Prime                                        | First live run failed on macOS Unix-socket path length; the next exposed a fixture gate path typo (`/usr/bin/test` instead of `/bin/test`).                                | Production opt-in test passed with a real streamed tool call, high reasoning, file edit, trusted gate, dedicated unsigned commit, report and inert remote. A separate live cancellation recorded one aborted upstream and no remaining worker. |
+
+No intentionally failing state was committed.
+
+## Live acceptance evidence
+
+- Test command: `PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test test/live-prime.acceptance.test.js`
+- Result: 1/1 passed in approximately 14 seconds.
+- Prime release checksum: `bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e`.
+- Inference event: two authorized requests; streaming, function-call event and high reasoning all observed.
+- Result: trusted `fixture-output` gate passed and a local commit was created as `Prime Dispatch <prime-dispatch@local.invalid>`, unsigned.
+- Remote proof: the configured `https://example.invalid/never-contact.git` remained unchanged; the source checkout remained clean.
+- Cancellation exercise: terminal `cancelled`; broker recorded `abortedUpstreams: 1`; no Prime/worker process remained.
+
+## Remaining risks
+
+- Unsafe-local current-user execution is not a sandbox and retains normal host networking.
+- Token usage is observable only after an upstream response, so one response can overshoot remaining budget.
+- Worker death is preserved as interrupted; automatic transcript resume is deferred.
+- The Discord/OpenClaw adapter and editable status card are outside Milestone 1.
+- Storage quota/eviction and container execution remain later milestones.

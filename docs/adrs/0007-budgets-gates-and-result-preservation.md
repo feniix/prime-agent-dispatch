@@ -37,12 +37,14 @@ Gates are executable-plus-argv records with fixed cwd, timeout, and output ceili
 - Good, because terminal status is based on independently observed evidence.
 - Good, because command injection through shell concatenation is avoided.
 - Good, because cancelled and failed work remains inspectable.
-- Bad, because token and monetary accounting require the future inference broker.
+- Bad, because token usage is observable only after an upstream response and subscription cost is not reported monetarily.
 - Bad, because retained artifacts need quotas and a lossless cleanup command.
 
 ### Confirmation
 
-Tests cover a successful gate and commit, external wall-clock cancellation, interactive cancellation, bounded output, and a gate that ignores `SIGTERM` and is killed after the hard timeout. Token/cost ceilings remain unconfirmed until broker usage accounting is implemented.
+Tests cover a successful gate and commit, external wall-clock cancellation, interactive cancellation, bounded output, and a gate that ignores `SIGTERM` and is killed after the hard timeout. Host ceilings are 30 minutes, 250,000 observable model tokens, 50 externally submitted Prime turns, 10 minutes per gate, and a 10-second cancellation grace; jobs may request only lower finite values. The broker denies later requests once observed cumulative tokens reach the job limit.
+
+The opt-in live fixture passed its trusted host-configured gate, created an unsigned local commit, wrote result/report/diff artifacts, and separately demonstrated cancellation revoking inference before aborting Prime. A single upstream response can exceed the remaining token allowance before usage becomes observable, so this is a hard admission ceiling rather than preemptive per-token termination.
 
 ## More Information
 

@@ -42,6 +42,7 @@ let server: ReturnType<typeof createServer> | undefined;
 let inferenceBroker: ProductionInferenceBroker | undefined;
 let inferenceLease: InferenceLease | undefined;
 let primeRuntimeTmpDir: string | undefined;
+let turnsUsed = 1;
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
   socket.end(
@@ -75,9 +76,14 @@ async function serveCommands(): Promise<void> {
             reply(socket, await store.readState(jobId));
           } else if (command.operation === "prime_steer") {
             if (!agent) throw new Error("agent is not running");
+            const request = await store.readRequest(jobId);
+            if (turnsUsed >= request.budget.maxTurns)
+              throw new Error("Prime turn budget exhausted");
+            turnsUsed += 1;
             await agent.steer(command.message);
             await store.appendEvent(jobId, "steered", {
               message: command.message,
+              turnsUsed,
             });
             reply(socket, { accepted: true });
           } else {
