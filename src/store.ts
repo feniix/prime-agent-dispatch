@@ -108,7 +108,13 @@ async function acquireLock(
           continue;
         }
       } catch {
-        const info = await stat(lockDir);
+        let info;
+        try {
+          info = await stat(lockDir);
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw statError;
+        }
         if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
           await rm(lockDir, { recursive: true });
           continue;
