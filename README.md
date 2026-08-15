@@ -16,17 +16,32 @@ Recommendation: retain the interfaces and test evidence, but rewrite/harden the 
 
 ## Scope and architecture
 
-```text
-prime-dispatch CLI / optional OpenClaw adapter contract
-  -> immutable request + authoritative state + event journal
-  -> detached prime-job worker, one Unix socket per running job
-    -> ExecutionBackend
-      -> unsafe-local fixture worktree (implemented)
-      -> Apple container (stub)
-    -> AgentBackend
-      -> Prime JSONL RPC subprocess driver (implemented)
-      -> deterministic fake RPC executable (implemented and tested)
-    -> structured gates -> local commit -> diff/report/result artifacts
+```mermaid
+flowchart TD
+    CLI["prime-dispatch CLI"]
+    OpenClaw["Optional OpenClaw adapter contract"]
+    ControlPlane["Durable control plane<br/>request.json · state.json · events.jsonl"]
+    Worker["Detached prime-job worker<br/>Unix socket per active job"]
+    Execution{"ExecutionBackend"}
+    UnsafeLocal["unsafe-local fixture worktree<br/>(implemented)"]
+    AppleContainer["Apple container<br/>(stub)"]
+    Agent{"AgentBackend"}
+    PrimeRpc["Prime JSONL RPC driver<br/>(implemented)"]
+    FakeRpc["Deterministic fake RPC<br/>(implemented and tested)"]
+    Gates["Structured gates"]
+    Commit["Local commit"]
+    Artifacts["Diff · report · result artifacts"]
+
+    CLI --> ControlPlane
+    OpenClaw --> ControlPlane
+    ControlPlane --> Worker
+    Worker --> Execution
+    Execution --> UnsafeLocal
+    Execution --> AppleContainer
+    Worker --> Agent
+    Agent --> PrimeRpc
+    Agent --> FakeRpc
+    Worker --> Gates --> Commit --> Artifacts
 ```
 
 The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`), while the API schemas and worker IPC retain the explicit operations `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
@@ -51,11 +66,40 @@ Snapshots are written with temporary-file creation, file `fsync`, rename, and pa
 
 The state machine is:
 
-```text
-queued -> provisioning -> running -> verifying -> committing -> succeeded
-   |           |            |          |             |
-   +-----------+------------+----------+-------------+-> failed/interrupted
-                           \-> cancelling -> cancelled
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> provisioning
+    provisioning --> running
+    running --> verifying
+    verifying --> committing
+    committing --> succeeded
+
+    queued --> cancelling
+    provisioning --> cancelling
+    running --> cancelling
+    verifying --> cancelling
+    committing --> cancelling
+    cancelling --> cancelled
+
+    queued --> failed
+    provisioning --> failed
+    running --> failed
+    verifying --> failed
+    committing --> failed
+    cancelling --> failed
+
+    queued --> interrupted
+    provisioning --> interrupted
+    running --> interrupted
+    verifying --> interrupted
+    committing --> interrupted
+    cancelling --> interrupted
+
+    succeeded --> [*]
+    failed --> [*]
+    cancelled --> [*]
+    interrupted --> [*]
 ```
 
 Same-state transitions are idempotent. Other transitions are validated explicitly.
