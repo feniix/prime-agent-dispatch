@@ -130,3 +130,47 @@ test("caller budgets cannot exceed conservative host maximums", () => {
     /too_big/,
   );
 });
+
+test("terminal intent reconciles a durable result after a worker crash window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-terminal-intent-"));
+  const store = new JobStore(root);
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  const request = PrimeStartInputSchema.parse({
+    task: "fixture",
+    repoPath: repo,
+    repoRoots: [root],
+    fixture: true,
+    authorization: { channelId: "test", senderId: "test" },
+  });
+  const jobId = "terminal-intent";
+  await store.initialize({
+    ...request,
+    jobId,
+    createdAt: new Date().toISOString(),
+    canonicalRepoPath: repo,
+    canonicalRepoRoot: root,
+    baseSha: "a".repeat(40),
+  });
+  await store.updateState(jobId, "provisioning");
+  await store.updateState(jobId, "running");
+  await store.updateState(jobId, "verifying");
+  await store.updateState(jobId, "committing", {
+    terminalIntentStatus: "succeeded",
+    noChanges: true,
+    summary: "durable result",
+  });
+  await store.writeResult({
+    schemaVersion: 1,
+    jobId,
+    status: "succeeded",
+    summary: "durable result",
+    baseSha: "a".repeat(40),
+    noChanges: true,
+    gateResults: [],
+    completedAt: new Date().toISOString(),
+  });
+  const state = await new PrimeDispatcher(root).status(jobId);
+  assert.equal(state.status, "succeeded");
+  assert.equal(state.terminalIntentStatus, undefined);
+});
