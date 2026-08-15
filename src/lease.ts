@@ -1,8 +1,17 @@
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 type LeaseOwner = { jobId: string; pid: number; acquiredAt: string };
+const INCOMPLETE_LEASE_GRACE_MS = 1_000;
 
 function processExists(pid: number): boolean {
   try {
@@ -23,33 +32,11 @@ export class GlobalJobLease {
   }
 
   async acquire(jobId: string, pid = process.pid): Promise<void> {
-    try {
-      await mkdir(this.leaseDir, { recursive: false });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        await mkdir(join(this.leaseDir, ".."), { recursive: true });
-        return await this.acquire(jobId, pid);
-      }
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        const current = await this.readOwner().catch(() => undefined);
-        if (current && !processExists(current.pid)) {
-          const stalePath = `${this.leaseDir}.stale-${randomUUID()}`;
-          try {
-            await rename(this.leaseDir, stalePath);
-            await rm(stalePath, { recursive: true, force: true });
-          } catch (renameError) {
-            if ((renameError as NodeJS.ErrnoException).code !== "ENOENT")
-              throw renameError;
-          }
-          return await this.acquire(jobId, pid);
-        }
-        throw new Error(
-          `active job already holds global lease${current ? `: ${current.jobId}` : ""}`,
-        );
-      }
-      throw error;
-    }
-    const handle = await open(this.ownerPath, "wx", 0o600);
+    await mkdir(join(this.leaseDir, ".."), { recursive: true });
+    const candidate = `${this.leaseDir}.candidate-${randomUUID()}`;
+    await mkdir(candidate);
+    const candidateOwner = join(candidate, "owner.json");
+    const handle = await open(candidateOwner, "wx", 0o600);
     try {
       await handle.writeFile(
         `${JSON.stringify({ jobId, pid, acquiredAt: new Date().toISOString() } satisfies LeaseOwner)}\n`,
@@ -57,6 +44,28 @@ export class GlobalJobLease {
       await handle.sync();
     } finally {
       await handle.close();
+    }
+    try {
+      await rename(candidate, this.leaseDir);
+      return;
+    } catch (error) {
+      await rm(candidate, { recursive: true, force: true });
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ENOTEMPTY") {
+        const current = await this.readOwner().catch(() => undefined);
+        const incompleteIsStale = current
+          ? false
+          : Date.now() - (await stat(this.leaseDir)).mtimeMs >
+            INCOMPLETE_LEASE_GRACE_MS;
+        if ((current && !processExists(current.pid)) || incompleteIsStale) {
+          await this.quarantineStaleLease();
+          return await this.acquire(jobId, pid);
+        }
+        throw new Error(
+          `active job already holds global lease${current ? `: ${current.jobId}` : ""}`,
+        );
+      }
+      throw error;
     }
   }
 
@@ -90,5 +99,15 @@ export class GlobalJobLease {
 
   private async readOwner(): Promise<LeaseOwner> {
     return JSON.parse(await readFile(this.ownerPath, "utf8")) as LeaseOwner;
+  }
+
+  private async quarantineStaleLease(): Promise<void> {
+    const stalePath = `${this.leaseDir}.stale-${randomUUID()}`;
+    try {
+      await rename(this.leaseDir, stalePath);
+      await rm(stalePath, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 }

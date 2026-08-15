@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -32,6 +32,21 @@ test("global lease reclaims an owner whose process no longer exists", async () =
   const replacement = new GlobalJobLease(root);
   await replacement.acquire("replacement", process.pid);
   await replacement.release("replacement");
+});
+
+test("global lease recovers stale missing and malformed ownership", async () => {
+  for (const ownerText of [undefined, "not-json\n"]) {
+    const root = await mkdtemp(join(tmpdir(), "prime-broken-lease-"));
+    const leaseDir = join(root, "global-job.lease");
+    await mkdir(leaseDir);
+    if (ownerText !== undefined)
+      await writeFile(join(leaseDir, "owner.json"), ownerText);
+    const old = new Date(Date.now() - 60_000);
+    await utimes(leaseDir, old, old);
+    const replacement = new GlobalJobLease(root);
+    await replacement.acquire("replacement", process.pid);
+    await replacement.release("replacement");
+  }
 });
 
 test("queued job with a dead launch owner reconciles to interrupted", async () => {
