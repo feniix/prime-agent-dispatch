@@ -30,6 +30,7 @@ type LeaseState = {
   active: number;
   revoked: boolean;
   controllers: Set<AbortController>;
+  expiryTimer: NodeJS.Timeout;
 };
 
 export type BrokerOptions = {
@@ -124,6 +125,11 @@ export class ProductionInferenceBroker implements InferenceBackend {
   ): Promise<InferenceLease> {
     await this.listen();
     const token = randomBytes(32).toString("base64url");
+    const expiryTimer = setTimeout(
+      () => void this.revoke(token),
+      budget.wallClockMs,
+    );
+    expiryTimer.unref();
     const state: LeaseState = {
       jobId,
       token,
@@ -133,6 +139,7 @@ export class ProductionInferenceBroker implements InferenceBackend {
       active: 0,
       revoked: false,
       controllers: new Set(),
+      expiryTimer,
     };
     this.leases.set(token, state);
     const address = this.server.address() as AddressInfo;
@@ -165,6 +172,7 @@ export class ProductionInferenceBroker implements InferenceBackend {
   private async revoke(token: string): Promise<void> {
     const lease = this.leases.get(token);
     if (!lease) return;
+    clearTimeout(lease.expiryTimer);
     lease.revoked = true;
     this.leases.delete(token);
     for (const controller of lease.controllers) {
