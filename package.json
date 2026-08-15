@@ -2,6 +2,7 @@
   "name": "prime-dispatch-prototype",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.21.0",
   "type": "module",
   "bin": {
     "prime-dispatch": "dist/cli.js"
@@ -11,7 +12,7 @@
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "pretest": "npm run build",
+    "pretest": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {

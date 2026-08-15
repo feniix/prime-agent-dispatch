@@ -66,10 +66,10 @@ Requires Node.js 22 or newer and Git.
 
 ```bash
 cd /var/lib/evie-agent/src/prime-dispatch-prototype
-npm install
-npm run format
-npm run typecheck
-npm test
+pnpm install
+pnpm run format
+pnpm run typecheck
+pnpm test
 ```
 
 The tests use only temporary fixture repositories and the deterministic fake Prime process. They cover:
@@ -98,7 +98,7 @@ Build and start a detached fake job:
 
 ```bash
 cd /var/lib/evie-agent/src/prime-dispatch-prototype
-npm run build
+pnpm run build
 node dist/cli.js start \
   --state-root /tmp/prime-dispatch-state \
   --task "write the deterministic fixture output" \
