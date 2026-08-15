@@ -17,7 +17,7 @@ import { git, runCommand } from "./process.js";
 import { GlobalJobLease } from "./lease.js";
 import { ProductionInferenceBroker, type InferenceLease } from "./inference.js";
 import { resolveCodexSubscriptionAuth } from "./openclaw-auth.js";
-import { verifyPrimeInstallation } from "./release.js";
+import { prepareVerifiedPrimeRuntime } from "./release.js";
 import { writePrimeModelsConfig } from "./prime-runtime.js";
 import {
   buildRemoteInertGitEnvironment,
@@ -167,6 +167,7 @@ async function writeTerminalResult(
 async function main(): Promise<void> {
   await new GlobalJobLease(stateRoot).claim(jobId, process.pid);
   const request = await store.readRequest(jobId);
+  let agentRequest = request;
   const controller = new AbortController();
   jobAbortController = controller;
   const deadlineAt = Date.now() + request.budget.wallClockMs;
@@ -258,15 +259,24 @@ async function main(): Promise<void> {
         process.env.PATH ?? "/usr/bin:/bin",
       );
       primeRuntime = { homeDir, configDir, sessionDir, tmpDir, path };
-      await verifyPrimeInstallation({
+      const verifiedRuntime = await prepareVerifiedPrimeRuntime({
         artifactPath: request.agent.releaseArtifact,
-        executablePath: request.agent.executable,
+        runtimeDir: join(
+          store.jobDir(jobId),
+          "artifacts",
+          "prime-agent",
+          "verified-runtime",
+        ),
         signal: controller.signal,
         terminationGraceMs: request.budget.cancellationGraceMs,
       });
+      agentRequest = {
+        ...request,
+        agent: { ...request.agent, executable: verifiedRuntime.executablePath },
+      };
     }
     assertJobActive();
-    agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
+    agent = createAgentBackend(agentRequest, store.jobDir(jobId), primeRuntime);
     const agentResult = await agent.start(
       request.task,
       execution.worktreePath,

@@ -1,15 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PrimeJsonlRpcBackend,
+  prepareVerifiedPrimeRuntime,
   verifyPrimeInstallation,
   writePrimeModelsConfig,
   primeRpcLaunchArguments,
 } from "../dist/index.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
 
 test("Prime RPC backend enforces the configured assistant-turn budget", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-turn-budget-"));
@@ -83,6 +88,50 @@ test("Prime installation verifies release artifact checksum and executable versi
       }),
     /version mismatch/,
   );
+});
+
+test("Prime runtime launches exclusively from the verified release extraction", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-extracted-runtime-"));
+  const packageRoot = join(root, "source", "package");
+  const bundle = join(packageRoot, "dist", "bundle");
+  await mkdir(bundle, { recursive: true });
+  const cli = 'import "./chunk.js"; console.log("0.7.2");\n';
+  await writeFile(join(packageRoot, "package.json"), '{"type":"module"}\n');
+  await writeFile(join(bundle, "cli.js"), cli);
+  await writeFile(
+    join(bundle, "chunk.js"),
+    'globalThis.marker = "verified";\n',
+  );
+  const artifact = join(root, "release.tgz");
+  await exec("tar", ["-czf", artifact, "-C", join(root, "source"), "package"]);
+  const artifactSha = createHash("sha256")
+    .update(await readFile(artifact))
+    .digest("hex");
+  const cliSha = createHash("sha256").update(cli).digest("hex");
+
+  const installedBundle = join(root, "installed", "dist", "bundle");
+  await mkdir(installedBundle, { recursive: true });
+  await writeFile(join(installedBundle, "cli.js"), cli);
+  await writeFile(
+    join(installedBundle, "chunk.js"),
+    'throw new Error("tampered");\n',
+  );
+
+  const prepared = await prepareVerifiedPrimeRuntime({
+    artifactPath: artifact,
+    runtimeDir: join(root, "private-runtime"),
+    expectedSha256: artifactSha,
+    expectedExecutableSha256: cliSha,
+  });
+  assert.notEqual(prepared.executablePath, join(installedBundle, "cli.js"));
+  assert.equal(
+    await readFile(
+      join(prepared.runtimeRoot, "package/dist/bundle/chunk.js"),
+      "utf8",
+    ),
+    'globalThis.marker = "verified";\n',
+  );
+  assert.equal((await stat(prepared.runtimeRoot)).mode & 0o777, 0o700);
 });
 
 test("Prime private config contains only scoped broker token and fixed model", async () => {
