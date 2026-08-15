@@ -84,6 +84,16 @@ async function waitFor(dispatcher, jobId, predicate, timeoutMs = 10_000) {
   throw new Error(`timed out waiting for ${jobId}`);
 }
 
+async function waitForEvent(store, jobId, predicate, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const events = await store.readEvents(jobId);
+    if (events.some(predicate)) return events;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  throw new Error(`timed out waiting for an event for ${jobId}`);
+}
+
 test("happy path creates a worktree, passes gates, commits, and records root-only env", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
@@ -243,6 +253,12 @@ test("event reader ignores only a partial final JSONL record and rejects middle 
     dispatcher,
     started.jobId,
     (value) => value.status === "succeeded",
+  );
+  await waitForEvent(
+    dispatcher.store,
+    started.jobId,
+    (event) =>
+      event.type === "state_changed" && event.data.to === "succeeded",
   );
   const path = join(stateRoot, "jobs", started.jobId, "events.jsonl");
   const count = (await dispatcher.store.readEvents(started.jobId)).length;
