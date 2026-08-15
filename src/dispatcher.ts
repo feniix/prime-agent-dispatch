@@ -142,7 +142,25 @@ export class PrimeDispatcher {
   }
 
   async status(jobId: string): Promise<unknown> {
-    const state = await this.store.readState(jobId);
+    let state = await this.store.readState(jobId);
+    if (!terminalStatuses.has(state.status) && state.terminalIntentStatus) {
+      try {
+        const result = await this.store.readResult(jobId);
+        if (result.status === state.terminalIntentStatus) {
+          state = await this.store.updateState(jobId, result.status, {
+            ...(result.commitSha ? { commitSha: result.commitSha } : {}),
+            noChanges: result.noChanges,
+            summary: result.summary,
+            ...(result.status === "failed" || result.status === "cancelled"
+              ? { error: result.summary }
+              : {}),
+            terminalIntentStatus: undefined,
+          });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
     const lease = new GlobalJobLease(this.stateRoot);
     const workerMissing =
       state.workerPid !== undefined

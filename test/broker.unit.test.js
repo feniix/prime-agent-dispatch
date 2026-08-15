@@ -241,3 +241,37 @@ test("broker accumulates observable token usage across Responses calls", async (
     await fake.close();
   }
 });
+
+test("broker rejects authenticated upstream redirects", async () => {
+  let redirectedRequests = 0;
+  const target = await upstream((_request, response) => {
+    redirectedRequests += 1;
+    response.end("credential leak target");
+  });
+  const redirector = await upstream((_request, response) => {
+    response.writeHead(307, { location: target.url.toString() });
+    response.end();
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: redirector.url,
+    accessToken: "must-not-follow",
+    accountId: "must-not-follow",
+  });
+  const lease = await broker.createLease("redirect", {
+    wallClockMs: 1000,
+    maxTokens: 10,
+  });
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    });
+    assert.equal(response.status, 502);
+    assert.equal(redirectedRequests, 0);
+  } finally {
+    await broker.close();
+    await redirector.close();
+    await target.close();
+  }
+});

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JobStore, PrimeStartInputSchema } from "../dist/index.js";
@@ -86,4 +86,20 @@ test("artifact paths cannot escape the job artifact directory", async () => {
   );
   assert.equal(await readFile(artifact, "utf8"), "bounded\n");
   assert.ok(artifact.startsWith(root));
+});
+
+test("event reads reject mismatched job ids and non-contiguous sequences", async () => {
+  for (const mutation of [
+    (event) => ({ ...event, jobId: "another-job" }),
+    (event) => ({ ...event, sequence: event.sequence + 2 }),
+  ]) {
+    const { store, request } = await storeFixture();
+    const events = await store.readEvents(request.jobId);
+    const path = join(store.jobDir(request.jobId), "events.jsonl");
+    await appendFile(path, `${JSON.stringify(mutation(events[0]))}\n`);
+    await assert.rejects(
+      () => store.readEvents(request.jobId),
+      /journal (?:job id|sequence) mismatch/,
+    );
+  }
 });

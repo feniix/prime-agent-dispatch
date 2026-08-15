@@ -45,6 +45,8 @@ let inferenceLease: InferenceLease | undefined;
 let primeRuntimeTmpDir: string | undefined;
 let jobAbortController: AbortController | undefined;
 let turnsUsed = 1;
+let cancellationPromise: Promise<void> | undefined;
+let performCancellation: (() => Promise<void>) | undefined;
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
   socket.end(
@@ -117,15 +119,9 @@ async function serveCommands(): Promise<void> {
               reply(socket, current);
               return;
             }
-            cancellationRequested = true;
-            jobAbortController?.abort();
-            await store.updateState(jobId, "cancelling", {
-              summary: "cancellation requested",
-            });
-            await inferenceLease?.revoke();
-            await agent?.abort(
-              (await store.readRequest(jobId)).budget.cancellationGraceMs,
-            );
+            if (!performCancellation)
+              throw new Error("job cancellation is not initialized");
+            await performCancellation();
             reply(socket, { accepted: true });
           }
         } catch (error) {
@@ -164,6 +160,55 @@ async function writeTerminalResult(
   await store.writeResult(result);
 }
 
+async function finalizeTerminalOutcome(
+  current: JobState,
+  status: "succeeded" | "failed" | "cancelled",
+  request: Awaited<ReturnType<JobStore["readRequest"]>>,
+  summary: string,
+  gateResults: GateResult[],
+  patch: Pick<JobState, "commitSha" | "noChanges" | "summary" | "error">,
+): Promise<JobState> {
+  const intent = await store.updateState(jobId, current.status, {
+    ...patch,
+    terminalIntentStatus: status,
+  });
+  const terminalView = { ...intent, ...patch, status } satisfies JobState;
+  await writeTerminalResult(terminalView, request, summary, gateResults);
+  return await store.updateState(jobId, status, {
+    ...patch,
+    terminalIntentStatus: undefined,
+  });
+}
+
+async function capturePartialEvidence(
+  request: Awaited<ReturnType<JobStore["readRequest"]>>,
+  state: JobState,
+): Promise<{ noChanges: boolean }> {
+  if (!state.worktreePath) return { noChanges: true };
+  const evidenceController = new AbortController();
+  const evidenceTimeout = setTimeout(() => evidenceController.abort(), 5_000);
+  const control = {
+    signal: evidenceController.signal,
+    terminationGraceMs: Math.min(request.budget.cancellationGraceMs, 1_000),
+  };
+  try {
+    await git(state.worktreePath, ["add", "-A"], control);
+    const diff = await git(
+      state.worktreePath,
+      ["diff", "--cached", "--binary", request.baseSha],
+      control,
+    );
+    await store.writeArtifact(
+      jobId,
+      "final.diff",
+      diff.slice(0, request.budget.maxOutputBytes),
+    );
+    return { noChanges: diff.length === 0 };
+  } finally {
+    clearTimeout(evidenceTimeout);
+  }
+}
+
 async function main(): Promise<void> {
   await new GlobalJobLease(stateRoot).claim(jobId, process.pid);
   const request = await store.readRequest(jobId);
@@ -186,21 +231,36 @@ async function main(): Promise<void> {
   };
   let state = await store.readState(jobId);
   let gateResults: GateResult[] = [];
+  const requestCancellation = async (): Promise<void> => {
+    cancellationRequested = true;
+    cancellationPromise ??= (async () => {
+      const current = await store.readState(jobId);
+      if (terminalStatuses.has(current.status)) return;
+      if (current.status !== "cancelling")
+        await store.updateState(jobId, "cancelling", {
+          summary: "cancellation requested",
+        });
+      jobAbortController?.abort(new Error("cancelled by request"));
+      await inferenceLease?.revoke();
+      await agent?.abort(request.budget.cancellationGraceMs);
+    })();
+    await cancellationPromise;
+  };
+  performCancellation = requestCancellation;
   try {
     await serveCommands();
     assertJobActive();
+    const executionBackend = new UnsafeLocalExecutionBackend();
+    const executionPlan = executionBackend.plan(request, stateRoot);
     state = await store.updateState(jobId, "provisioning", {
       workerPid: process.pid,
       socketPath: socketPath!,
+      ...executionPlan,
     });
-    const execution = await new UnsafeLocalExecutionBackend().prepare(
-      request,
-      stateRoot,
-      {
-        signal: controller.signal,
-        terminationGraceMs: request.budget.cancellationGraceMs,
-      },
-    );
+    const execution = await executionBackend.prepare(request, stateRoot, {
+      signal: controller.signal,
+      terminationGraceMs: request.budget.cancellationGraceMs,
+    });
     assertJobActive();
     state = await store.updateState(jobId, "running", execution);
     let primeRuntime:
@@ -294,7 +354,7 @@ async function main(): Promise<void> {
     state = await store.updateState(jobId, "verifying", {
       summary: agentResult.summary,
     });
-    for (const gate of request.gates) {
+    for (const [gateIndex, gate] of request.gates.entries()) {
       const command = await runCommand(gate.command, gate.args, {
         cwd: execution.worktreePath,
         env: buildRemoteInertGitEnvironment(),
@@ -317,7 +377,7 @@ async function main(): Promise<void> {
       gateResults.push(gateResult);
       await store.writeArtifact(
         jobId,
-        `checks/${gate.name.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`,
+        `checks/${String(gateIndex + 1).padStart(3, "0")}-${gate.name.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`,
         gateResult.output,
       );
       if (!gateResult.ok)
@@ -385,26 +445,21 @@ async function main(): Promise<void> {
     ].join("\n");
     await store.writeArtifact(jobId, "report.md", report);
     assertJobActive();
-    const succeededState: JobState = {
-      ...state,
-      status: "succeeded",
-      ...(commitSha ? { commitSha } : {}),
-      noChanges,
-      summary: agentResult.summary,
-    };
-    await writeTerminalResult(
-      succeededState,
+    assertJobActive();
+    state = await finalizeTerminalOutcome(
+      state,
+      "succeeded",
       request,
       agentResult.summary,
       gateResults,
+      {
+        ...(commitSha ? { commitSha } : {}),
+        noChanges,
+        summary: agentResult.summary,
+      },
     );
-    assertJobActive();
-    state = await store.updateState(jobId, "succeeded", {
-      ...(commitSha ? { commitSha } : {}),
-      noChanges,
-      summary: agentResult.summary,
-    });
   } catch (error) {
+    await cancellationPromise?.catch(() => undefined);
     const message = cancellationRequested
       ? "cancelled by request"
       : deadlineExceeded
@@ -412,29 +467,50 @@ async function main(): Promise<void> {
         : error instanceof Error
           ? error.message
           : String(error);
-    const current = await store.readState(jobId);
+    let current = await store.readState(jobId);
     const status = cancellationRequested ? "cancelled" : "failed";
     if (!terminalStatuses.has(current.status)) {
       state = { ...current, status, error: message, summary: message };
     } else {
       state = current;
     }
+    let noChanges = current.noChanges ?? true;
+    try {
+      ({ noChanges } = await capturePartialEvidence(request, current));
+    } catch (evidenceError) {
+      await store.appendEvent(jobId, "evidence_capture_failed", {
+        error:
+          evidenceError instanceof Error
+            ? evidenceError.message
+            : String(evidenceError),
+      });
+    }
     await store.writeArtifact(
       jobId,
       "report.md",
       `# Prime dispatch result ${jobId}\n\nStatus: ${state.status}\nError: ${message}\n`,
     );
-    await store.writeArtifact(jobId, "final.diff", "");
-    await writeTerminalResult(state, request, message, gateResults);
     if (!terminalStatuses.has(current.status)) {
-      state = await store.updateState(jobId, status, {
-        error: message,
-        summary: message,
-      });
+      state = await finalizeTerminalOutcome(
+        current,
+        status,
+        request,
+        message,
+        gateResults,
+        {
+          error: message,
+          summary: message,
+          noChanges,
+        },
+      );
+    } else {
+      state = current;
+      await writeTerminalResult(state, request, message, gateResults);
     }
   } finally {
     clearTimeout(deadline);
     jobAbortController = undefined;
+    performCancellation = undefined;
     await inferenceLease?.revoke();
     if (inferenceBroker)
       await store

@@ -5,6 +5,7 @@ import {
   appendFile,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   stat,
   symlink,
@@ -331,6 +332,66 @@ test("cancellation aborts an active verification gate", async () => {
     2_000,
   );
   assert.equal(state.summary, "cancelled by request");
+  const result = await dispatcher.result(started.jobId);
+  assert.equal(result.noChanges, false);
+  assert.match(
+    await readFile(result.diffArtifact, "utf8"),
+    /prototype-output\.txt/,
+  );
+  const events = await dispatcher.store.readEvents(started.jobId);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "state_changed" && event.data.to === "cancelling",
+    ),
+  );
+});
+
+test("a failed gate preserves the actual partial diff and truthful change status", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const failing = input(repo, root, "edit before gate failure");
+  failing.gates = [
+    {
+      name: "fails-after-edit",
+      command: process.execPath,
+      args: ["-e", "process.exit(7)"],
+      timeoutMs: 2_000,
+    },
+  ];
+  const started = await startConfirmed(dispatcher, failing);
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "failed",
+  );
+  const result = await dispatcher.result(started.jobId);
+  assert.equal(result.noChanges, false);
+  assert.match(
+    await readFile(result.diffArtifact, "utf8"),
+    /prototype-output\.txt/,
+  );
+});
+
+test("gate artifacts remain distinct when names sanitize to the same filename", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const colliding = input(repo, root, "gate filename collision");
+  colliding.gates = [
+    { name: "same/name", command: "/usr/bin/true", args: [], timeoutMs: 1_000 },
+    { name: "same?name", command: "/usr/bin/true", args: [], timeoutMs: 1_000 },
+  ];
+  const started = await startConfirmed(dispatcher, colliding);
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "succeeded",
+  );
+  const files = await readdir(
+    join(stateRoot, "jobs", started.jobId, "artifacts", "checks"),
+  );
+  assert.equal(files.length, 2);
+  assert.notEqual(files[0], files[1]);
 });
 
 test("event reader ignores only a partial final JSONL record and rejects middle corruption", async () => {

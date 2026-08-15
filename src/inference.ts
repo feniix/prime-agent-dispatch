@@ -238,6 +238,7 @@ export class ProductionInferenceBroker implements InferenceBackend {
     try {
       const upstream = await fetch(this.options.upstream, {
         method: "POST",
+        redirect: "error",
         signal: controller.signal,
         headers: {
           accept: "text/event-stream",

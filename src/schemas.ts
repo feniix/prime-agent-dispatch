@@ -129,6 +129,9 @@ export const JobStateSchema = z.object({
   noChanges: z.boolean().optional(),
   summary: z.string().optional(),
   error: z.string().optional(),
+  terminalIntentStatus: z
+    .enum(["succeeded", "failed", "cancelled", "interrupted"])
+    .optional(),
 });
 export type JobState = z.infer<typeof JobStateSchema>;
 

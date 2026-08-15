@@ -21,15 +21,21 @@ export interface ExecutionBackend {
 export class UnsafeLocalExecutionBackend implements ExecutionBackend {
   readonly kind = "unsafe-local";
 
+  plan(request: JobRequest, stateRoot: string): PreparedExecution {
+    return {
+      branchName: `prime/${request.jobId}`,
+      worktreePath: join(stateRoot, "worktrees", request.jobId),
+    };
+  }
+
   async prepare(
     request: JobRequest,
     stateRoot: string,
     control: { signal?: AbortSignal; terminationGraceMs?: number } = {},
   ): Promise<PreparedExecution> {
     assertUnsafeLocalPolicy(request.fixture, request.unsafeAllowLiveRepo);
-    const branchName = `prime/${request.jobId}`;
+    const { branchName, worktreePath } = this.plan(request, stateRoot);
     const worktreeRoot = join(stateRoot, "worktrees");
-    const worktreePath = join(worktreeRoot, request.jobId);
     await mkdir(worktreeRoot, { recursive: true });
     await git(
       request.canonicalRepoPath,
