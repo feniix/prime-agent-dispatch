@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createServer, type Socket } from "node:net";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentBackend, type AgentBackend } from "./agent.js";
@@ -41,6 +41,7 @@ let deadlineExceeded = false;
 let server: ReturnType<typeof createServer> | undefined;
 let inferenceBroker: ProductionInferenceBroker | undefined;
 let inferenceLease: InferenceLease | undefined;
+let primeRuntimeTmpDir: string | undefined;
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
   socket.end(
@@ -178,12 +179,11 @@ async function main(): Promise<void> {
       );
       const configDir = join(homeDir, ".prime", "agent");
       const sessionDir = join(homeDir, "sessions");
-      const tmpDir = join(
-        store.jobDir(jobId),
-        "artifacts",
-        "prime-agent",
-        "tmp",
-      );
+      // Prime's daemon owns a Unix socket under TMPDIR. macOS limits socket
+      // paths to roughly 104 bytes, so this unique private directory must stay
+      // short instead of living beneath the verbose durable job path.
+      const tmpDir = await mkdtemp("/tmp/prime-dispatch.");
+      primeRuntimeTmpDir = tmpDir;
       await Promise.all(
         [homeDir, configDir, sessionDir, tmpDir].map((path) =>
           mkdir(path, { recursive: true, mode: 0o700 }),
@@ -214,6 +214,10 @@ async function main(): Promise<void> {
       summary: agentResult.summary,
       metadata: agentResult.metadata,
     });
+    if (inferenceBroker)
+      await store.appendEvent(jobId, "inference_completed", {
+        ...inferenceBroker.stats(),
+      });
     if (cancellationRequested) {
       const cancelledState: JobState = {
         ...state,
@@ -356,12 +360,20 @@ async function main(): Promise<void> {
     }
   } finally {
     await inferenceLease?.revoke();
+    if (inferenceBroker)
+      await store
+        .appendEvent(jobId, "inference_final", {
+          ...inferenceBroker.stats(),
+        })
+        .catch(() => undefined);
     await inferenceBroker?.close();
     await agent?.dispose();
     await new Promise<void>(
       (resolve) => server?.close(() => resolve()) ?? resolve(),
     );
     await rm(socketPath, { force: true });
+    if (primeRuntimeTmpDir)
+      await rm(primeRuntimeTmpDir, { recursive: true, force: true });
     await new GlobalJobLease(stateRoot).release(jobId).catch(() => undefined);
   }
 }

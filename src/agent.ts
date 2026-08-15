@@ -99,8 +99,10 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     const onAbort = () => void this.abort(1_000);
     signal.addEventListener("abort", onAbort, { once: true });
     this.send({
+      id: "initial-prompt",
       type: "prompt",
-      message: JSON.stringify({ task, worktreePath }),
+      message:
+        this.kind === "fake" ? JSON.stringify({ task, worktreePath }) : task,
     });
     try {
       return await result;

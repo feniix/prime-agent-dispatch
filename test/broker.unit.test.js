@@ -21,7 +21,7 @@ test("broker authorizes scoped token and pins normalized Responses body", async 
     observed = { headers: request.headers, body: JSON.parse(raw) };
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end(
-      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"total_tokens":7}}}\n\n',
+      'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call"}}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"usage":{"total_tokens":7}}}\n\n',
     );
   });
   const broker = new ProductionInferenceBroker({
@@ -64,6 +64,9 @@ test("broker authorizes scoped token and pins normalized Responses body", async 
   assert.deepEqual(observed.body.include, ["reasoning.encrypted_content"]);
   assert.equal(observed.headers.authorization, "Bearer provider-secret");
   assert.equal(observed.headers["chatgpt-account-id"], "account-secret");
+  assert.equal(broker.stats().sawStreamingResponse, true);
+  assert.equal(broker.stats().sawToolCallEvent, true);
+  assert.equal(broker.stats().sawHighReasoning, true);
   await broker.close();
   await fake.close();
 });

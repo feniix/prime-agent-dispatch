@@ -103,6 +103,9 @@ export class ProductionInferenceBroker implements InferenceBackend {
     authorizedRequests: 0,
     rejectedRequests: 0,
     abortedUpstreams: 0,
+    sawStreamingResponse: false,
+    sawToolCallEvent: false,
+    sawHighReasoning: false,
   };
 
   constructor(private readonly options: BrokerOptions) {
@@ -214,6 +217,8 @@ export class ProductionInferenceBroker implements InferenceBackend {
       jsonError(response, 400, "invalid JSON request body");
       return;
     }
+    this.counters.sawHighReasoning ||=
+      (body.reasoning as { effort?: unknown }).effort === "high";
     const controller = new AbortController();
     lease.controllers.add(controller);
     lease.active += 1;
@@ -245,6 +250,9 @@ export class ProductionInferenceBroker implements InferenceBackend {
         "content-type":
           upstream.headers.get("content-type") ?? "text/event-stream",
       });
+      this.counters.sawStreamingResponse ||=
+        upstream.headers.get("content-type")?.includes("text/event-stream") ===
+        true;
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
       let observed = "";
@@ -255,6 +263,10 @@ export class ProductionInferenceBroker implements InferenceBackend {
         observed = (observed + decoder.decode(value, { stream: true })).slice(
           -64_000,
         );
+        this.counters.sawStreamingResponse ||=
+          observed.includes("event:") || observed.includes("data:");
+        this.counters.sawToolCallEvent ||=
+          /"type"\s*:\s*"(?:function_call|custom_tool_call)"/.test(observed);
       }
       for (const match of observed.matchAll(/"total_tokens"\s*:\s*(\d+)/g))
         lease.usedTokens = Math.max(lease.usedTokens, Number(match[1]));

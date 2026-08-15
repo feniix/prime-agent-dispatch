@@ -58,5 +58,7 @@ test("Prime private config contains only scoped broker token and fixed model", a
     "gpt-5.6-sol",
     "--thinking",
     "high",
+    "--tools",
+    "ipython",
   ]);
 });

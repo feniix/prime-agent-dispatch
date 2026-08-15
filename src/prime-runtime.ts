@@ -51,5 +51,7 @@ export function primeRpcLaunchArguments(executablePath: string): string[] {
     PRIME_MODEL,
     "--thinking",
     PRIME_REASONING_EFFORT,
+    "--tools",
+    "ipython",
   ];
 }
