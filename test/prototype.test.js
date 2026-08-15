@@ -243,6 +243,66 @@ test("the external wall-clock budget aborts a slow agent", async () => {
   assert.equal((await dispatcher.result(started.jobId)).status, "failed");
 });
 
+test("the external wall-clock budget includes verification gates", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const bounded = input(repo, root, "finish agent before slow gate");
+  bounded.budget.wallClockMs = 200;
+  bounded.gates = [
+    {
+      name: "slow-gate",
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 30_000)"],
+      timeoutMs: 2_000,
+    },
+  ];
+  const preview = await dispatcher.preview(bounded);
+  const started = await dispatcher.startConfirmed(
+    preview,
+    preview.summary.requestHash,
+  );
+  const state = await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "failed",
+    2_000,
+  );
+  assert.match(state.error, /wall-clock budget exceeded/);
+});
+
+test("cancellation aborts an active verification gate", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const cancellable = input(repo, root, "finish agent before cancelled gate");
+  cancellable.budget.cancellationGraceMs = 100;
+  cancellable.gates = [
+    {
+      name: "cancelled-gate",
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 30_000)"],
+      timeoutMs: 5_000,
+    },
+  ];
+  const preview = await dispatcher.preview(cancellable);
+  const started = await dispatcher.startConfirmed(
+    preview,
+    preview.summary.requestHash,
+  );
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "verifying",
+  );
+  await dispatcher.cancel(started.jobId);
+  const state = await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "cancelled",
+    2_000,
+  );
+  assert.equal(state.summary, "cancelled by request");
+});
+
 test("event reader ignores only a partial final JSONL record and rejects middle corruption", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);

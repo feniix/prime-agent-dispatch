@@ -44,6 +44,8 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   private readonly args: string[];
   private readonly codingAgentDir: string;
   private readonly environment: NodeJS.ProcessEnv | undefined;
+  private readonly abortGraceMs: number;
+  private aborting?: Promise<void>;
 
   constructor(options: {
     kind: string;
@@ -51,12 +53,14 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     args: string[];
     codingAgentDir: string;
     environment?: NodeJS.ProcessEnv;
+    abortGraceMs?: number;
   }) {
     this.kind = options.kind;
     this.command = options.command;
     this.args = options.args;
     this.codingAgentDir = options.codingAgentDir;
     this.environment = options.environment;
+    this.abortGraceMs = options.abortGraceMs ?? 1_000;
   }
 
   async start(
@@ -96,7 +100,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     const result = new Promise<AgentRunResult>((resolve, reject) => {
       this.pending = { resolve, reject };
     });
-    const onAbort = () => void this.abort(1_000);
+    const onAbort = () => void this.abort(this.abortGraceMs);
     signal.addEventListener("abort", onAbort, { once: true });
     this.send({
       id: "initial-prompt",
@@ -117,6 +121,11 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 
   async abort(graceMs: number): Promise<void> {
+    this.aborting ??= this.abortProcess(graceMs);
+    await this.aborting;
+  }
+
+  private async abortProcess(graceMs: number): Promise<void> {
     if (!this.child || this.child.exitCode !== null) return;
     this.send({ type: "abort" });
     const exited = await Promise.race([
@@ -240,6 +249,7 @@ export function createAgentBackend(
       command: request.agent.executable ?? process.execPath,
       args: request.agent.executable ? [] : [fakePath],
       codingAgentDir,
+      abortGraceMs: request.budget.cancellationGraceMs,
     });
   }
   if (!primeRuntime) throw new Error("Prime runtime was not prepared");
@@ -255,5 +265,6 @@ export function createAgentBackend(
       tmpDir: primeRuntime.tmpDir,
       path: primeRuntime.path,
     }),
+    abortGraceMs: request.budget.cancellationGraceMs,
   });
 }

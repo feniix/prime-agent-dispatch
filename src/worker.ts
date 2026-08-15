@@ -42,6 +42,7 @@ let server: ReturnType<typeof createServer> | undefined;
 let inferenceBroker: ProductionInferenceBroker | undefined;
 let inferenceLease: InferenceLease | undefined;
 let primeRuntimeTmpDir: string | undefined;
+let jobAbortController: AbortController | undefined;
 let turnsUsed = 1;
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
@@ -93,6 +94,7 @@ async function serveCommands(): Promise<void> {
               return;
             }
             cancellationRequested = true;
+            jobAbortController?.abort();
             await store.updateState(jobId, "cancelling", {
               summary: "cancellation requested",
             });
@@ -140,17 +142,31 @@ async function writeTerminalResult(
 async function main(): Promise<void> {
   await new GlobalJobLease(stateRoot).claim(jobId, process.pid);
   const request = await store.readRequest(jobId);
-  await serveCommands();
-  let state = await store.updateState(jobId, "provisioning", {
-    workerPid: process.pid,
-    socketPath,
-  });
+  const controller = new AbortController();
+  jobAbortController = controller;
+  const deadline = setTimeout(() => {
+    deadlineExceeded = true;
+    jobAbortController?.abort();
+    void inferenceLease?.revoke();
+  }, request.budget.wallClockMs);
+  const assertJobActive = (): void => {
+    if (cancellationRequested) throw new Error("cancelled by request");
+    if (deadlineExceeded) throw new Error("job wall-clock budget exceeded");
+  };
+  let state = await store.readState(jobId);
   let gateResults: GateResult[] = [];
   try {
+    await serveCommands();
+    assertJobActive();
+    state = await store.updateState(jobId, "provisioning", {
+      workerPid: process.pid,
+      socketPath,
+    });
     const execution = await new UnsafeLocalExecutionBackend().prepare(
       request,
       stateRoot,
     );
+    assertJobActive();
     state = await store.updateState(jobId, "running", execution);
     let primeRuntime:
       | {
@@ -166,7 +182,9 @@ async function main(): Promise<void> {
         artifactPath: request.agent.releaseArtifact,
         executablePath: request.agent.executable,
       });
+      assertJobActive();
       const auth = await resolveCodexSubscriptionAuth();
+      assertJobActive();
       inferenceBroker = new ProductionInferenceBroker({
         upstream: new URL("https://chatgpt.com/backend-api/codex/responses"),
         accessToken: auth.accessToken,
@@ -178,6 +196,7 @@ async function main(): Promise<void> {
         wallClockMs: request.budget.wallClockMs,
         maxTokens: request.budget.maxTokens,
       });
+      assertJobActive();
       const homeDir = join(
         store.jobDir(jobId),
         "artifacts",
@@ -208,15 +227,11 @@ async function main(): Promise<void> {
       );
       primeRuntime = { homeDir, configDir, sessionDir, tmpDir, path };
     }
+    assertJobActive();
     agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
-    const controller = new AbortController();
-    const deadline = setTimeout(() => {
-      deadlineExceeded = true;
-      controller.abort();
-    }, request.budget.wallClockMs);
     const agentResult = await agent
-      .start(request.task, execution.worktreePath, controller.signal)
-      .finally(() => clearTimeout(deadline));
+      .start(request.task, execution.worktreePath, controller.signal);
+    assertJobActive();
     await store.appendEvent(jobId, "agent_completed", {
       summary: agentResult.summary,
       metadata: agentResult.metadata,
@@ -225,32 +240,6 @@ async function main(): Promise<void> {
       await store.appendEvent(jobId, "inference_completed", {
         ...inferenceBroker.stats(),
       });
-    if (cancellationRequested) {
-      const cancelledState: JobState = {
-        ...state,
-        status: "cancelled",
-        summary: "cancelled by request",
-        noChanges: true,
-      };
-      await store.writeArtifact(
-        jobId,
-        "report.md",
-        `# Prime dispatch result ${jobId}\n\nStatus: cancelled\n`,
-      );
-      await store.writeArtifact(jobId, "final.diff", "");
-      await writeTerminalResult(
-        cancelledState,
-        request,
-        "cancelled by request",
-      );
-      state = await store.updateState(jobId, "cancelled", {
-        summary: "cancelled by request",
-        noChanges: true,
-      });
-      return;
-    }
-    if (deadlineExceeded) throw new Error("job wall-clock budget exceeded");
-
     state = await store.updateState(jobId, "verifying", {
       summary: agentResult.summary,
     });
@@ -260,10 +249,13 @@ async function main(): Promise<void> {
         env: buildRemoteInertGitEnvironment(),
         timeoutMs: gate.timeoutMs,
         maxOutputBytes: request.budget.maxOutputBytes,
+        signal: controller.signal,
+        terminationGraceMs: request.budget.cancellationGraceMs,
       });
+      assertJobActive();
       const gateResult = {
         name: gate.name,
-        ok: command.exitCode === 0 && !command.timedOut,
+        ok: command.exitCode === 0 && !command.timedOut && !command.aborted,
         exitCode: command.exitCode,
         timedOut: command.timedOut,
         output: `${command.stdout}${command.stderr}`.slice(
@@ -281,8 +273,10 @@ async function main(): Promise<void> {
         throw new Error(`verification gate failed: ${gate.name}`);
     }
 
+    assertJobActive();
     state = await store.updateState(jobId, "committing");
     await git(execution.worktreePath, ["add", "-A"]);
+    assertJobActive();
     const staged = await git(execution.worktreePath, [
       "diff",
       "--cached",
@@ -304,6 +298,7 @@ async function main(): Promise<void> {
       ]);
       commitSha = await git(execution.worktreePath, ["rev-parse", "HEAD"]);
     }
+    assertJobActive();
     const diff = await git(execution.worktreePath, [
       "diff",
       "--binary",
@@ -366,6 +361,8 @@ async function main(): Promise<void> {
       });
     }
   } finally {
+    clearTimeout(deadline);
+    jobAbortController = undefined;
     await inferenceLease?.revoke();
     if (inferenceBroker)
       await store

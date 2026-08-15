@@ -5,6 +5,7 @@ export type CommandResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  aborted: boolean;
 };
 
 export async function runCommand(
@@ -15,6 +16,8 @@ export async function runCommand(
     env?: NodeJS.ProcessEnv;
     timeoutMs?: number;
     maxOutputBytes?: number;
+    signal?: AbortSignal;
+    terminationGraceMs?: number;
   } = {},
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
@@ -27,6 +30,7 @@ export async function runCommand(
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let timedOut = false;
+    let aborted = false;
     let killTimer: NodeJS.Timeout | undefined;
     const max = options.maxOutputBytes ?? 1_000_000;
     const collect = (
@@ -46,36 +50,47 @@ export async function runCommand(
       stderr = collect(stderr, chunk);
     });
     child.on("error", reject);
+    const terminate = (): void => {
+      try {
+        if (child.pid && process.platform !== "win32")
+          process.kill(-child.pid, "SIGTERM");
+        else child.kill("SIGTERM");
+      } catch {
+        // It may have exited between the trigger and signal.
+      }
+      killTimer ??= setTimeout(() => {
+        try {
+          if (child.pid && process.platform !== "win32")
+            process.kill(-child.pid, "SIGKILL");
+          else child.kill("SIGKILL");
+        } catch {
+          // It may have exited during the termination grace period.
+        }
+      }, options.terminationGraceMs ?? 250);
+    };
+    const onAbort = (): void => {
+      aborted = true;
+      terminate();
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
     const timer =
       options.timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
             timedOut = true;
-            try {
-              if (child.pid && process.platform !== "win32")
-                process.kill(-child.pid, "SIGTERM");
-              else child.kill("SIGTERM");
-            } catch {
-              // It may have exited between the timeout and signal.
-            }
-            killTimer = setTimeout(() => {
-              try {
-                if (child.pid && process.platform !== "win32")
-                  process.kill(-child.pid, "SIGKILL");
-                else child.kill("SIGKILL");
-              } catch {
-                // It may have exited during the termination grace period.
-              }
-            }, 250);
+            terminate();
           }, options.timeoutMs);
     child.on("close", (exitCode) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       resolve({
         exitCode,
         stdout: stdout.toString("utf8"),
         stderr: stderr.toString("utf8"),
         timedOut,
+        aborted,
       });
     });
   });
