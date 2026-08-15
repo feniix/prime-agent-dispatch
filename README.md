@@ -6,6 +6,15 @@ A bounded spike for this question:
 
 This is not production-ready. The default execution backend is intentionally named `unsafe-local` and accepts fixture repositories only.
 
+## Current status
+
+- **Subscription feasibility gate:** [`spikes/001-codex-subscription`](spikes/001-codex-subscription/README.md) is **VALIDATED**. Real Prime Agent `0.7.2` completed a streamed tool-call fixture run with `gpt-5.6-sol` and high reasoning through OpenClaw-held Codex subscription authentication. Prime received only a scoped, revocable token.
+- **Beta Milestone 1:** **COMPLETE for the disposable-fixture CLI scope.** It productionizes the broker seam, pins and verifies Prime, adds immutable confirmation and trusted host policy, enforces one global job and finite budgets, and validates real Prime completion and cancellation.
+- **Operational Discord beta:** not implemented or installed yet. The OpenClaw adapter, owner authorization, confirmation/status components, and retention policy remain later milestones.
+- **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
+
+The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
+
 ## Verdict: Beta Milestone 1 COMPLETE for disposable fixtures
 
 The vertical slice now validates detached per-job workers, reconnectable Unix-socket control, JSON/Zod state, Git worktrees, structured verification gates, cancellation, local commits, result artifacts, path policy, a real Prime JSONL RPC subprocess, and Codex-subscription inference through a scoped host broker.
