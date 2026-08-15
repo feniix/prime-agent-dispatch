@@ -42,13 +42,6 @@ export class PrimeDispatcher {
     this.store = new JobStore(this.stateRoot);
   }
 
-  async start(
-    input: PrimeStartInput,
-  ): Promise<{ jobId: string; state: unknown }> {
-    const prepared = await this.preview(input);
-    return await this.launch(prepared);
-  }
-
   async preview(input: PrimeStartInput): Promise<PreparedStart> {
     const parsed = PrimeStartInputSchema.parse(input);
     const repository = await resolveRepository(

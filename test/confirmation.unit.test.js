@@ -34,6 +34,7 @@ async function fixture() {
 test("dispatcher preview binds resolved SHA and immutable request hash", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
+  assert.equal("start" in dispatcher, false);
   const input = PrimeStartInputSchema.parse({
     task: "fixture",
     repoPath: repo,

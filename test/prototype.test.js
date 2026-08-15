@@ -94,10 +94,16 @@ async function waitForEvent(store, jobId, predicate, timeoutMs = 10_000) {
   throw new Error(`timed out waiting for an event for ${jobId}`);
 }
 
+async function startConfirmed(dispatcher, request) {
+  const preview = await dispatcher.preview(request);
+  return await dispatcher.startConfirmed(preview, preview.summary.requestHash);
+}
+
 test("happy path creates a worktree, passes gates, commits, and records root-only env", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
-  const started = await dispatcher.start(
+  const started = await startConfirmed(
+    dispatcher,
     input(repo, root, "write deterministic output"),
   );
   const state = await waitFor(
@@ -199,10 +205,13 @@ test("a fresh CLI process reconnects to a surviving worker for steer and cancel"
 test("dispatcher enforces one active job globally and releases after terminal state", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
-  const first = await dispatcher.start(input(repo, root, "SLOW lease holder"));
+  const first = await startConfirmed(
+    dispatcher,
+    input(repo, root, "SLOW lease holder"),
+  );
   await waitFor(dispatcher, first.jobId, (value) => value.status === "running");
   await assert.rejects(
-    () => dispatcher.start(input(repo, root, "must wait")),
+    () => startConfirmed(dispatcher, input(repo, root, "must wait")),
     /active job already holds global lease/,
   );
   await dispatcher.cancel(first.jobId);
@@ -213,7 +222,10 @@ test("dispatcher enforces one active job globally and releases after terminal st
   );
   for (let attempt = 0; attempt < 50; attempt += 1) {
     try {
-      const second = await dispatcher.start(input(repo, root, "after release"));
+      const second = await startConfirmed(
+        dispatcher,
+        input(repo, root, "after release"),
+      );
       await waitFor(
         dispatcher,
         second.jobId,
@@ -233,7 +245,7 @@ test("the external wall-clock budget aborts a slow agent", async () => {
   const dispatcher = new PrimeDispatcher(stateRoot);
   const bounded = input(repo, root, "SLOW until deadline");
   bounded.budget.wallClockMs = 150;
-  const started = await dispatcher.start(bounded);
+  const started = await startConfirmed(dispatcher, bounded);
   const state = await waitFor(
     dispatcher,
     started.jobId,
@@ -306,7 +318,8 @@ test("cancellation aborts an active verification gate", async () => {
 test("event reader ignores only a partial final JSONL record and rejects middle corruption", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
-  const started = await dispatcher.start(
+  const started = await startConfirmed(
+    dispatcher,
     input(repo, root, "write journal fixture"),
   );
   await waitFor(
@@ -361,7 +374,7 @@ test("unsafe-local rejects non-fixture repositories without an explicit override
   const dispatcher = new PrimeDispatcher(stateRoot);
   const unsafeInput = input(repo, root, "must not run");
   unsafeInput.fixture = false;
-  const started = await dispatcher.start(unsafeInput);
+  const started = await startConfirmed(dispatcher, unsafeInput);
   const state = await waitFor(
     dispatcher,
     started.jobId,
@@ -454,7 +467,7 @@ test("a gate that ignores SIGTERM is killed after the hard timeout", async () =>
     },
   ];
   const startedAt = Date.now();
-  const started = await dispatcher.start(bounded);
+  const started = await startConfirmed(dispatcher, bounded);
   const state = await waitFor(
     dispatcher,
     started.jobId,
