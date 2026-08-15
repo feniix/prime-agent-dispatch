@@ -9,6 +9,8 @@ export function buildPrimeEnvironment(options: {
   path: string;
   brokerEndpoint?: string;
   brokerToken?: string;
+  configDir?: string;
+  sessionDir?: string;
 }): NodeJS.ProcessEnv {
   return {
     PATH: options.path,
@@ -16,8 +18,12 @@ export function buildPrimeEnvironment(options: {
     LC_ALL: "C.UTF-8",
     HOME: options.jobHome,
     TMPDIR: options.tmpDir,
-    PRIME_AGENT_CODING_AGENT_DIR: options.jobHome,
+    PRIME_AGENT_CODING_AGENT_DIR: options.configDir ?? options.jobHome,
+    PRIME_AGENT_SESSION_DIR:
+      options.sessionDir ?? `${options.jobHome}/sessions`,
     RLM_MAX_DEPTH: "0",
+    PI_OFFLINE: "1",
+    PI_SKIP_VERSION_CHECK: "1",
     ...(options.brokerEndpoint
       ? { OPENAI_BASE_URL: options.brokerEndpoint }
       : {}),

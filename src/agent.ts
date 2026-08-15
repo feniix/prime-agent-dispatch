@@ -2,6 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { JobRequest } from "./schemas.js";
+import { buildPrimeEnvironment } from "./policy.js";
+import { primeRpcLaunchArguments } from "./prime-runtime.js";
 
 export type AgentRunResult = {
   summary: string;
@@ -41,17 +43,20 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   private readonly command: string;
   private readonly args: string[];
   private readonly codingAgentDir: string;
+  private readonly environment: NodeJS.ProcessEnv | undefined;
 
   constructor(options: {
     kind: string;
     command: string;
     args: string[];
     codingAgentDir: string;
+    environment?: NodeJS.ProcessEnv;
   }) {
     this.kind = options.kind;
     this.command = options.command;
     this.args = options.args;
     this.codingAgentDir = options.codingAgentDir;
+    this.environment = options.environment;
   }
 
   async start(
@@ -61,15 +66,13 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   ): Promise<AgentRunResult> {
     if (this.child) throw new Error("agent backend already started");
     await mkdir(this.codingAgentDir, { recursive: true });
-    const env: NodeJS.ProcessEnv = {
-      PATH: process.env.PATH ?? "/usr/bin:/bin",
-      LANG: process.env.LANG ?? "C.UTF-8",
-      LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
-      TMPDIR: process.env.TMPDIR ?? "/tmp",
-      HOME: this.codingAgentDir,
-      PRIME_AGENT_CODING_AGENT_DIR: this.codingAgentDir,
-      RLM_MAX_DEPTH: "0",
-    };
+    const env =
+      this.environment ??
+      buildPrimeEnvironment({
+        jobHome: this.codingAgentDir,
+        tmpDir: process.env.TMPDIR ?? "/tmp",
+        path: process.env.PATH ?? "/usr/bin:/bin",
+      });
     this.child = spawn(this.command, this.args, {
       cwd: worktreePath,
       env,
@@ -219,6 +222,12 @@ function extractLastAssistantText(messages: unknown): string | undefined {
 export function createAgentBackend(
   request: JobRequest,
   jobDir: string,
+  primeRuntime?: {
+    homeDir: string;
+    configDir: string;
+    sessionDir: string;
+    tmpDir: string;
+  },
 ): AgentBackend {
   const codingAgentDir = `${jobDir}/artifacts/prime-agent`;
   if (request.agent.kind === "fake") {
@@ -230,12 +239,18 @@ export function createAgentBackend(
       codingAgentDir,
     });
   }
-  const args = ["--mode", "rpc"];
-  if (request.agent.model) args.push("--model", request.agent.model);
+  if (!primeRuntime) throw new Error("Prime runtime was not prepared");
   return new PrimeJsonlRpcBackend({
     kind: "prime-rpc",
-    command: request.agent.executable,
-    args,
-    codingAgentDir,
+    command: process.execPath,
+    args: primeRpcLaunchArguments(request.agent.executable),
+    codingAgentDir: primeRuntime.configDir,
+    environment: buildPrimeEnvironment({
+      jobHome: primeRuntime.homeDir,
+      configDir: primeRuntime.configDir,
+      sessionDir: primeRuntime.sessionDir,
+      tmpDir: primeRuntime.tmpDir,
+      path: process.env.PATH ?? "/usr/bin:/bin",
+    }),
   });
 }

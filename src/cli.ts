@@ -86,8 +86,8 @@ async function main(): Promise<void> {
         ...(one(parsed.flags, "--agent-executable")
           ? { executable: one(parsed.flags, "--agent-executable") }
           : {}),
-        ...(one(parsed.flags, "--model")
-          ? { model: one(parsed.flags, "--model") }
+        ...(one(parsed.flags, "--prime-release-artifact")
+          ? { releaseArtifact: one(parsed.flags, "--prime-release-artifact") }
           : {}),
       },
     });

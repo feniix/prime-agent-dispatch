@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import { runCommand } from "./process.js";
 
 export const PRIME_AGENT_VERSION = "0.7.2" as const;
 export const PRIME_AGENT_SHA256 =
@@ -26,4 +27,30 @@ export async function verifyPrimeRelease(options: {
       `Prime Agent checksum mismatch: expected ${expectedSha256}, got ${actual}`,
     );
   return { version: expectedVersion, sha256: actual };
+}
+
+export async function verifyPrimeInstallation(options: {
+  artifactPath: string;
+  executablePath: string;
+  expectedSha256?: string;
+}): Promise<void> {
+  await verifyPrimeRelease({
+    artifactPath: options.artifactPath,
+    expectedVersion: PRIME_AGENT_VERSION,
+    expectedSha256: options.expectedSha256 ?? PRIME_AGENT_SHA256,
+  });
+  const result = await runCommand(
+    process.execPath,
+    [options.executablePath, "--version"],
+    {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      timeoutMs: 10_000,
+      maxOutputBytes: 4_096,
+    },
+  );
+  const version = (result.stdout || result.stderr).trim();
+  if (result.exitCode !== 0 || version !== PRIME_AGENT_VERSION)
+    throw new Error(
+      `Prime Agent version mismatch: expected ${PRIME_AGENT_VERSION}, got ${version || "no version"}`,
+    );
 }

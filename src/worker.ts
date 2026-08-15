@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createServer, type Socket } from "node:net";
-import { rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentBackend, type AgentBackend } from "./agent.js";
@@ -15,6 +15,10 @@ import {
 import { terminalStatuses } from "./state-machine.js";
 import { git, runCommand } from "./process.js";
 import { GlobalJobLease } from "./lease.js";
+import { ProductionInferenceBroker, type InferenceLease } from "./inference.js";
+import { resolveCodexSubscriptionAuth } from "./openclaw-auth.js";
+import { verifyPrimeInstallation } from "./release.js";
+import { writePrimeModelsConfig } from "./prime-runtime.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -31,6 +35,8 @@ let agent: AgentBackend | undefined;
 let cancellationRequested = false;
 let deadlineExceeded = false;
 let server: ReturnType<typeof createServer> | undefined;
+let inferenceBroker: ProductionInferenceBroker | undefined;
+let inferenceLease: InferenceLease | undefined;
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
   socket.end(
@@ -79,6 +85,7 @@ async function serveCommands(): Promise<void> {
             await store.updateState(jobId, "cancelling", {
               summary: "cancellation requested",
             });
+            await inferenceLease?.revoke();
             await agent?.abort(
               (await store.readRequest(jobId)).budget.cancellationGraceMs,
             );
@@ -133,7 +140,58 @@ async function main(): Promise<void> {
       stateRoot,
     );
     state = await store.updateState(jobId, "running", execution);
-    agent = createAgentBackend(request, store.jobDir(jobId));
+    let primeRuntime:
+      | {
+          homeDir: string;
+          configDir: string;
+          sessionDir: string;
+          tmpDir: string;
+        }
+      | undefined;
+    if (request.agent.kind === "prime-rpc") {
+      await verifyPrimeInstallation({
+        artifactPath: request.agent.releaseArtifact,
+        executablePath: request.agent.executable,
+      });
+      const auth = await resolveCodexSubscriptionAuth();
+      inferenceBroker = new ProductionInferenceBroker({
+        upstream: new URL("https://chatgpt.com/backend-api/codex/responses"),
+        accessToken: auth.accessToken,
+        accountId: auth.accountId,
+        maxConcurrency: 1,
+        maxRequestBytes: 4 * 1024 * 1024,
+      });
+      inferenceLease = await inferenceBroker.createLease(jobId, {
+        wallClockMs: request.budget.wallClockMs,
+        maxTokens: request.budget.maxTokens,
+      });
+      const homeDir = join(
+        store.jobDir(jobId),
+        "artifacts",
+        "prime-agent",
+        "home",
+      );
+      const configDir = join(homeDir, ".prime", "agent");
+      const sessionDir = join(homeDir, "sessions");
+      const tmpDir = join(
+        store.jobDir(jobId),
+        "artifacts",
+        "prime-agent",
+        "tmp",
+      );
+      await Promise.all(
+        [homeDir, configDir, sessionDir, tmpDir].map((path) =>
+          mkdir(path, { recursive: true, mode: 0o700 }),
+        ),
+      );
+      await writePrimeModelsConfig({
+        configDir,
+        brokerBaseUrl: inferenceLease.endpoint.toString(),
+        scopedToken: inferenceLease.opaqueToken,
+      });
+      primeRuntime = { homeDir, configDir, sessionDir, tmpDir };
+    }
+    agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
     const controller = new AbortController();
     const deadline = setTimeout(() => {
       deadlineExceeded = true;
@@ -284,6 +342,8 @@ async function main(): Promise<void> {
       });
     }
   } finally {
+    await inferenceLease?.revoke();
+    await inferenceBroker?.close();
     await agent?.dispose();
     await new Promise<void>(
       (resolve) => server?.close(() => resolve()) ?? resolve(),

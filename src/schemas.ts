@@ -78,8 +78,8 @@ export const AgentConfigSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("prime-rpc"),
-    executable: z.string().min(1).default("prime-agent"),
-    model: z.string().min(1).optional(),
+    executable: z.string().min(1),
+    releaseArtifact: z.string().min(1),
   }),
 ]);
 
