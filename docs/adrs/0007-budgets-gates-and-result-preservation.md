@@ -42,9 +42,9 @@ Gates are executable-plus-argv records with fixed cwd, timeout, and output ceili
 
 ### Confirmation
 
-Tests cover a successful gate and commit, external wall-clock cancellation, interactive cancellation, bounded output, and a gate that ignores `SIGTERM` and is killed after the hard timeout. Host ceilings are 30 minutes, 250,000 observable model tokens, 50 externally submitted Prime turns, 10 minutes per gate, and a 10-second cancellation grace; jobs may request only lower finite values. The broker denies later requests once observed cumulative tokens reach the job limit.
+Tests cover a successful gate and commit, external wall-clock cancellation, interactive cancellation, bounded output, and a gate that ignores `SIGTERM` and is killed after the hard timeout. Host ceilings are 30 minutes, 250,000 observable model tokens, 50 externally submitted Prime turns, 10 minutes per gate, and a 10-second cancellation grace; jobs may request only lower finite values. The broker denies later requests once observed cumulative tokens reach the job limit, making this a soft observable admission ceiling rather than exact per-token enforcement.
 
-The opt-in live fixture passed its trusted host-configured gate, created an unsigned local commit, wrote result/report/diff artifacts, and separately demonstrated cancellation revoking inference before aborting Prime. A single upstream response can exceed the remaining token allowance before usage becomes observable, so this is a hard admission ceiling rather than preemptive per-token termination.
+The opt-in live fixture passed its trusted host-configured gate, created an unsigned local commit, wrote result/report/diff artifacts, and separately demonstrated cancellation revoking inference before aborting Prime. A single upstream response can exceed the remaining token allowance before usage becomes observable, so this is a soft admission ceiling rather than preemptive per-token termination.
 
 ## More Information
 

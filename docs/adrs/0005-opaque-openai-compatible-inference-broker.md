@@ -42,7 +42,7 @@ The proxy must pin the upstream and model server-side, forward supported bodies 
 
 ### Confirmation
 
-Beta Milestone 1 implements the broker as a production module, independently of the tracked spike. It resolves Codex subscription OAuth through OpenClaw's public provider-auth runtime, keeps the access token and account identifier in the trusted worker process, and gives Prime only a random expiring lease token in its job-private model configuration. The broker fixes the upstream and `gpt-5.6-sol`/high reasoning server-side, normalizes Codex-incompatible Responses fields, streams tool calls, bounds request size and concurrency, records observable cumulative usage, and aborts in-flight requests on revocation.
+Beta Milestone 1 implements the broker as a production module, independently of the tracked spike. The trusted detached worker resolves Codex subscription OAuth through OpenClaw's public provider-auth runtime, keeps the access token and account identifier outside Prime, and gives Prime only a random expiring lease token in its job-private model configuration. The broker fixes the upstream and `gpt-5.6-sol`/high reasoning server-side, normalizes Codex-incompatible Responses fields, streams tool calls, bounds request size and concurrency, records observable cumulative usage, rejects redirects, and aborts in-flight requests on revocation.
 
 Unit tests use a local fake upstream to confirm authorization, pinning, normalization, expiry, revocation, cancellation, size/concurrency/token limits, and non-disclosure. The opt-in live fixture recorded streamed inference, a function call, high reasoning, a successful local edit, and cancellation with an aborted upstream. Prime is never configured against OpenClaw's agent HTTP endpoint.
 

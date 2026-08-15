@@ -29,7 +29,7 @@ Discord requests must be able to start long-running Prime work without holding a
 
 Chosen option: **explicit detached jobs with one root Prime agent**, exposed through `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
 
-Prime recursion is hard-disabled per job with a dedicated Prime agent directory and `RLM_MAX_DEPTH=0`. The harness owns a per-job worker and reconnectable Unix socket rather than relying on anonymous RPC pipes as a recovery boundary.
+Prime's built-in RLM delegation is disabled per job with a dedicated Prime agent directory and `RLM_MAX_DEPTH=0`. This is not a hard single-process boundary because the allowed IPython tool can launch processes. The harness owns a per-job worker and reconnectable Unix socket rather than relying on anonymous RPC pipes as a recovery boundary.
 
 ### Consequences
 
