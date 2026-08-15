@@ -4,6 +4,8 @@ export * from "./execution.js";
 export * from "./inference.js";
 export * from "./notifications.js";
 export * from "./openclaw-adapter.js";
+export * from "./policy.js";
+export * from "./release.js";
 export * from "./repository.js";
 export * from "./schemas.js";
 export * from "./state-machine.js";
