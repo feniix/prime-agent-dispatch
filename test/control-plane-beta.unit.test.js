@@ -49,10 +49,14 @@ test("missing worker for a nonterminal job reconciles to interrupted", async () 
     workerPid: 99999999,
     socketPath: join(root, "missing.sock"),
   });
+  await new GlobalJobLease(root).acquire(jobId, 99999999);
   const dispatcher = new PrimeDispatcher(root);
   const state = await dispatcher.status(jobId);
   assert.equal(state.status, "interrupted");
   assert.match(state.error, /worker process is missing/);
+  const replacement = new GlobalJobLease(root);
+  await replacement.acquire("replacement", process.pid);
+  await replacement.release("replacement");
 });
 
 test("caller budgets cannot exceed conservative host maximums", () => {

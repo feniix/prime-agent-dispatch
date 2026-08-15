@@ -131,10 +131,14 @@ export class PrimeDispatcher {
       state.workerPid !== undefined &&
       !processExists(state.workerPid)
     ) {
-      return await this.store.updateState(jobId, "interrupted", {
+      const interrupted = await this.store.updateState(jobId, "interrupted", {
         error: "worker process is missing; preserved job evidence",
         summary: "worker process is missing; job interrupted",
       });
+      await new GlobalJobLease(this.stateRoot)
+        .release(jobId)
+        .catch(() => undefined);
+      return interrupted;
     }
     return state;
   }
