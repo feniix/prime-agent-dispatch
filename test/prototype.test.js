@@ -19,9 +19,6 @@ import {
   JobStore,
   PrimeDispatcher,
   PrimeStartInputSchema,
-  assertTransition,
-  canTransition,
-  createOpenClawTools,
   resolveRepository,
 } from "../dist/index.js";
 
@@ -461,74 +458,6 @@ test("unsafe-local rejects non-fixture repositories without an explicit override
   assert.match(state.error, /fixture-only/);
 });
 
-test("OpenClaw contract requires channel plus sender for writes", async () => {
-  const calls = [];
-  const client = {
-    async start(value) {
-      calls.push(["start", value]);
-      return {};
-    },
-    async status(jobId) {
-      calls.push(["status", jobId]);
-      return {};
-    },
-    async steer(jobId, message) {
-      calls.push(["steer", jobId, message]);
-      return {};
-    },
-    async cancel(jobId) {
-      calls.push(["cancel", jobId]);
-      return {};
-    },
-    async result(jobId) {
-      calls.push(["result", jobId]);
-      return {};
-    },
-  };
-  const tools = createOpenClawTools(client, {
-    allowedChannelIds: new Set(["allowed-channel"]),
-    allowedWriterSenderIds: new Set(["allowed-sender"]),
-    allowedRepoRoots: ["/trusted/repos"],
-    fixtureOnly: true,
-    agent: { kind: "fake" },
-  });
-  const cancel = tools.find((tool) => tool.name === "prime_cancel");
-  await assert.rejects(
-    () =>
-      cancel.execute(
-        { jobId: "job" },
-        { channelId: "allowed-channel", requesterSenderId: "other" },
-      ),
-    /sender is not authorized/,
-  );
-  await cancel.execute(
-    { jobId: "job" },
-    { channelId: "allowed-channel", requesterSenderId: "allowed-sender" },
-  );
-  const start = tools.find((tool) => tool.name === "prime_start");
-  await start.execute(
-    {
-      task: "fixture",
-      repoPath: "/fixture",
-      repoRoots: ["/spoofed"],
-      fixture: false,
-      unsafeAllowLiveRepo: true,
-      agent: { kind: "prime-rpc", executable: "/tmp/evil" },
-      authorization: { channelId: "spoofed", senderId: "spoofed" },
-    },
-    { channelId: "allowed-channel", requesterSenderId: "allowed-sender" },
-  );
-  assert.deepEqual(calls[0], ["cancel", "job"]);
-  assert.deepEqual(calls[1][1].authorization, {
-    channelId: "allowed-channel",
-    senderId: "allowed-sender",
-  });
-  assert.deepEqual(calls[1][1].repoRoots, ["/trusted/repos"]);
-  assert.equal(calls[1][1].fixture, true);
-  assert.equal(calls[1][1].unsafeAllowLiveRepo, false);
-  assert.deepEqual(calls[1][1].agent, { kind: "fake" });
-});
-
 test("a gate that ignores SIGTERM is killed after the hard timeout", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
@@ -555,17 +484,4 @@ test("a gate that ignores SIGTERM is killed after the hard timeout", async () =>
   assert.ok(Date.now() - startedAt < 3_000);
   const result = await dispatcher.result(started.jobId);
   assert.equal(result.gateResults[0].timedOut, true);
-});
-
-test("state transitions are idempotent but reject invalid jumps", () => {
-  assert.equal(canTransition("running", "running"), true);
-  assert.doesNotThrow(() => assertTransition("running", "running"));
-  assert.throws(
-    () => assertTransition("queued", "succeeded"),
-    /invalid job transition/,
-  );
-  assert.throws(
-    () => assertTransition("succeeded", "running"),
-    /invalid job transition/,
-  );
 });

@@ -18,7 +18,7 @@ import {
 
 const exec = promisify(execFile);
 
-test("Prime release is pinned and checksum verified", async () => {
+test("configured Prime release and entrypoint checksums are verified", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-release-"));
   const artifact = join(root, "prime-agent.tar.gz");
   await writeFile(artifact, "known fixture");
@@ -73,7 +73,7 @@ test("Git guard rejects remote-capable commands while allowing local operations"
   assert.equal(guardedPath, `${bin}:/usr/bin:/bin`);
 });
 
-test("Git environment blocks transports even when the wrapper is bypassed", async () => {
+test("Git environment applies restrictive protocol defaults without the wrapper", async () => {
   let contacted = false;
   const server = createServer((_request, response) => {
     contacted = true;
@@ -96,7 +96,7 @@ test("Git environment blocks transports even when the wrapper is bypassed", asyn
   }
 });
 
-test("Prime gets a job-private root-only scrubbed environment", () => {
+test("Prime gets a job-private environment with built-in delegation disabled", () => {
   const env = buildPrimeEnvironment({
     jobHome: "/jobs/one/home",
     tmpDir: "/jobs/one/tmp",

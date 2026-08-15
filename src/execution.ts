@@ -10,7 +10,6 @@ export type PreparedExecution = {
 };
 
 export interface ExecutionBackend {
-  readonly kind: string;
   prepare(
     request: JobRequest,
     stateRoot: string,
@@ -19,8 +18,6 @@ export interface ExecutionBackend {
 }
 
 export class UnsafeLocalExecutionBackend implements ExecutionBackend {
-  readonly kind = "unsafe-local";
-
   plan(request: JobRequest, stateRoot: string): PreparedExecution {
     return {
       branchName: `prime/${request.jobId}`,
@@ -43,19 +40,5 @@ export class UnsafeLocalExecutionBackend implements ExecutionBackend {
       control,
     );
     return { worktreePath, branchName };
-  }
-}
-
-export class AppleContainerExecutionBackend implements ExecutionBackend {
-  readonly kind = "apple-container";
-
-  async prepare(
-    _request: JobRequest,
-    _stateRoot: string,
-    _control: { signal?: AbortSignal; terminationGraceMs?: number } = {},
-  ): Promise<PreparedExecution> {
-    throw new Error(
-      "Apple container execution is a contract stub in this prototype",
-    );
   }
 }

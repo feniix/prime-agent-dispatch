@@ -435,7 +435,6 @@ async function main(): Promise<void> {
     ].join("\n");
     await store.writeArtifact(jobId, "report.md", report);
     assertJobActive();
-    assertJobActive();
     state = await finalizeTerminalOutcome(
       state,
       "succeeded",

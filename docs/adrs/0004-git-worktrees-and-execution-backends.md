@@ -30,7 +30,7 @@ Prime must modify and verify repositories without disturbing the user's checkout
 
 Chosen option: **dedicated Git worktree behind an `ExecutionBackend`**.
 
-The dispatcher canonicalizes the repository and configured roots, rejects symlink escapes, resolves the requested base to a commit SHA, and creates `prime/<job-id>`. The prototype implements `unsafe-local` only for fixture use and retains an Apple-container contract stub.
+The dispatcher canonicalizes the repository and configured roots, rejects symlink escapes, resolves the requested base to a commit SHA, and creates `prime/<job-id>`. The prototype implements `unsafe-local` only for fixture use. `ExecutionBackend` remains the seam for a later contained implementation; there is no throw-only container placeholder.
 
 ### Consequences
 

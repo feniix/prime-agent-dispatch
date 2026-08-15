@@ -13,14 +13,6 @@ export type InferenceLease = {
   revoke(): Promise<void>;
 };
 
-export interface InferenceBackend {
-  readonly kind: string;
-  createLease(
-    jobId: string,
-    budget: { wallClockMs: number; maxTokens?: number },
-  ): Promise<InferenceLease>;
-}
-
 type LeaseState = {
   jobId: string;
   token: string;
@@ -33,7 +25,7 @@ type LeaseState = {
   expiryTimer: NodeJS.Timeout;
 };
 
-export type BrokerOptions = {
+type BrokerOptions = {
   upstream: URL;
   accessToken: string;
   accountId: string;
@@ -91,8 +83,7 @@ export function normalizeCodexResponsesBody(
   return body;
 }
 
-export class ProductionInferenceBroker implements InferenceBackend {
-  readonly kind = "openclaw-held-codex-broker";
+export class ProductionInferenceBroker {
   private readonly leases = new Map<string, LeaseState>();
   private readonly server = createServer(
     (request, response) => void this.handle(request, response),
@@ -294,14 +285,5 @@ export class ProductionInferenceBroker implements InferenceBackend {
       lease.active -= 1;
       lease.controllers.delete(controller);
     }
-  }
-}
-
-export class OpenClawOpaqueBrokerBackend implements InferenceBackend {
-  readonly kind = "openclaw-opaque-broker";
-  async createLease(): Promise<InferenceLease> {
-    throw new Error(
-      "OpenClaw adapter must instantiate ProductionInferenceBroker with trusted auth",
-    );
   }
 }

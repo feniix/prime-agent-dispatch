@@ -38,7 +38,7 @@ Chosen option: **standalone core and CLI with a thin optional OpenClaw adapter**
 
 ### Confirmation
 
-The repository builds and tests without OpenClaw packages. `PrimeDispatcher` and the CLI own orchestration; `openclaw-adapter.ts` only defines the five tools and trusted-policy translation. The adapter is not installed, and editable Discord status cards remain deferred behind `NotificationSink`.
+The repository builds and tests without OpenClaw packages. `PrimeDispatcher` and the CLI own orchestration. No placeholder adapter is retained: the production tool, policy, auth, and Discord component boundary is tracked by [issue #5](https://github.com/feniix/prime-dispatch-prototype/issues/5).
 
 ## More Information
 
