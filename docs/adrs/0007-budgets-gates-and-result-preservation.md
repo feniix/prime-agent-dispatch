@@ -50,3 +50,5 @@ The opt-in live fixture passed its trusted host-configured gate, created an unsi
 
 - [ADR-0003](0003-json-zod-control-plane.md)
 - [ADR-0005](0005-opaque-openai-compatible-inference-broker.md)
+- [ADR-0010](0010-quiesce-prime-before-verification.md)
+- [ADR-0011](0011-terminal-intent-and-preserved-evidence.md)

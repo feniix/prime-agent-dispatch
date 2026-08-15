@@ -52,3 +52,4 @@ The later thin OpenClaw adapter still needs to own broker construction directly.
 
 - [ADR-0001](0001-standalone-core-and-thin-openclaw-adapter.md)
 - [ADR-0007](0007-budgets-gates-and-result-preservation.md)
+- [ADR-0012](0012-self-contained-pinned-prime-runtime.md)

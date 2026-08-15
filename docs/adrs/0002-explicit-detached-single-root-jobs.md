@@ -50,3 +50,4 @@ The opt-in acceptance test runs the pinned real Prime release through the produc
 - Prime compatibility target: `0.7.2`, commit `97b994c3d7c45ca1ae635190e91e9e58ddf2577c`.
 - [Prime RPC protocol](https://github.com/PrimeIntellect-ai/prime-agent/blob/97b994c3d7c45ca1ae635190e91e9e58ddf2577c/packages/coding-agent/docs/rpc.md)
 - [ADR-0003](0003-json-zod-control-plane.md)
+- [ADR-0010](0010-quiesce-prime-before-verification.md)

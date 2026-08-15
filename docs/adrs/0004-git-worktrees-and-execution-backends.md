@@ -51,3 +51,4 @@ This current-user backend remains explicitly unsafe-local: it is not a sandbox a
 
 - Minimal environment variables are defense in depth, not a security boundary.
 - [ADR-0005](0005-opaque-openai-compatible-inference-broker.md)
+- [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md)

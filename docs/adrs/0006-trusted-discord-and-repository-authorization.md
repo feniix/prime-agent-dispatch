@@ -1,11 +1,14 @@
 ---
-status: accepted
+status: superseded
 date: 2026-08-15
 decision-makers: [feniix]
 consulted: [ryn]
+superseded-by: 0009-trusted-policy-and-hash-bound-confirmation.md
 ---
 
 # Authorize writes by trusted channel, sender, and configured repository roots
+
+This decision is superseded by [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md), which records the selected owner-from-any-channel policy and hash-bound confirmation for real jobs.
 
 ## Context and Problem Statement
 

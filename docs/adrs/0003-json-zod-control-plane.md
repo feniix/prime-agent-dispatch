@@ -56,3 +56,4 @@ state/jobs/<job-id>/
 ```
 
 - [ADR-0007](0007-budgets-gates-and-result-preservation.md)
+- [ADR-0011](0011-terminal-intent-and-preserved-evidence.md)

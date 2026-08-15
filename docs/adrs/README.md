@@ -9,9 +9,13 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 - [ADR-0003: Use versioned JSON and Zod for the durable control plane](0003-json-zod-control-plane.md)
 - [ADR-0004: Isolate Git changes with worktrees and an execution backend](0004-git-worktrees-and-execution-backends.md)
 - [ADR-0005: Broker raw OpenAI-compatible inference instead of nesting agent loops](0005-opaque-openai-compatible-inference-broker.md)
-- [ADR-0006: Authorize writes by trusted channel, sender, and configured repository roots](0006-trusted-discord-and-repository-authorization.md)
+- [ADR-0006: Authorize writes by trusted channel, sender, and configured repository roots](0006-trusted-discord-and-repository-authorization.md) — superseded by ADR-0009
 - [ADR-0007: Enforce external budgets, verification gates, and preserved results](0007-budgets-gates-and-result-preservation.md)
 - [ADR-0008: Use pnpm for package management](0008-use-pnpm.md)
+- [ADR-0009: Require trusted host policy and hash-bound confirmation for real jobs](0009-trusted-policy-and-hash-bound-confirmation.md)
+- [ADR-0010: Quiesce Prime before verification and commit](0010-quiesce-prime-before-verification.md)
+- [ADR-0011: Use terminal intent and preserve partial repository evidence](0011-terminal-intent-and-preserved-evidence.md)
+- [ADR-0012: Require a self-contained checksum-pinned Prime runtime for broader rollout](0012-self-contained-pinned-prime-runtime.md)
 
 ## Status conventions
 

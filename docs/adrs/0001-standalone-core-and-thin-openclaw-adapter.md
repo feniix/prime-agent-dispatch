@@ -43,4 +43,4 @@ The repository builds and tests without OpenClaw packages. `PrimeDispatcher` and
 ## More Information
 
 - [ADR-0002](0002-explicit-detached-single-root-jobs.md)
-- [ADR-0006](0006-trusted-discord-and-repository-authorization.md)
+- [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md)
