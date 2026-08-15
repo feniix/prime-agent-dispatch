@@ -212,13 +212,6 @@ async function main(): Promise<void> {
         }
       | undefined;
     if (request.agent.kind === "prime-rpc") {
-      await verifyPrimeInstallation({
-        artifactPath: request.agent.releaseArtifact,
-        executablePath: request.agent.executable,
-        signal: controller.signal,
-        terminationGraceMs: request.budget.cancellationGraceMs,
-      });
-      assertJobActive();
       const auth = await abortable(
         resolveCodexSubscriptionAuth(),
         controller.signal,
@@ -265,6 +258,12 @@ async function main(): Promise<void> {
         process.env.PATH ?? "/usr/bin:/bin",
       );
       primeRuntime = { homeDir, configDir, sessionDir, tmpDir, path };
+      await verifyPrimeInstallation({
+        artifactPath: request.agent.releaseArtifact,
+        executablePath: request.agent.executable,
+        signal: controller.signal,
+        terminationGraceMs: request.budget.cancellationGraceMs,
+      });
     }
     assertJobActive();
     agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
