@@ -42,11 +42,14 @@ The proxy must pin the upstream and model server-side, forward supported bodies 
 
 ### Confirmation
 
-The core currently contains only the `InferenceBackend` contract and an intentionally throwing broker stub. The tracked [Codex subscription spike](../../spikes/001-codex-subscription/README.md) validates the critical feasibility seam with Prime Agent `0.7.2`: OpenClaw-resolved OAuth remains in the trusted broker process, Prime receives only a scoped token, `gpt-5.6-sol` with high reasoning completes a streamed tool call, RPC cancellation aborts upstream work, revocation rejects token reuse, and provider credentials do not appear in Prime's environment or files.
+Beta Milestone 1 implements the broker as a production module, independently of the tracked spike. The trusted detached worker resolves Codex subscription OAuth through OpenClaw's public provider-auth runtime, keeps the access token and account identifier outside Prime, and gives Prime only a random expiring lease token in its job-private model configuration. The broker fixes the upstream and `gpt-5.6-sol`/high reasoning server-side, normalizes Codex-incompatible Responses fields, streams tool calls, bounds request size and concurrency, records observable cumulative usage, rejects redirects, and aborts in-flight requests on revocation.
 
-The spike broker is not yet integrated with the core or thin OpenClaw adapter. Full compliance still requires integrated cumulative budget enforcement, durable lifecycle control, and the same fixture proof through the installed adapter. Prime must never be configured against OpenClaw's agent HTTP endpoint.
+Unit tests use a local fake upstream to confirm authorization, pinning, normalization, expiry, revocation, cancellation, size/concurrency/token limits, and non-disclosure. The opt-in live fixture recorded streamed inference, a function call, high reasoning, a successful local edit, and cancellation with an aborted upstream. Prime is never configured against OpenClaw's agent HTTP endpoint.
+
+The later thin OpenClaw adapter still needs to own broker construction directly. Milestone 1's trusted CLI worker instantiates the same component for disposable-fixture acceptance.
 
 ## More Information
 
 - [ADR-0001](0001-standalone-core-and-thin-openclaw-adapter.md)
 - [ADR-0007](0007-budgets-gates-and-result-preservation.md)
+- [ADR-0012](0012-self-contained-pinned-prime-runtime.md)

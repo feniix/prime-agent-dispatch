@@ -108,7 +108,13 @@ async function acquireLock(
           continue;
         }
       } catch {
-        const info = await stat(lockDir);
+        let info;
+        try {
+          info = await stat(lockDir);
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw statError;
+        }
         if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
           await rm(lockDir, { recursive: true });
           continue;
@@ -303,9 +309,24 @@ export class JobStore {
       const line = lines[index];
       if (!line) continue;
       try {
-        parsed.push(EventSchema.parse(JSON.parse(line)));
+        const event = EventSchema.parse(JSON.parse(line));
+        const expectedSequence = parsed.length + 1;
+        if (event.jobId !== jobId)
+          throw new Error(
+            `journal job id mismatch at line ${index + 1}: expected ${jobId}, got ${event.jobId}`,
+          );
+        if (event.sequence !== expectedSequence)
+          throw new Error(
+            `journal sequence mismatch at line ${index + 1}: expected ${expectedSequence}, got ${event.sequence}`,
+          );
+        parsed.push(event);
       } catch (error) {
         if (finalIsPartial && index === lines.length - 1) break;
+        if (
+          error instanceof Error &&
+          /^journal (?:job id|sequence) mismatch/.test(error.message)
+        )
+          throw error;
         throw new Error(`corrupt events journal at line ${index + 1}`, {
           cause: error,
         });

@@ -32,3 +32,16 @@ test("spawn errors reject instead of producing a false command result", async ()
     /ENOENT/,
   );
 });
+
+test("AbortSignal terminates the complete command process group", async () => {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 20);
+  const startedAt = Date.now();
+  const result = await runCommand(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 30_000)"],
+    { signal: controller.signal, terminationGraceMs: 50 },
+  );
+  assert.equal(result.aborted, true);
+  assert.ok(Date.now() - startedAt < 1_000);
+});

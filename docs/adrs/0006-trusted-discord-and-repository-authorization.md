@@ -1,11 +1,14 @@
 ---
-status: accepted
+status: superseded
 date: 2026-08-15
 decision-makers: [feniix]
 consulted: [ryn]
+superseded-by: 0009-trusted-policy-and-hash-bound-confirmation.md
 ---
 
 # Authorize writes by trusted channel, sender, and configured repository roots
+
+This decision is superseded by [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md), which records the selected owner-from-any-channel policy and hash-bound confirmation for real jobs.
 
 ## Context and Problem Statement
 
@@ -41,7 +44,7 @@ The adapter replaces authorization, repository roots, fixture policy, unsafe-loc
 
 ### Confirmation
 
-Tests reject unauthorized senders and verify that spoofed authorization, repo roots, unsafe-local flags, and agent executables are replaced with trusted policy values. An installed adapter must map actual OpenClaw `deliveryContext` and `requesterSenderId` into this contract without accepting equivalent tool arguments.
+The provisional adapter contract was removed after this decision was superseded. Its replacement must implement [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md) using trusted OpenClaw runtime context.
 
 ## More Information
 

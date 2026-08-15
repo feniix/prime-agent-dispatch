@@ -10,43 +10,35 @@ export type PreparedExecution = {
 };
 
 export interface ExecutionBackend {
-  readonly kind: string;
-  prepare(request: JobRequest, stateRoot: string): Promise<PreparedExecution>;
+  prepare(
+    request: JobRequest,
+    stateRoot: string,
+    control?: { signal?: AbortSignal; terminationGraceMs?: number },
+  ): Promise<PreparedExecution>;
 }
 
 export class UnsafeLocalExecutionBackend implements ExecutionBackend {
-  readonly kind = "unsafe-local";
+  plan(request: JobRequest, stateRoot: string): PreparedExecution {
+    return {
+      branchName: `prime/${request.jobId}`,
+      worktreePath: join(stateRoot, "worktrees", request.jobId),
+    };
+  }
 
   async prepare(
     request: JobRequest,
     stateRoot: string,
+    control: { signal?: AbortSignal; terminationGraceMs?: number } = {},
   ): Promise<PreparedExecution> {
     assertUnsafeLocalPolicy(request.fixture, request.unsafeAllowLiveRepo);
-    const branchName = `prime/${request.jobId}`;
+    const { branchName, worktreePath } = this.plan(request, stateRoot);
     const worktreeRoot = join(stateRoot, "worktrees");
-    const worktreePath = join(worktreeRoot, request.jobId);
     await mkdir(worktreeRoot, { recursive: true });
-    await git(request.canonicalRepoPath, [
-      "worktree",
-      "add",
-      "-b",
-      branchName,
-      worktreePath,
-      request.baseSha,
-    ]);
-    return { worktreePath, branchName };
-  }
-}
-
-export class AppleContainerExecutionBackend implements ExecutionBackend {
-  readonly kind = "apple-container";
-
-  async prepare(
-    _request: JobRequest,
-    _stateRoot: string,
-  ): Promise<PreparedExecution> {
-    throw new Error(
-      "Apple container execution is a contract stub in this prototype",
+    await git(
+      request.canonicalRepoPath,
+      ["worktree", "add", "-b", branchName, worktreePath, request.baseSha],
+      control,
     );
+    return { worktreePath, branchName };
   }
 }

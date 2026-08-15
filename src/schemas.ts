@@ -1,6 +1,11 @@
 import { z } from "zod";
 
 export const SCHEMA_VERSION = 1 as const;
+export const HOST_MAX_WALL_CLOCK_MS = 30 * 60_000;
+export const HOST_MAX_MODEL_TOKENS = 250_000;
+export const HOST_MAX_PRIME_TURNS = 50;
+export const HOST_MAX_GATE_TIMEOUT_MS = 10 * 60_000;
+export const HOST_MAX_CANCELLATION_GRACE_MS = 10_000;
 
 export const JobStatusSchema = z.enum([
   "queued",
@@ -24,7 +29,7 @@ export const GateSchema = z.object({
     .number()
     .int()
     .positive()
-    .max(30 * 60_000)
+    .max(HOST_MAX_GATE_TIMEOUT_MS)
     .default(120_000),
 });
 
@@ -33,15 +38,32 @@ export const BudgetSchema = z.object({
     .number()
     .int()
     .positive()
-    .max(24 * 60 * 60_000)
+    .max(HOST_MAX_WALL_CLOCK_MS)
     .default(20 * 60_000),
-  cancellationGraceMs: z.number().int().positive().max(60_000).default(2_000),
+  cancellationGraceMs: z
+    .number()
+    .int()
+    .positive()
+    .max(HOST_MAX_CANCELLATION_GRACE_MS)
+    .default(2_000),
   maxOutputBytes: z
     .number()
     .int()
     .positive()
     .max(10_000_000)
     .default(1_000_000),
+  maxTokens: z
+    .number()
+    .int()
+    .positive()
+    .max(HOST_MAX_MODEL_TOKENS)
+    .default(HOST_MAX_MODEL_TOKENS),
+  maxTurns: z
+    .number()
+    .int()
+    .positive()
+    .max(HOST_MAX_PRIME_TURNS)
+    .default(HOST_MAX_PRIME_TURNS),
 });
 
 export const AuthorizationSchema = z.object({
@@ -56,8 +78,8 @@ export const AgentConfigSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("prime-rpc"),
-    executable: z.string().min(1).default("prime-agent"),
-    model: z.string().min(1).optional(),
+    executable: z.string().min(1),
+    releaseArtifact: z.string().min(1),
   }),
 ]);
 
@@ -75,6 +97,8 @@ export const PrimeStartInputSchema = z.object({
     wallClockMs: 20 * 60_000,
     cancellationGraceMs: 2_000,
     maxOutputBytes: 1_000_000,
+    maxTokens: HOST_MAX_MODEL_TOKENS,
+    maxTurns: HOST_MAX_PRIME_TURNS,
   }),
   authorization: AuthorizationSchema,
   agent: AgentConfigSchema.default({ kind: "fake" }),
@@ -105,6 +129,9 @@ export const JobStateSchema = z.object({
   noChanges: z.boolean().optional(),
   summary: z.string().optional(),
   error: z.string().optional(),
+  terminalIntentStatus: z
+    .enum(["succeeded", "failed", "cancelled", "interrupted"])
+    .optional(),
 });
 export type JobState = z.infer<typeof JobStateSchema>;
 

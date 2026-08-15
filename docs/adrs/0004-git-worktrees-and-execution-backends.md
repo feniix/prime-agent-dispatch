@@ -30,7 +30,7 @@ Prime must modify and verify repositories without disturbing the user's checkout
 
 Chosen option: **dedicated Git worktree behind an `ExecutionBackend`**.
 
-The dispatcher canonicalizes the repository and configured roots, rejects symlink escapes, resolves the requested base to a commit SHA, and creates `prime/<job-id>`. The prototype implements `unsafe-local` only for fixture use and retains an Apple-container contract stub.
+The dispatcher canonicalizes the repository and configured roots, rejects symlink escapes, resolves the requested base to a commit SHA, and creates `prime/<job-id>`. The prototype implements `unsafe-local` only for fixture use. `ExecutionBackend` remains the seam for a later contained implementation; there is no throw-only container placeholder.
 
 ### Consequences
 
@@ -43,9 +43,12 @@ The dispatcher canonicalizes the repository and configured roots, rejects symlin
 
 ### Confirmation
 
-Tests cover canonical repo roots, symlink escape rejection, immutable base resolution, worktree creation, gate execution, local commit, and final diff/report capture. No real repository is executed without an explicit unsafe local override. Real Prime execution remains blocked on a containment backend and narrow inference path.
+Tests cover canonical repo roots, symlink escape rejection, immutable base resolution, worktree creation, gate execution, dedicated unsigned commit identity, and final diff/report capture. The Prime environment uses a Git guard that rejects ordinary `fetch`, `pull`, and `push`, removes inherited authentication, and leaves configured remotes unchanged. With normal host networking this is defense in depth, not an enforceable no-remote boundary: model code can invoke an absolute Git binary with configuration overrides or another network client. The opt-in real Prime acceptance ran only against a disposable fixture and left its source checkout and inert remote configuration untouched.
+
+This current-user backend remains explicitly unsafe-local: it is not a sandbox and has normal host networking. Existing real repositories require separate explicit selection; containers remain deferred.
 
 ## More Information
 
 - Minimal environment variables are defense in depth, not a security boundary.
 - [ADR-0005](0005-opaque-openai-compatible-inference-broker.md)
+- [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md)

@@ -29,7 +29,7 @@ Discord requests must be able to start long-running Prime work without holding a
 
 Chosen option: **explicit detached jobs with one root Prime agent**, exposed through `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
 
-Prime recursion is hard-disabled per job with a dedicated Prime agent directory and `RLM_MAX_DEPTH=0`. The harness owns a per-job worker and reconnectable Unix socket rather than relying on anonymous RPC pipes as a recovery boundary.
+Prime's built-in RLM delegation is disabled per job with a dedicated Prime agent directory and `RLM_MAX_DEPTH=0`. This is not a hard single-process boundary because the allowed IPython tool can launch processes. The harness owns a per-job worker and reconnectable Unix socket rather than relying on anonymous RPC pipes as a recovery boundary.
 
 ### Consequences
 
@@ -41,10 +41,13 @@ Prime recursion is hard-disabled per job with a dedicated Prime agent directory 
 
 ### Confirmation
 
-Integration tests start a detached worker, reconnect from new CLI processes, steer it, cancel it, and observe the terminal result. The fake RPC process records `RLM_MAX_DEPTH=0` and the dedicated agent directory. A real Prime test must additionally attempt child creation and confirm runtime rejection.
+Integration tests start a detached worker, reconnect from new CLI processes, steer it, cancel it, and observe the terminal result. Both fake and real Prime launches use a minimal job-private environment with `RLM_MAX_DEPTH=0`; the real CLI allowlists only the IPython tool, so no child-agent tool is available. A global filesystem lease admits one active job. Reconciliation marks a nonterminal job interrupted when its recorded worker no longer exists.
+
+The opt-in acceptance test runs the pinned real Prime release through the production broker and proves a terminal fixture result. Automatic transcript resume after worker death remains deferred.
 
 ## More Information
 
 - Prime compatibility target: `0.7.2`, commit `97b994c3d7c45ca1ae635190e91e9e58ddf2577c`.
 - [Prime RPC protocol](https://github.com/PrimeIntellect-ai/prime-agent/blob/97b994c3d7c45ca1ae635190e91e9e58ddf2577c/packages/coding-agent/docs/rpc.md)
 - [ADR-0003](0003-json-zod-control-plane.md)
+- [ADR-0010](0010-quiesce-prime-before-verification.md)
