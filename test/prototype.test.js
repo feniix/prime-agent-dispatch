@@ -6,11 +6,13 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
   JobStore,
@@ -163,7 +165,23 @@ test("a fresh CLI process reconnects to a surviving worker for steer and cancel"
   ]);
   const { jobId } = JSON.parse(start.stdout);
   const dispatcher = new PrimeDispatcher(stateRoot);
-  await waitFor(dispatcher, jobId, (value) => value.status === "running");
+  const running = await waitFor(
+    dispatcher,
+    jobId,
+    (value) => value.status === "running",
+  );
+  assert.equal((await stat(running.socketPath)).mode & 0o777, 0o600);
+  assert.equal((await stat(dirname(running.socketPath))).mode & 0o777, 0o700);
+  const oversizedReply = await new Promise((resolve, reject) => {
+    const socket = createConnection(running.socketPath);
+    let reply = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write("x".repeat(70_000)));
+    socket.on("data", (chunk) => (reply += chunk));
+    socket.on("end", () => resolve(reply));
+    socket.on("error", reject);
+  });
+  assert.match(oversizedReply, /command exceeded input limit/);
   const steer = await exec(process.execPath, [
     cli,
     "steer",

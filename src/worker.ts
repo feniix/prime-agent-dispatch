@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createServer, type Socket } from "node:net";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentBackend, type AgentBackend } from "./agent.js";
@@ -34,7 +34,8 @@ function readArg(name: string): string {
 const stateRoot = readArg("--state-root");
 const jobId = readArg("--job-id");
 const store = new JobStore(stateRoot);
-const socketPath = join(tmpdir(), `prime-dispatch-${jobId}.sock`);
+let controlDir: string | undefined;
+let socketPath: string | undefined;
 let agent: AgentBackend | undefined;
 let cancellationRequested = false;
 let deadlineExceeded = false;
@@ -59,14 +60,23 @@ function reply(socket: Socket, value: unknown, error?: unknown): void {
 }
 
 async function serveCommands(): Promise<void> {
-  await rm(socketPath, { force: true });
+  controlDir = await mkdtemp(join(tmpdir(), "pdc."));
+  socketPath = join(controlDir, "control.sock");
   server = createServer((socket) => {
     socket.setEncoding("utf8");
     let buffer = "";
+    let handled = false;
     socket.on("data", (chunk) => {
+      if (handled) return;
       buffer += chunk;
+      if (Buffer.byteLength(buffer, "utf8") > 64 * 1024) {
+        handled = true;
+        reply(socket, undefined, new Error("command exceeded input limit"));
+        return;
+      }
       const lf = buffer.indexOf("\n");
       if (lf < 0) return;
+      handled = true;
       void (async () => {
         try {
           const command = WorkerCommandSchema.parse(
@@ -114,6 +124,7 @@ async function serveCommands(): Promise<void> {
     server?.once("error", reject);
     server?.listen(socketPath, resolve);
   });
+  await chmod(socketPath, 0o600);
 }
 
 async function writeTerminalResult(
@@ -160,7 +171,7 @@ async function main(): Promise<void> {
     assertJobActive();
     state = await store.updateState(jobId, "provisioning", {
       workerPid: process.pid,
-      socketPath,
+      socketPath: socketPath!,
     });
     const execution = await new UnsafeLocalExecutionBackend().prepare(
       request,
@@ -375,7 +386,7 @@ async function main(): Promise<void> {
     await new Promise<void>(
       (resolve) => server?.close(() => resolve()) ?? resolve(),
     );
-    await rm(socketPath, { force: true });
+    if (controlDir) await rm(controlDir, { recursive: true, force: true });
     if (primeRuntimeTmpDir)
       await rm(primeRuntimeTmpDir, { recursive: true, force: true });
     await new GlobalJobLease(stateRoot).release(jobId).catch(() => undefined);
