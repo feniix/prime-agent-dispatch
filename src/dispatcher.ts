@@ -116,6 +116,30 @@ export class PrimeDispatcher {
         },
       );
       closeSync(logFd);
+      let spawnError: Error | undefined;
+      child.once("error", (error) => (spawnError = error));
+      if (!child.pid) throw new Error("job worker did not receive a process id");
+      const startupDeadline = Date.now() + 5_000;
+      while (Date.now() < startupDeadline) {
+        const current = await this.store.readState(jobId);
+        if (current.workerPid === child.pid) break;
+        if (spawnError) throw spawnError;
+        if (child.exitCode !== null)
+          throw new Error(
+            `job worker exited during startup with code ${String(child.exitCode)}`,
+          );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const started = await this.store.readState(jobId);
+      if (started.workerPid !== child.pid) {
+        try {
+          if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+          else child.kill("SIGKILL");
+        } catch {
+          // The failed worker may already have exited.
+        }
+        throw new Error("timed out waiting for job worker startup");
+      }
       child.unref();
       return { jobId, state };
     } catch (error) {
@@ -126,18 +150,17 @@ export class PrimeDispatcher {
 
   async status(jobId: string): Promise<unknown> {
     const state = await this.store.readState(jobId);
-    if (
-      !terminalStatuses.has(state.status) &&
-      state.workerPid !== undefined &&
-      !processExists(state.workerPid)
-    ) {
+    const lease = new GlobalJobLease(this.stateRoot);
+    const workerMissing =
+      state.workerPid !== undefined
+        ? !processExists(state.workerPid)
+        : !(await lease.isHeldByLiveProcess(jobId));
+    if (!terminalStatuses.has(state.status) && workerMissing) {
       const interrupted = await this.store.updateState(jobId, "interrupted", {
         error: "worker process is missing; preserved job evidence",
         summary: "worker process is missing; job interrupted",
       });
-      await new GlobalJobLease(this.stateRoot)
-        .release(jobId)
-        .catch(() => undefined);
+      await lease.release(jobId).catch(() => undefined);
       return interrupted;
     }
     return state;

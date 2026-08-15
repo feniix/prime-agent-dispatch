@@ -138,6 +138,7 @@ async function writeTerminalResult(
 }
 
 async function main(): Promise<void> {
+  await new GlobalJobLease(stateRoot).claim(jobId, process.pid);
   const request = await store.readRequest(jobId);
   await serveCommands();
   let state = await store.updateState(jobId, "provisioning", {
@@ -385,6 +386,7 @@ async function main(): Promise<void> {
 }
 
 void main().catch(async (error) => {
+  await new GlobalJobLease(stateRoot).release(jobId).catch(() => undefined);
   process.stderr.write(
     `${error instanceof Error ? error.stack : String(error)}\n`,
   );
