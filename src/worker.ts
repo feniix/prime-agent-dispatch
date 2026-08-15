@@ -59,6 +59,20 @@ function reply(socket: Socket, value: unknown, error?: unknown): void {
   );
 }
 
+async function abortable<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(resolve, reject).finally(() =>
+      signal.removeEventListener("abort", onAbort),
+    );
+  });
+}
+
 async function serveCommands(): Promise<void> {
   controlDir = await mkdtemp(join(tmpdir(), "pdc."));
   socketPath = join(controlDir, "control.sock");
@@ -155,6 +169,7 @@ async function main(): Promise<void> {
   const request = await store.readRequest(jobId);
   const controller = new AbortController();
   jobAbortController = controller;
+  const deadlineAt = Date.now() + request.budget.wallClockMs;
   const deadline = setTimeout(() => {
     deadlineExceeded = true;
     jobAbortController?.abort();
@@ -162,7 +177,11 @@ async function main(): Promise<void> {
   }, request.budget.wallClockMs);
   const assertJobActive = (): void => {
     if (cancellationRequested) throw new Error("cancelled by request");
-    if (deadlineExceeded) throw new Error("job wall-clock budget exceeded");
+    if (deadlineExceeded || Date.now() >= deadlineAt) {
+      deadlineExceeded = true;
+      controller.abort();
+      throw new Error("job wall-clock budget exceeded");
+    }
   };
   let state = await store.readState(jobId);
   let gateResults: GateResult[] = [];
@@ -176,6 +195,10 @@ async function main(): Promise<void> {
     const execution = await new UnsafeLocalExecutionBackend().prepare(
       request,
       stateRoot,
+      {
+        signal: controller.signal,
+        terminationGraceMs: request.budget.cancellationGraceMs,
+      },
     );
     assertJobActive();
     state = await store.updateState(jobId, "running", execution);
@@ -192,9 +215,14 @@ async function main(): Promise<void> {
       await verifyPrimeInstallation({
         artifactPath: request.agent.releaseArtifact,
         executablePath: request.agent.executable,
+        signal: controller.signal,
+        terminationGraceMs: request.budget.cancellationGraceMs,
       });
       assertJobActive();
-      const auth = await resolveCodexSubscriptionAuth();
+      const auth = await abortable(
+        resolveCodexSubscriptionAuth(),
+        controller.signal,
+      );
       assertJobActive();
       inferenceBroker = new ProductionInferenceBroker({
         upstream: new URL("https://chatgpt.com/backend-api/codex/responses"),
@@ -289,35 +317,48 @@ async function main(): Promise<void> {
 
     assertJobActive();
     state = await store.updateState(jobId, "committing");
-    await git(execution.worktreePath, ["add", "-A"]);
+    const gitControl = {
+      signal: controller.signal,
+      terminationGraceMs: request.budget.cancellationGraceMs,
+    };
+    await git(execution.worktreePath, ["add", "-A"], gitControl);
     assertJobActive();
-    const staged = await git(execution.worktreePath, [
-      "diff",
-      "--cached",
-      "--name-only",
-    ]);
+    const staged = await git(
+      execution.worktreePath,
+      ["diff", "--cached", "--name-only"],
+      gitControl,
+    );
     let commitSha: string | undefined;
     const noChanges = staged.length === 0;
     if (!noChanges) {
-      await git(execution.worktreePath, [
-        "-c",
-        "user.name=Prime Dispatch",
-        "-c",
-        "user.email=prime-dispatch@local.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "-m",
-        `prime dispatch ${jobId}`,
-      ]);
-      commitSha = await git(execution.worktreePath, ["rev-parse", "HEAD"]);
+      await git(
+        execution.worktreePath,
+        [
+          "-c",
+          "user.name=Prime Dispatch",
+          "-c",
+          "user.email=prime-dispatch@local.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "-m",
+          `prime dispatch ${jobId}`,
+        ],
+        gitControl,
+      );
+      commitSha = await git(
+        execution.worktreePath,
+        ["rev-parse", "HEAD"],
+        gitControl,
+      );
     }
     assertJobActive();
-    const diff = await git(execution.worktreePath, [
-      "diff",
-      "--binary",
-      `${request.baseSha}..HEAD`,
-    ]);
+    const diff = await git(
+      execution.worktreePath,
+      ["diff", "--binary", `${request.baseSha}..HEAD`],
+      gitControl,
+    );
+    assertJobActive();
     const diffArtifact = await store.writeArtifact(
       jobId,
       "final.diff",
@@ -334,6 +375,7 @@ async function main(): Promise<void> {
       "",
     ].join("\n");
     await store.writeArtifact(jobId, "report.md", report);
+    assertJobActive();
     const succeededState: JobState = {
       ...state,
       status: "succeeded",
@@ -347,13 +389,20 @@ async function main(): Promise<void> {
       agentResult.summary,
       gateResults,
     );
+    assertJobActive();
     state = await store.updateState(jobId, "succeeded", {
       ...(commitSha ? { commitSha } : {}),
       noChanges,
       summary: agentResult.summary,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = cancellationRequested
+      ? "cancelled by request"
+      : deadlineExceeded
+        ? "job wall-clock budget exceeded"
+        : error instanceof Error
+          ? error.message
+          : String(error);
     const current = await store.readState(jobId);
     const status = cancellationRequested ? "cancelled" : "failed";
     if (!terminalStatuses.has(current.status)) {

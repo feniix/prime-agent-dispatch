@@ -11,7 +11,11 @@ export type PreparedExecution = {
 
 export interface ExecutionBackend {
   readonly kind: string;
-  prepare(request: JobRequest, stateRoot: string): Promise<PreparedExecution>;
+  prepare(
+    request: JobRequest,
+    stateRoot: string,
+    control?: { signal?: AbortSignal; terminationGraceMs?: number },
+  ): Promise<PreparedExecution>;
 }
 
 export class UnsafeLocalExecutionBackend implements ExecutionBackend {
@@ -20,20 +24,18 @@ export class UnsafeLocalExecutionBackend implements ExecutionBackend {
   async prepare(
     request: JobRequest,
     stateRoot: string,
+    control: { signal?: AbortSignal; terminationGraceMs?: number } = {},
   ): Promise<PreparedExecution> {
     assertUnsafeLocalPolicy(request.fixture, request.unsafeAllowLiveRepo);
     const branchName = `prime/${request.jobId}`;
     const worktreeRoot = join(stateRoot, "worktrees");
     const worktreePath = join(worktreeRoot, request.jobId);
     await mkdir(worktreeRoot, { recursive: true });
-    await git(request.canonicalRepoPath, [
-      "worktree",
-      "add",
-      "-b",
-      branchName,
-      worktreePath,
-      request.baseSha,
-    ]);
+    await git(
+      request.canonicalRepoPath,
+      ["worktree", "add", "-b", branchName, worktreePath, request.baseSha],
+      control,
+    );
     return { worktreePath, branchName };
   }
 }
@@ -44,6 +46,7 @@ export class AppleContainerExecutionBackend implements ExecutionBackend {
   async prepare(
     _request: JobRequest,
     _stateRoot: string,
+    _control: { signal?: AbortSignal; terminationGraceMs?: number } = {},
   ): Promise<PreparedExecution> {
     throw new Error(
       "Apple container execution is a contract stub in this prototype",

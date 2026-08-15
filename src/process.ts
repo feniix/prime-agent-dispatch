@@ -99,9 +99,21 @@ export async function runCommand(
 export async function git(
   cwd: string,
   args: string[],
-  timeoutMs = 30_000,
+  options: {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    terminationGraceMs?: number;
+  } = {},
 ): Promise<string> {
-  const result = await runCommand("git", ["-C", cwd, ...args], { timeoutMs });
+  const result = await runCommand("git", ["-C", cwd, ...args], {
+    timeoutMs: options.timeoutMs ?? 30_000,
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.terminationGraceMs !== undefined
+      ? { terminationGraceMs: options.terminationGraceMs }
+      : {}),
+  });
+  if (result.aborted)
+    throw new Error(`git ${args[0] ?? ""} aborted by job control`);
   if (result.exitCode !== 0) {
     throw new Error(
       `git ${args[0] ?? ""} failed: ${result.stderr.trim() || result.stdout.trim()}`,
