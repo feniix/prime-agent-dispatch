@@ -1,134 +1,148 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
+import { Command, Option } from "commander";
 import { PrimeDispatcher } from "./dispatcher.js";
 import { PrimeStartInputSchema } from "./schemas.js";
 import { loadHostConfig, resolveHostRepositoryPolicy } from "./host-config.js";
 
-type ParsedArgs = { command: string | undefined; flags: Map<string, string[]> };
+type CommonOptions = { stateRoot?: string };
 
-function parseArgs(argv: string[]): ParsedArgs {
-  const [command, ...rest] = argv;
-  const flags = new Map<string, string[]>();
-  for (let index = 0; index < rest.length; index += 1) {
-    const key = rest[index];
-    if (!key?.startsWith("--")) throw new Error(`unexpected argument: ${key}`);
-    const next = rest[index + 1];
-    const value =
-      next && !next.startsWith("--") ? ((index += 1), next) : "true";
-    const existing = flags.get(key) ?? [];
-    existing.push(value);
-    flags.set(key, existing);
-  }
-  return { command, flags };
+function stateRoot(options: CommonOptions): string {
+  return resolve(
+    options.stateRoot ??
+      process.env.PRIME_DISPATCH_STATE_ROOT ??
+      ".prime-dispatch",
+  );
 }
 
-function one(
-  flags: Map<string, string[]>,
-  name: string,
-  required = false,
-): string | undefined {
-  const value = flags.get(name)?.at(-1);
-  if (required && !value) throw new Error(`missing ${name}`);
-  return value;
+function collect(value: string, previous: string[]): string[] {
+  return [...previous, value];
 }
 
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function usage(): never {
-  throw new Error(
-    [
-      "usage:",
-      "  prime-dispatch start --task TEXT --repo PATH --repo-root PATH --channel ID --sender ID --fixture",
-      "  prime-dispatch status --job-id ID",
-      "  prime-dispatch steer --job-id ID --message TEXT",
-      "  prime-dispatch cancel --job-id ID",
-      "  prime-dispatch result --job-id ID",
-      "common: --state-root PATH (default .prime-dispatch or PRIME_DISPATCH_STATE_ROOT)",
-    ].join("\n"),
+function withStateRoot(command: Command): Command {
+  return command.option(
+    "--state-root <path>",
+    "durable state root (defaults to PRIME_DISPATCH_STATE_ROOT or .prime-dispatch)",
   );
 }
 
-async function main(): Promise<void> {
-  const parsed = parseArgs(process.argv.slice(2));
-  const stateRoot = resolve(
-    one(parsed.flags, "--state-root") ??
-      process.env.PRIME_DISPATCH_STATE_ROOT ??
-      ".prime-dispatch",
+const program = new Command()
+  .name("prime-dispatch")
+  .description("Detached single-root Prime job control")
+  .showHelpAfterError()
+  .showSuggestionAfterError();
+
+withStateRoot(
+  program
+    .command("start")
+    .description("preview and launch a confirmed Prime job")
+    .requiredOption("--task <text>")
+    .requiredOption("--repo <path>")
+    .option("--repo-root <path>", "allowed repository root", collect, [])
+    .requiredOption("--channel <id>")
+    .requiredOption("--sender <id>")
+    .option("--base <ref>")
+    .option("--fixture")
+    .option("--unsafe-allow-live-repo")
+    .option("--gate <json>", "verification gate JSON", collect, [])
+    .option("--wall-clock-ms <milliseconds>")
+    .option("--host-config <path>")
+    .addOption(new Option("--agent <kind>").choices(["fake", "prime"]))
+    .option("--confirm-hash <sha256>")
+    .option(
+      "--yes",
+      "accept a fake fixture preview without a second invocation",
+    )
+    .action(async (options) => {
+      const dispatcher = new PrimeDispatcher(stateRoot(options));
+      const callerGates = options.gate.map(
+        (gate: string) => JSON.parse(gate) as unknown,
+      );
+      const hostPolicy = options.hostConfig
+        ? await resolveHostRepositoryPolicy(
+            await loadHostConfig(options.hostConfig),
+            options.repo,
+          )
+        : undefined;
+      if (options.agent === "prime" && !hostPolicy)
+        throw new Error(
+          "real Prime jobs require --host-config; caller-supplied Prime paths are rejected",
+        );
+      const input = PrimeStartInputSchema.parse({
+        task: options.task,
+        repoPath: options.repo,
+        repoRoots: hostPolicy?.repoRoots ?? options.repoRoot,
+        ...(options.base ? { baseRef: options.base } : {}),
+        fixture: hostPolicy?.fixture ?? Boolean(options.fixture),
+        unsafeAllowLiveRepo: Boolean(options.unsafeAllowLiveRepo),
+        gates: hostPolicy?.gates ?? callerGates,
+        budget: {
+          ...(options.wallClockMs
+            ? { wallClockMs: Number(options.wallClockMs) }
+            : {}),
+        },
+        authorization: {
+          channelId: options.channel,
+          senderId: options.sender,
+        },
+        agent: hostPolicy?.agent ?? { kind: "fake" },
+      });
+      const preview = await dispatcher.preview(input);
+      process.stderr.write(
+        `${JSON.stringify({ resolvedRequest: preview.summary }, null, 2)}\n`,
+      );
+      if (options.yes && input.agent.kind !== "fake")
+        throw new Error(
+          "--yes is limited to fake fixture jobs; real Prime requires a reviewed --confirm-hash",
+        );
+      if (!options.yes && !options.confirmHash) {
+        throw new Error(
+          `confirmation required; review this immutable resolved request and rerun with --confirm-hash ${preview.summary.requestHash}:\n${JSON.stringify(preview.summary, null, 2)}`,
+        );
+      }
+      print(
+        await dispatcher.startConfirmed(
+          preview,
+          options.yes ? preview.summary.requestHash : options.confirmHash,
+        ),
+      );
+    }),
+);
+
+for (const [name, description, action] of [
+  ["status", "show current job state", "status"],
+  ["cancel", "cancel a nonterminal job", "cancel"],
+  ["result", "read a terminal job result", "result"],
+] as const) {
+  withStateRoot(
+    program
+      .command(name)
+      .description(description)
+      .requiredOption("--job-id <id>")
+      .action(async (options) => {
+        const dispatcher = new PrimeDispatcher(stateRoot(options));
+        print(await dispatcher[action](options.jobId));
+      }),
   );
-  const dispatcher = new PrimeDispatcher(stateRoot);
-  if (parsed.command === "start") {
-    const callerGates = (parsed.flags.get("--gate") ?? []).map(
-      (gate) => JSON.parse(gate) as unknown,
-    );
-    const hostConfigPath = one(parsed.flags, "--host-config");
-    const repoPath = one(parsed.flags, "--repo", true)!;
-    const hostPolicy = hostConfigPath
-      ? await resolveHostRepositoryPolicy(
-          await loadHostConfig(hostConfigPath),
-          repoPath,
-        )
-      : undefined;
-    if (one(parsed.flags, "--agent") === "prime" && !hostPolicy)
-      throw new Error(
-        "real Prime jobs require --host-config; caller-supplied Prime paths are rejected",
-      );
-    const input = PrimeStartInputSchema.parse({
-      task: one(parsed.flags, "--task", true),
-      repoPath,
-      repoRoots: hostPolicy?.repoRoots ?? parsed.flags.get("--repo-root") ?? [],
-      ...(one(parsed.flags, "--base")
-        ? { baseRef: one(parsed.flags, "--base") }
-        : {}),
-      fixture: hostPolicy?.fixture ?? one(parsed.flags, "--fixture") === "true",
-      unsafeAllowLiveRepo:
-        one(parsed.flags, "--unsafe-allow-live-repo") === "true",
-      gates: hostPolicy?.gates ?? callerGates,
-      budget: {
-        ...(one(parsed.flags, "--wall-clock-ms")
-          ? { wallClockMs: Number(one(parsed.flags, "--wall-clock-ms")) }
-          : {}),
-      },
-      authorization: {
-        channelId: one(parsed.flags, "--channel", true),
-        senderId: one(parsed.flags, "--sender", true),
-      },
-      agent: hostPolicy?.agent ?? { kind: "fake" },
-    });
-    const preview = await dispatcher.preview(input);
-    process.stderr.write(
-      `${JSON.stringify({ resolvedRequest: preview.summary }, null, 2)}\n`,
-    );
-    const suppliedHash = one(parsed.flags, "--confirm-hash");
-    const explicitYes = one(parsed.flags, "--yes") === "true";
-    if (explicitYes && input.agent.kind !== "fake")
-      throw new Error(
-        "--yes is limited to fake fixture jobs; real Prime requires a reviewed --confirm-hash",
-      );
-    if (!explicitYes && !suppliedHash) {
-      throw new Error(
-        `confirmation required; review this immutable resolved request and rerun with --confirm-hash ${preview.summary.requestHash}:\n${JSON.stringify(preview.summary, null, 2)}`,
-      );
-    }
-    print(
-      await dispatcher.startConfirmed(
-        preview,
-        explicitYes ? preview.summary.requestHash : suppliedHash!,
-      ),
-    );
-    return;
-  }
-  const jobId = one(parsed.flags, "--job-id", true)!;
-  if (parsed.command === "status") print(await dispatcher.status(jobId));
-  else if (parsed.command === "steer")
-    print(await dispatcher.steer(jobId, one(parsed.flags, "--message", true)!));
-  else if (parsed.command === "cancel") print(await dispatcher.cancel(jobId));
-  else if (parsed.command === "result") print(await dispatcher.result(jobId));
-  else usage();
 }
 
-void main().catch((error) => {
+withStateRoot(
+  program
+    .command("steer")
+    .description("send guidance during an active Prime turn")
+    .requiredOption("--job-id <id>")
+    .requiredOption("--message <text>")
+    .action(async (options) => {
+      const dispatcher = new PrimeDispatcher(stateRoot(options));
+      print(await dispatcher.steer(options.jobId, options.message));
+    }),
+);
+
+void program.parseAsync().catch((error) => {
   process.stderr.write(
     `${error instanceof Error ? error.message : String(error)}\n`,
   );
