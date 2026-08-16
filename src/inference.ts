@@ -60,11 +60,18 @@ function responseUsageTokens(data: unknown) {
     : 0;
 }
 
+function isEventStream(contentType: string): boolean {
+  return (
+    contentType.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream"
+  );
+}
+
 function isToolCallEvent(eventName: string | undefined, data: unknown) {
   const payload = asRecord(data);
   const item = asRecord(payload?.item);
   return (
-    eventName === "response.output_item.added" &&
+    (eventName === "response.output_item.added" ||
+      payload?.type === "response.output_item.added") &&
     (item?.type === "function_call" || item?.type === "custom_tool_call")
   );
 }
@@ -273,45 +280,55 @@ export class ProductionInferenceBroker {
         jsonError(response, upstream.status, "upstream returned no body");
         return;
       }
-      response.writeHead(upstream.status, {
-        "content-type":
-          upstream.headers.get("content-type") ?? "text/event-stream",
-      });
-      this.counters.sawStreamingResponse ||=
-        upstream.headers.get("content-type")?.includes("text/event-stream") ===
-        true;
+      const contentType =
+        upstream.headers.get("content-type") ?? "text/event-stream";
+      const parseEvents = isEventStream(contentType);
+      response.writeHead(upstream.status, { "content-type": contentType });
+      this.counters.sawStreamingResponse ||= parseEvents;
       const reader = upstream.body.getReader();
-      const decoder = new TextDecoder();
       let responseTokens = 0;
       let parserError: Error | undefined;
-      const parser = createParser({
-        maxBufferSize: 1024 * 1024,
-        onError(error) {
-          parserError = error;
-        },
-        onEvent: (event) => {
-          this.counters.sawStreamingResponse = true;
-          if (event.data === "[DONE]") return;
-          let data: unknown;
-          try {
-            data = JSON.parse(event.data);
-          } catch {
-            return;
-          }
-          this.counters.sawToolCallEvent ||= isToolCallEvent(event.event, data);
-          responseTokens = Math.max(responseTokens, responseUsageTokens(data));
-        },
-      });
+      const decoder = parseEvents ? new TextDecoder() : undefined;
+      const parser = parseEvents
+        ? createParser({
+            maxBufferSize: 1024 * 1024,
+            onError(error) {
+              if (error.type === "max-buffer-size-exceeded")
+                parserError = error;
+            },
+            onEvent: (event) => {
+              if (event.data === "[DONE]") return;
+              let data: unknown;
+              try {
+                data = JSON.parse(event.data);
+              } catch {
+                return;
+              }
+              this.counters.sawToolCallEvent ||= isToolCallEvent(
+                event.event,
+                data,
+              );
+              responseTokens = Math.max(
+                responseTokens,
+                responseUsageTokens(data),
+              );
+            },
+          })
+        : undefined;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         response.write(Buffer.from(value));
-        parser.feed(decoder.decode(value, { stream: true }));
+        if (parser && decoder) {
+          parser.feed(decoder.decode(value, { stream: true }));
+          if (parserError) throw parserError;
+        }
+      }
+      if (parser && decoder) {
+        parser.feed(decoder.decode());
+        parser.reset({ consume: true });
         if (parserError) throw parserError;
       }
-      parser.feed(decoder.decode());
-      parser.reset({ consume: true });
-      if (parserError) throw parserError;
       lease.usedTokens += responseTokens;
       response.end();
     } catch (error) {
