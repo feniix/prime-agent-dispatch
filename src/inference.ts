@@ -5,6 +5,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createParser } from "eventsource-parser";
 
 export type InferenceLease = {
   endpoint: URL;
@@ -40,6 +41,32 @@ function jsonError(
 ): void {
   response.writeHead(status, { "content-type": "application/json" });
   response.end(JSON.stringify({ error: { message } }));
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function responseUsageTokens(data: unknown) {
+  const payload = asRecord(data);
+  const response = asRecord(payload?.response);
+  const usage = asRecord(response?.usage);
+  return typeof usage?.total_tokens === "number" &&
+    Number.isSafeInteger(usage.total_tokens) &&
+    usage.total_tokens >= 0
+    ? usage.total_tokens
+    : 0;
+}
+
+function isToolCallEvent(eventName: string | undefined, data: unknown) {
+  const payload = asRecord(data);
+  const item = asRecord(payload?.item);
+  return (
+    eventName === "response.output_item.added" &&
+    (item?.type === "function_call" || item?.type === "custom_tool_call")
+  );
 }
 
 async function readBounded(
@@ -255,22 +282,36 @@ export class ProductionInferenceBroker {
         true;
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
-      let observed = "";
+      let responseTokens = 0;
+      let parserError: Error | undefined;
+      const parser = createParser({
+        maxBufferSize: 1024 * 1024,
+        onError(error) {
+          parserError = error;
+        },
+        onEvent: (event) => {
+          this.counters.sawStreamingResponse = true;
+          if (event.data === "[DONE]") return;
+          let data: unknown;
+          try {
+            data = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          this.counters.sawToolCallEvent ||= isToolCallEvent(event.event, data);
+          responseTokens = Math.max(responseTokens, responseUsageTokens(data));
+        },
+      });
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         response.write(Buffer.from(value));
-        observed = (observed + decoder.decode(value, { stream: true })).slice(
-          -64_000,
-        );
-        this.counters.sawStreamingResponse ||=
-          observed.includes("event:") || observed.includes("data:");
-        this.counters.sawToolCallEvent ||=
-          /"type"\s*:\s*"(?:function_call|custom_tool_call)"/.test(observed);
+        parser.feed(decoder.decode(value, { stream: true }));
+        if (parserError) throw parserError;
       }
-      let responseTokens = 0;
-      for (const match of observed.matchAll(/"total_tokens"\s*:\s*(\d+)/g))
-        responseTokens = Math.max(responseTokens, Number(match[1]));
+      parser.feed(decoder.decode());
+      parser.reset({ consume: true });
+      if (parserError) throw parserError;
       lease.usedTokens += responseTokens;
       response.end();
     } catch (error) {

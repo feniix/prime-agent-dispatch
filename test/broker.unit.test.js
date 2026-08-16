@@ -242,6 +242,54 @@ test("broker accumulates observable token usage across Responses calls", async (
   }
 });
 
+test("broker accounts only structured response usage events", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      [
+        "event: diagnostic",
+        'data: {"debug":{"total_tokens":999}}',
+        "",
+        "event: response.completed",
+        'data: {"type":"response.completed","response":{"usage":{"total_tokens":3}}}',
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("structured-usage", {
+    wallClockMs: 1000,
+    maxTokens: 5,
+  });
+  const options = {
+    method: "POST",
+    headers: { authorization: `Bearer ${lease.opaqueToken}` },
+    body: "{}",
+  };
+  try {
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      429,
+    );
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
+
 test("broker rejects authenticated upstream redirects", async () => {
   let redirectedRequests = 0;
   const target = await upstream((_request, response) => {
