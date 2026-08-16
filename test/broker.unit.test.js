@@ -323,3 +323,33 @@ test("broker rejects authenticated upstream redirects", async () => {
     await target.close();
   }
 });
+
+test("broker forwards non-SSE upstream errors without parsing them as events", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "bad request" } }));
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("json-error", {
+    wallClockMs: 1000,
+    maxTokens: 10,
+  });
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: { message: "bad request" },
+    });
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
