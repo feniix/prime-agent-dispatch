@@ -12,6 +12,7 @@ This is not production-ready. The default execution backend is intentionally nam
 - **Beta Milestone 1:** **COMPLETE for the disposable-fixture CLI scope, with reviewed limitations.** It productionizes the broker seam, checks the pinned Prime release and entrypoint, adds immutable confirmation and trusted host policy, enforces one global job and finite budgets, and validates real Prime completion and cancellation. Complete dependency-tree integrity remains a follow-up.
 - **Operational Discord beta:** not implemented or installed yet. The OpenClaw adapter, owner authorization, confirmation/status components, and retention policy remain later milestones.
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
+- **Control-plane direction:** the current JSON/Zod store remains the Milestone 1 implementation. [ADR-0013](docs/adrs/0013-sqlite-authority-with-json-artifacts.md) supersedes it for future crash-consistent work: SQLite becomes authoritative while JSON, reports, diffs, and logs remain inspectable artifacts.
 
 The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
 
