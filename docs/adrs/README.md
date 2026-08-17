@@ -6,7 +6,7 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 
 - [ADR-0001: Keep the dispatch core standalone with a thin OpenClaw adapter](0001-standalone-core-and-thin-openclaw-adapter.md)
 - [ADR-0002: Use explicit detached jobs with one root Prime agent](0002-explicit-detached-single-root-jobs.md)
-- [ADR-0003: Use versioned JSON and Zod for the durable control plane](0003-json-zod-control-plane.md)
+- [ADR-0003: Use versioned JSON and Zod for the durable control plane](0003-json-zod-control-plane.md) — superseded by ADR-0013
 - [ADR-0004: Isolate Git changes with worktrees and an execution backend](0004-git-worktrees-and-execution-backends.md)
 - [ADR-0005: Broker raw OpenAI-compatible inference instead of nesting agent loops](0005-opaque-openai-compatible-inference-broker.md)
 - [ADR-0006: Authorize writes by trusted channel, sender, and configured repository roots](0006-trusted-discord-and-repository-authorization.md) — superseded by ADR-0009
@@ -16,6 +16,8 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 - [ADR-0010: Quiesce Prime before verification and commit](0010-quiesce-prime-before-verification.md)
 - [ADR-0011: Use terminal intent and preserve partial repository evidence](0011-terminal-intent-and-preserved-evidence.md)
 - [ADR-0012: Require a self-contained checksum-pinned Prime runtime for broader rollout](0012-self-contained-pinned-prime-runtime.md)
+- [ADR-0013: Use SQLite for authoritative state and retain JSON artifacts](0013-sqlite-authority-with-json-artifacts.md)
+- [ADR-0014: Reuse maintained infrastructure primitives without outsourcing policy](0014-reuse-maintained-infrastructure-primitives.md)
 
 ## Status conventions
 

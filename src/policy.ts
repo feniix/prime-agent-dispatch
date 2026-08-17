@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import canonicalize from "canonicalize";
 
 export const PRIME_MODEL = "gpt-5.6-sol" as const;
 export const PRIME_REASONING_EFFORT = "high" as const;
@@ -104,17 +105,6 @@ type ConfirmationInput = {
   immutableRequest?: unknown;
 };
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
 export function buildConfirmationSummary(input: ConfirmationInput) {
   const payload = {
     repository: input.canonicalRepoPath,
@@ -127,10 +117,11 @@ export function buildConfirmationSummary(input: ConfirmationInput) {
     executionWarning:
       "unsafe-local: current-user execution is not sandboxed and has normal host networking",
   };
+  const canonicalRequest = canonicalize(input.immutableRequest ?? payload);
+  if (canonicalRequest === undefined)
+    throw new Error("confirmation request is not canonicalizable JSON");
   return Object.freeze({
     ...payload,
-    requestHash: createHash("sha256")
-      .update(canonicalJson(input.immutableRequest ?? payload))
-      .digest("hex"),
+    requestHash: createHash("sha256").update(canonicalRequest).digest("hex"),
   });
 }

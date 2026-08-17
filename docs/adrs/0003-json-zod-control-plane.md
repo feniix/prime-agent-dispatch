@@ -1,11 +1,14 @@
 ---
-status: accepted
+status: superseded
 date: 2026-08-15
 decision-makers: [feniix]
 consulted: [ryn]
+superseded-by: 0013-sqlite-authority-with-json-artifacts.md
 ---
 
 # Use versioned JSON and Zod for the durable control plane
+
+This decision is superseded by [ADR-0013](0013-sqlite-authority-with-json-artifacts.md). The JSON/Zod implementation remains the Beta Milestone 1 prototype, but further crash-consistency work will use SQLite transactions instead of building a custom multi-file transaction protocol.
 
 ## Context and Problem Statement
 

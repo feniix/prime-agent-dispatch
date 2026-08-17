@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, writeFile } from "node:fs/promises";
@@ -151,4 +152,19 @@ test("confirmation summary is canonical, immutable, and pins model/reasoning", (
   assert.equal(first.model, "gpt-5.6-sol");
   assert.equal(first.reasoningEffort, "high");
   assert.equal(Object.isFrozen(first), true);
+});
+
+test("confirmation hashes use RFC 8785 JSON key ordering", () => {
+  const summary = buildConfirmationSummary({
+    task: "fixture",
+    canonicalRepoPath: "/repos/fixture",
+    baseSha: "a".repeat(40),
+    gates: [],
+    budget: {},
+    immutableRequest: { a: 2, Z: 1 },
+  });
+  assert.equal(
+    summary.requestHash,
+    createHash("sha256").update('{"Z":1,"a":2}').digest("hex"),
+  );
 });

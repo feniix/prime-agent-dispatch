@@ -182,3 +182,17 @@ test("CLI rejects --yes for host-configured real Prime jobs", async () => {
     },
   );
 });
+
+test("CLI exposes help and rejects unknown options before dispatch", async () => {
+  const help = await exec(process.execPath, [cli, "--help"]);
+  assert.match(help.stdout, /Usage: prime-dispatch/);
+
+  await assert.rejects(
+    () =>
+      exec(process.execPath, [cli, "status", "--job-id", "unknown", "--bogus"]),
+    (error) => {
+      assert.match(error.stderr, /unknown option/i);
+      return true;
+    },
+  );
+});

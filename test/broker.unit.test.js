@@ -242,6 +242,128 @@ test("broker accumulates observable token usage across Responses calls", async (
   }
 });
 
+test("broker accounts only structured response usage events", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      [
+        "event: diagnostic",
+        'data: {"debug":{"total_tokens":999}}',
+        "",
+        "event: response.completed",
+        'data: {"type":"response.completed","response":{"usage":{"total_tokens":3}}}',
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("structured-usage", {
+    wallClockMs: 1000,
+    maxTokens: 5,
+  });
+  const options = {
+    method: "POST",
+    headers: { authorization: `Bearer ${lease.opaqueToken}` },
+    body: "{}",
+  };
+  try {
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      429,
+    );
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("broker tolerates SSE extension fields and data-only tool events", async () => {
+  const body = [
+    "x-extension: ignored by EventSource clients",
+    'data: {"type":"response.output_item.added","item":{"type":"custom_tool_call"}}',
+    "",
+    "event: response.completed",
+    'data: {"response":{"usage":{"total_tokens":1}}}',
+    "",
+    "",
+  ].join("\n");
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, {
+      "content-type": "Text/Event-Stream; charset=utf-8",
+    });
+    response.end(body);
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("sse-extensions", {
+    wallClockMs: 1000,
+    maxTokens: 1,
+  });
+  const options = {
+    method: "POST",
+    headers: { authorization: `Bearer ${lease.opaqueToken}` },
+    body: "{}",
+  };
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), options);
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), body);
+    assert.equal(broker.stats().sawStreamingResponse, true);
+    assert.equal(broker.stats().sawToolCallEvent, true);
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      429,
+    );
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("broker terminates SSE streams that exceed the parser buffer", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(`data: ${"x".repeat(1024 * 1024 + 1)}`);
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("oversized-sse", {
+    wallClockMs: 2000,
+    maxTokens: 10,
+  });
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    });
+    assert.equal(response.status, 200);
+    await assert.rejects(() => response.text());
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
+
 test("broker rejects authenticated upstream redirects", async () => {
   let redirectedRequests = 0;
   const target = await upstream((_request, response) => {
@@ -273,5 +395,36 @@ test("broker rejects authenticated upstream redirects", async () => {
     await broker.close();
     await redirector.close();
     await target.close();
+  }
+});
+
+test("broker forwards non-SSE upstream errors without parsing them as events", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(`${JSON.stringify({ error: { message: "bad request" } })}\n`);
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("json-error", {
+    wallClockMs: 1000,
+    maxTokens: 10,
+  });
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: { message: "bad request" },
+    });
+    assert.equal(broker.stats().sawStreamingResponse, false);
+  } finally {
+    await broker.close();
+    await fake.close();
   }
 });
