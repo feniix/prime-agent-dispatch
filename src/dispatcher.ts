@@ -8,23 +8,19 @@ import {
   PrimeStartInputSchema,
   SCHEMA_VERSION,
   type JobRequest,
+  type JobState,
   type PrimeStartInput,
 } from "./schemas.js";
 import { resolveRepository } from "./repository.js";
-import { sendWorkerCommand } from "./ipc.js";
+import { sendAuthenticatedWorkerCommand } from "./ipc.js";
 import { terminalStatuses } from "./state-machine.js";
-import { GlobalJobLease } from "./lease.js";
+import { GlobalJobLease, type LeaseOwner, type LeaseToken } from "./lease.js";
 import { buildConfirmationSummary } from "./policy.js";
 import type { ResolvedRepository } from "./repository.js";
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+import {
+  verifyWorkerIdentity,
+  workerIdentityFromState,
+} from "./worker-identity.js";
 
 function createJobId(): string {
   return `${new Date()
@@ -76,7 +72,13 @@ export class PrimeDispatcher {
     const { input: parsed, repository } = prepared;
     const jobId = createJobId();
     const lease = new GlobalJobLease(this.stateRoot);
-    await lease.acquire(jobId);
+    const launcherToken = await lease.acquire(jobId);
+    const workerNonce = randomUUID();
+    const workerToken: LeaseToken = {
+      kind: "worker",
+      jobId,
+      nonce: workerNonce,
+    };
     const request: JobRequest = {
       ...parsed,
       schemaVersion: SCHEMA_VERSION,
@@ -95,7 +97,17 @@ export class PrimeDispatcher {
       );
       const child = spawn(
         process.execPath,
-        [workerPath, "--state-root", this.stateRoot, "--job-id", jobId],
+        [
+          workerPath,
+          "--state-root",
+          this.stateRoot,
+          "--job-id",
+          jobId,
+          "--launch-nonce",
+          launcherToken.nonce,
+          "--worker-nonce",
+          workerNonce,
+        ],
         {
           detached: true,
           stdio: ["ignore", logFd, logFd],
@@ -115,7 +127,13 @@ export class PrimeDispatcher {
       const startupDeadline = Date.now() + 5_000;
       while (Date.now() < startupDeadline) {
         const current = await this.store.readState(jobId);
-        if (current.workerPid === child.pid) break;
+        const identity = workerIdentityFromState(current);
+        if (
+          identity?.pid === child.pid &&
+          identity.nonce === workerNonce &&
+          (await verifyWorkerIdentity(identity)).status === "verified"
+        )
+          break;
         if (spawnError) throw spawnError;
         if (child.exitCode !== null)
           throw new Error(
@@ -124,7 +142,12 @@ export class PrimeDispatcher {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       const started = await this.store.readState(jobId);
-      if (started.workerPid !== child.pid) {
+      const startedIdentity = workerIdentityFromState(started);
+      if (
+        startedIdentity?.pid !== child.pid ||
+        startedIdentity.nonce !== workerNonce ||
+        (await verifyWorkerIdentity(startedIdentity)).status !== "verified"
+      ) {
         try {
           if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
           else child.kill("SIGKILL");
@@ -136,7 +159,9 @@ export class PrimeDispatcher {
       child.unref();
       return { jobId, state };
     } catch (error) {
-      await lease.release(jobId).catch(() => undefined);
+      await lease
+        .release(workerToken)
+        .catch(() => lease.release(launcherToken).catch(() => undefined));
       throw error;
     }
   }
@@ -161,27 +186,132 @@ export class PrimeDispatcher {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
     }
+    if (terminalStatuses.has(state.status)) return state;
     const lease = new GlobalJobLease(this.stateRoot);
-    const workerMissing =
-      state.workerPid !== undefined
-        ? !processExists(state.workerPid)
-        : !(await lease.isHeldByLiveProcess(jobId));
-    if (!terminalStatuses.has(state.status) && workerMissing) {
-      const interrupted = await this.store.updateState(jobId, "interrupted", {
-        error: "worker process is missing; preserved job evidence",
-        summary: "worker process is missing; job interrupted",
-      });
-      await lease.release(jobId).catch(() => undefined);
-      return interrupted;
+    let identity = workerIdentityFromState(state);
+    if (!identity) {
+      const inspection = await lease.inspect();
+      if (
+        inspection.status === "verified-worker" &&
+        inspection.owner.kind === "worker" &&
+        inspection.owner.jobId === jobId
+      ) {
+        identity = inspection.owner.identity;
+        state = await this.store.updateState(jobId, state.status, {
+          workerPid: identity.pid,
+          workerStartIdentity: identity.processStartIdentity,
+          workerNonce: identity.nonce,
+          workerProtocolVersion: identity.protocolVersion,
+          socketPath: identity.socketPath,
+        });
+        await this.store.appendEventOnce(
+          jobId,
+          "worker_identity_recovered",
+          `worker:${identity.nonce}`,
+          {
+            workerPid: identity.pid,
+            protocolVersion: identity.protocolVersion,
+          },
+        );
+      } else if (
+        inspection.status === "live-launcher" &&
+        inspection.owner.kind === "launcher" &&
+        inspection.owner.jobId === jobId &&
+        state.status === "queued"
+      ) {
+        await this.store.appendEventOnce(
+          jobId,
+          "worker_launch_observed",
+          `launcher:${inspection.owner.nonce}`,
+          { launcherPid: inspection.owner.pid },
+        );
+        return state;
+      } else if (
+        inspection.status === "unreachable-worker" &&
+        inspection.owner.kind === "worker" &&
+        inspection.owner.jobId === jobId
+      ) {
+        await this.store.appendEventOnce(
+          jobId,
+          "worker_reconciliation_deferred",
+          `worker:${inspection.owner.identity.nonce}:${inspection.error}`,
+          { error: inspection.error },
+        );
+        throw new Error(
+          `worker identity could not be verified: ${inspection.error}`,
+        );
+      } else {
+        return await this.interruptUnverifiedWorker(
+          state,
+          "worker identity is missing or stale; preserved job evidence",
+          "owner" in inspection ? inspection.owner : undefined,
+        );
+      }
     }
+    const verification = await verifyWorkerIdentity(identity);
+    if (verification.status === "unreachable") {
+      await this.store.appendEventOnce(
+        jobId,
+        "worker_reconciliation_deferred",
+        `worker:${identity.nonce}:${verification.error}`,
+        { error: verification.error },
+      );
+      throw new Error(
+        `worker identity could not be verified: ${verification.error}`,
+      );
+    }
+    if (verification.status !== "verified")
+      return await this.interruptUnverifiedWorker(
+        state,
+        `worker identity ${verification.status}; preserved job evidence`,
+        {
+          kind: "worker",
+          jobId,
+          identity,
+          acquiredAt: state.createdAt,
+        },
+      );
+    await this.store.appendEventOnce(
+      jobId,
+      "worker_reconnected",
+      `worker:${identity.nonce}`,
+      {
+        workerPid: identity.pid,
+        processStartIdentity: identity.processStartIdentity,
+        protocolVersion: identity.protocolVersion,
+      },
+    );
     return state;
   }
 
+  async reconcileNonterminalJobs(): Promise<
+    Array<{ jobId: string; state?: JobState; error?: string }>
+  > {
+    const results: Array<{
+      jobId: string;
+      state?: JobState;
+      error?: string;
+    }> = [];
+    for (const jobId of await this.store.listJobIds()) {
+      const current = await this.store.readState(jobId);
+      if (terminalStatuses.has(current.status)) continue;
+      try {
+        results.push({ jobId, state: (await this.status(jobId)) as JobState });
+      } catch (error) {
+        results.push({
+          jobId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return results;
+  }
+
   async steer(jobId: string, message: string): Promise<unknown> {
-    const state = await this.store.readState(jobId);
-    if (!state.socketPath)
-      throw new Error("job worker socket is not available");
-    return await sendWorkerCommand(state.socketPath, {
+    const state = (await this.status(jobId)) as JobState;
+    const identity = workerIdentityFromState(state);
+    if (!identity) throw new Error("verified job worker is not available");
+    return await sendAuthenticatedWorkerCommand(identity, {
       operation: "prime_steer",
       jobId,
       message,
@@ -189,12 +319,12 @@ export class PrimeDispatcher {
   }
 
   async cancel(jobId: string): Promise<unknown> {
-    const state = await this.store.readState(jobId);
-    if (!state.socketPath)
-      throw new Error("job worker socket is not available");
+    const state = (await this.status(jobId)) as JobState;
+    const identity = workerIdentityFromState(state);
+    if (!identity) throw new Error("verified job worker is not available");
     const request = await this.store.readRequest(jobId);
-    return await sendWorkerCommand(
-      state.socketPath,
+    return await sendAuthenticatedWorkerCommand(
+      identity,
       { operation: "prime_cancel", jobId },
       request.budget.cancellationGraceMs + 2_500,
     );
@@ -203,6 +333,40 @@ export class PrimeDispatcher {
   async result(jobId: string): Promise<unknown> {
     await this.status(jobId);
     return await this.store.readResult(jobId);
+  }
+
+  private async interruptUnverifiedWorker(
+    state: JobState,
+    reason: string,
+    owner?: LeaseOwner,
+  ): Promise<JobState> {
+    const workerNonce =
+      owner?.kind === "worker" ? owner.identity.nonce : "no-worker";
+    await this.store.appendEventOnce(
+      state.jobId,
+      "worker_reconciliation_interrupted",
+      `${workerNonce}:${reason}`,
+      { reason },
+    );
+    const interrupted = await this.store.updateState(
+      state.jobId,
+      "interrupted",
+      { error: reason, summary: reason },
+    );
+    if (owner) {
+      const token: LeaseToken =
+        owner.kind === "launcher"
+          ? { kind: "launcher", jobId: owner.jobId, nonce: owner.nonce }
+          : {
+              kind: "worker",
+              jobId: owner.jobId,
+              nonce: owner.identity.nonce,
+            };
+      await new GlobalJobLease(this.stateRoot)
+        .release(token)
+        .catch(() => undefined);
+    }
+    return interrupted;
   }
 }
 

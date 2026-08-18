@@ -14,24 +14,43 @@ test("global lease admits exactly one active job and releases by owner", async (
   const root = await mkdtemp(join(tmpdir(), "prime-global-lease-"));
   const first = new GlobalJobLease(root);
   const second = new GlobalJobLease(root);
-  await first.acquire("job-one", process.pid);
+  const firstToken = await first.acquire("job-one");
   await assert.rejects(
-    () => second.acquire("job-two", process.pid),
+    () => second.acquire("job-two"),
     /active job already holds global lease/,
   );
-  await assert.rejects(() => second.release("job-two"), /lease owner mismatch/);
-  await first.release("job-one");
-  await second.acquire("job-two", process.pid);
-  await second.release("job-two");
+  await assert.rejects(
+    () =>
+      second.release({
+        kind: "launcher",
+        jobId: "job-two",
+        nonce: crypto.randomUUID(),
+      }),
+    /lease owner mismatch/,
+  );
+  await first.release(firstToken);
+  const secondToken = await second.acquire("job-two");
+  await second.release(secondToken);
 });
 
 test("global lease reclaims an owner whose process no longer exists", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-stale-lease-"));
-  const stale = new GlobalJobLease(root);
-  await stale.acquire("dead-job", 99999999);
-  const replacement = new GlobalJobLease(root);
-  await replacement.acquire("replacement", process.pid);
-  await replacement.release("replacement");
+  const starts = new Map([[99999999, "dead-start"]]);
+  const dependencies = {
+    readProcessStartIdentity: async (pid) =>
+      pid === process.pid ? "replacement-start" : starts.get(pid),
+  };
+  const stale = new GlobalJobLease(root, dependencies);
+  await stale.acquire("dead-job", {
+    pid: 99999999,
+    processStartIdentity: "dead-start",
+  });
+  starts.delete(99999999);
+  const replacement = new GlobalJobLease(root, dependencies);
+  const token = await replacement.acquire("replacement", {
+    pid: process.pid,
+  });
+  await replacement.release(token);
 });
 
 test("global lease recovers stale missing and malformed ownership", async () => {
@@ -44,8 +63,8 @@ test("global lease recovers stale missing and malformed ownership", async () => 
     const old = new Date(Date.now() - 60_000);
     await utimes(leaseDir, old, old);
     const replacement = new GlobalJobLease(root);
-    await replacement.acquire("replacement", process.pid);
-    await replacement.release("replacement");
+    const token = await replacement.acquire("replacement");
+    await replacement.release(token);
   }
 });
 
@@ -70,10 +89,12 @@ test("queued job with a dead launch owner reconciles to interrupted", async () =
     canonicalRepoRoot: root,
     baseSha: "a".repeat(40),
   });
-  await new GlobalJobLease(root).acquire(jobId, 99999999);
+  await new GlobalJobLease(root, {
+    readProcessStartIdentity: async () => "dead-start",
+  }).acquire(jobId, { pid: 99999999 });
   const state = await new PrimeDispatcher(root).status(jobId);
   assert.equal(state.status, "interrupted");
-  assert.match(state.error, /worker process is missing/);
+  assert.match(state.error, /worker identity is missing or stale/);
 });
 
 test("missing worker for a nonterminal job reconciles to interrupted", async () => {
@@ -100,14 +121,16 @@ test("missing worker for a nonterminal job reconciles to interrupted", async () 
     workerPid: 99999999,
     socketPath: join(root, "missing.sock"),
   });
-  await new GlobalJobLease(root).acquire(jobId, 99999999);
+  await new GlobalJobLease(root, {
+    readProcessStartIdentity: async () => "dead-start",
+  }).acquire(jobId, { pid: 99999999 });
   const dispatcher = new PrimeDispatcher(root);
   const state = await dispatcher.status(jobId);
   assert.equal(state.status, "interrupted");
-  assert.match(state.error, /worker process is missing/);
+  assert.match(state.error, /worker identity is missing or stale/);
   const replacement = new GlobalJobLease(root);
-  await replacement.acquire("replacement", process.pid);
-  await replacement.release("replacement");
+  const token = await replacement.acquire("replacement");
+  await replacement.release(token);
 });
 
 test("caller budgets cannot exceed conservative host maximums", () => {

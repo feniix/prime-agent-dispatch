@@ -5,6 +5,7 @@ import {
   WORKER_PROTOCOL_VERSION,
   WorkerIdentitySchema,
   readProcessStartIdentity,
+  verifyWorkerIdentity,
   workerIdentityFromState,
 } from "../dist/index.js";
 
@@ -69,4 +70,48 @@ test("process start identity is stable for the live process and absent for a mis
   assert.ok(first.length > 0);
   assert.equal(second, first);
   assert.equal(await readProcessStartIdentity(99_999_999), undefined);
+});
+
+test("worker verification distinguishes verified, dead, reused, mismatched, and unreachable identities", async () => {
+  const identity = WorkerIdentitySchema.parse({
+    jobId: "job-one",
+    pid: 42,
+    processStartIdentity: "start-a",
+    nonce: "2cb7191a-38ef-45ff-a17b-511b6fc329d2",
+    socketPath: "/tmp/pdc.fixture/control.sock",
+    protocolVersion: 1,
+  });
+  const verify = (overrides = {}) =>
+    verifyWorkerIdentity(identity, {
+      readProcessStartIdentity: async () => "start-a",
+      handshake: async () => identity,
+      ...overrides,
+    });
+
+  assert.deepEqual(await verify(), { status: "verified", identity });
+  assert.deepEqual(
+    await verify({ readProcessStartIdentity: async () => undefined }),
+    { status: "dead", identity },
+  );
+  assert.deepEqual(
+    await verify({ readProcessStartIdentity: async () => "start-b" }),
+    { status: "different-process", identity },
+  );
+  assert.deepEqual(
+    await verify({
+      handshake: async () => ({ ...identity, nonce: crypto.randomUUID() }),
+    }),
+    { status: "different-worker", identity },
+  );
+  const unavailable = Object.assign(new Error("connect refused"), {
+    code: "ECONNREFUSED",
+  });
+  assert.deepEqual(
+    await verify({
+      handshake: async () => {
+        throw unavailable;
+      },
+    }),
+    { status: "unreachable", identity, error: "connect refused" },
+  );
 });

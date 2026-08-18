@@ -208,3 +208,20 @@ export const WorkerCommandSchema = z.discriminatedUnion("operation", [
   PrimeCancelInputSchema,
 ]);
 export type WorkerCommand = z.infer<typeof WorkerCommandSchema>;
+
+const WorkerRequestCredentials = {
+  workerNonce: z.string().uuid(),
+  protocolVersion: z.literal(WORKER_PROTOCOL_VERSION),
+};
+
+export const WorkerRequestSchema = z.discriminatedUnion("operation", [
+  z.object({
+    operation: z.literal("worker_handshake"),
+    jobId: z.string().min(1),
+    ...WorkerRequestCredentials,
+  }),
+  PrimeStatusInputSchema.extend(WorkerRequestCredentials),
+  PrimeSteerInputSchema.extend(WorkerRequestCredentials),
+  PrimeCancelInputSchema.extend(WorkerRequestCredentials),
+]);
+export type WorkerRequest = z.infer<typeof WorkerRequestSchema>;

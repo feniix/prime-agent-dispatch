@@ -20,6 +20,8 @@ import {
   PrimeDispatcher,
   PrimeStartInputSchema,
   resolveRepository,
+  verifyWorkerIdentity,
+  workerIdentityFromState,
 } from "../dist/index.js";
 
 const exec = promisify(execFile);
@@ -167,6 +169,35 @@ test("a fresh CLI process reconnects to a surviving worker for steer and cancel"
     dispatcher,
     jobId,
     (value) => value.status === "running",
+  );
+  const identity = workerIdentityFromState(running);
+  assert.ok(identity);
+  assert.equal((await verifyWorkerIdentity(identity)).status, "verified");
+  for (const mutation of [
+    { nonce: crypto.randomUUID() },
+    { jobId: "wrong-job" },
+    { protocolVersion: 2 },
+  ]) {
+    assert.equal(
+      (await verifyWorkerIdentity({ ...identity, ...mutation })).status,
+      "different-worker",
+    );
+  }
+  const firstScan = await dispatcher.reconcileNonterminalJobs();
+  const secondScan = await dispatcher.reconcileNonterminalJobs();
+  assert.deepEqual(
+    firstScan.map((entry) => entry.jobId),
+    [jobId],
+  );
+  assert.deepEqual(
+    secondScan.map((entry) => entry.jobId),
+    [jobId],
+  );
+  assert.equal(
+    (await dispatcher.store.readEvents(jobId)).filter(
+      (event) => event.type === "worker_reconnected",
+    ).length,
+    1,
   );
   assert.equal((await stat(running.socketPath)).mode & 0o777, 0o600);
   assert.equal((await stat(dirname(running.socketPath))).mode & 0o777, 0o700);
