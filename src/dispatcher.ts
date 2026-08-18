@@ -169,25 +169,7 @@ export class PrimeDispatcher {
   }
 
   async status(jobId: string): Promise<unknown> {
-    let state = await this.store.readState(jobId);
-    if (!terminalStatuses.has(state.status) && state.terminalIntentStatus) {
-      try {
-        const result = await this.store.readResult(jobId);
-        if (result.status === state.terminalIntentStatus) {
-          state = await this.store.updateState(jobId, result.status, {
-            ...(result.commitSha ? { commitSha: result.commitSha } : {}),
-            noChanges: result.noChanges,
-            summary: result.summary,
-            ...(result.status === "failed" || result.status === "cancelled"
-              ? { error: result.summary }
-              : {}),
-            terminalIntentStatus: undefined,
-          });
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    }
+    let state = await this.readReconciledState(jobId);
     if (terminalStatuses.has(state.status)) return state;
     const lease = new GlobalJobLease(this.stateRoot);
     let identity = workerIdentityFromState(state);
@@ -233,6 +215,8 @@ export class PrimeDispatcher {
         inspection.owner.kind === "worker" &&
         inspection.owner.jobId === jobId
       ) {
+        const completed = await this.readReconciledState(jobId);
+        if (terminalStatuses.has(completed.status)) return completed;
         await this.store.appendEventOnce(
           jobId,
           "worker_reconciliation_deferred",
@@ -252,6 +236,8 @@ export class PrimeDispatcher {
     }
     const verification = await verifyWorkerIdentity(identity);
     if (verification.status === "unreachable") {
+      const completed = await this.readReconciledState(jobId);
+      if (terminalStatuses.has(completed.status)) return completed;
       await this.store.appendEventOnce(
         jobId,
         "worker_reconciliation_deferred",
@@ -283,6 +269,29 @@ export class PrimeDispatcher {
         protocolVersion: identity.protocolVersion,
       },
     );
+    return state;
+  }
+
+  private async readReconciledState(jobId: string): Promise<JobState> {
+    let state = await this.store.readState(jobId);
+    if (!terminalStatuses.has(state.status) && state.terminalIntentStatus) {
+      try {
+        const result = await this.store.readResult(jobId);
+        if (result.status === state.terminalIntentStatus) {
+          state = await this.store.updateState(jobId, result.status, {
+            ...(result.commitSha ? { commitSha: result.commitSha } : {}),
+            noChanges: result.noChanges,
+            summary: result.summary,
+            ...(result.status === "failed" || result.status === "cancelled"
+              ? { error: result.summary }
+              : {}),
+            terminalIntentStatus: undefined,
+          });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
     return state;
   }
 

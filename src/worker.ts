@@ -279,15 +279,17 @@ async function main(): Promise<void> {
   try {
     await serveCommands();
     leaseToken = await globalLease.claim(leaseToken, workerIdentity!);
-    assertJobActive();
-    const executionBackend = new UnsafeLocalExecutionBackend();
-    const executionPlan = executionBackend.plan(request, stateRoot);
-    state = await store.updateState(jobId, "provisioning", {
+    state = await store.updateState(jobId, state.status, {
       workerPid: workerIdentity!.pid,
       workerStartIdentity: workerIdentity!.processStartIdentity,
       workerNonce: workerIdentity!.nonce,
       workerProtocolVersion: workerIdentity!.protocolVersion,
       socketPath: workerIdentity!.socketPath,
+    });
+    assertJobActive();
+    const executionBackend = new UnsafeLocalExecutionBackend();
+    const executionPlan = executionBackend.plan(request, stateRoot);
+    state = await store.updateState(jobId, "provisioning", {
       ...executionPlan,
     });
     const execution = await executionBackend.prepare(request, stateRoot, {
