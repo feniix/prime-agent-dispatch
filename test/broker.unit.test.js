@@ -73,8 +73,11 @@ test("broker authorizes scoped token and pins normalized Responses body", async 
 
 test("broker enforces revocation, expiry, size, concurrency, and token budget", async () => {
   let release;
+  let markStarted;
   const held = new Promise((resolve) => (release = resolve));
+  const started = new Promise((resolve) => (markStarted = resolve));
   const fake = await upstream(async (_request, response) => {
+    markStarted();
     await held;
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end('data: {"response":{"usage":{"total_tokens":3}}}\n\n');
@@ -87,59 +90,68 @@ test("broker enforces revocation, expiry, size, concurrency, and token budget", 
     maxConcurrency: 1,
   });
   const lease = await broker.createLease("job", {
-    wallClockMs: 50,
+    wallClockMs: 5_000,
     maxTokens: 2,
   });
   const headers = {
     authorization: `Bearer ${lease.opaqueToken}`,
     "content-type": "application/json",
   };
-  const oversized = await fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ long: "payload" }),
-  });
-  assert.equal(oversized.status, 413);
-  const first = fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers,
-    body: "{}",
-  });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  const concurrent = await fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers,
-    body: "{}",
-  });
-  assert.equal(concurrent.status, 429);
-  release();
-  await (await first).text();
-  const exhausted = await fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers,
-    body: "{}",
-  });
-  assert.equal(exhausted.status, 429);
-  await lease.revoke();
-  const revoked = await fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers,
-    body: "{}",
-  });
-  assert.equal(revoked.status, 401);
-  const short = await broker.createLease("expiring", {
-    wallClockMs: 5,
-    maxTokens: 10,
-  });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  const expired = await fetch(new URL("responses", short.endpoint), {
-    method: "POST",
-    headers: { authorization: `Bearer ${short.opaqueToken}` },
-    body: "{}",
-  });
-  assert.equal(expired.status, 401);
-  await broker.close();
-  await fake.close();
+  let first;
+  let short;
+  try {
+    const oversized = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ long: "payload" }),
+    });
+    assert.equal(oversized.status, 413);
+    first = fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    await started;
+    const concurrent = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(concurrent.status, 429);
+    release();
+    await (await first).text();
+    const exhausted = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(exhausted.status, 429);
+    await lease.revoke();
+    const revoked = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(revoked.status, 401);
+    short = await broker.createLease("expiring", {
+      wallClockMs: 5,
+      maxTokens: 10,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const expired = await fetch(new URL("responses", short.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${short.opaqueToken}` },
+      body: "{}",
+    });
+    assert.equal(expired.status, 401);
+  } finally {
+    release();
+    await first?.catch(() => undefined);
+    await short?.revoke().catch(() => undefined);
+    await lease.revoke().catch(() => undefined);
+    await broker.close();
+    await fake.close();
+  }
 });
 
 test("revocation aborts an in-flight upstream without disclosing secrets", async () => {
