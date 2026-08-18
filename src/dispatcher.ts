@@ -128,12 +128,11 @@ export class PrimeDispatcher {
       while (Date.now() < startupDeadline) {
         const current = await this.store.readState(jobId);
         const identity = workerIdentityFromState(current);
-        if (
-          identity?.pid === child.pid &&
-          identity.nonce === workerNonce &&
-          (await verifyWorkerIdentity(identity)).status === "verified"
-        )
-          break;
+        if (identity?.pid === child.pid && identity.nonce === workerNonce) {
+          if (terminalStatuses.has(current.status)) break;
+          if ((await verifyWorkerIdentity(identity)).status === "verified")
+            break;
+        }
         if (spawnError) throw spawnError;
         if (child.exitCode !== null)
           throw new Error(
@@ -143,10 +142,13 @@ export class PrimeDispatcher {
       }
       const started = await this.store.readState(jobId);
       const startedIdentity = workerIdentityFromState(started);
+      const startedIdentityMatches =
+        startedIdentity?.pid === child.pid &&
+        startedIdentity.nonce === workerNonce;
       if (
-        startedIdentity?.pid !== child.pid ||
-        startedIdentity.nonce !== workerNonce ||
-        (await verifyWorkerIdentity(startedIdentity)).status !== "verified"
+        !startedIdentityMatches ||
+        (!terminalStatuses.has(started.status) &&
+          (await verifyWorkerIdentity(startedIdentity)).status !== "verified")
       ) {
         try {
           if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
