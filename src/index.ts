@@ -12,3 +12,4 @@ export * from "./repository.js";
 export * from "./schemas.js";
 export * from "./state-machine.js";
 export * from "./store.js";
+export * from "./worker-identity.js";

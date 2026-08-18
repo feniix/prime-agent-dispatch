@@ -7,14 +7,16 @@ import { createAgentBackend, type AgentBackend } from "./agent.js";
 import { UnsafeLocalExecutionBackend } from "./execution.js";
 import { JobStore } from "./store.js";
 import {
-  WorkerCommandSchema,
+  WORKER_PROTOCOL_VERSION,
+  WorkerRequestSchema,
   type GateResult,
   type JobResult,
   type JobState,
+  type WorkerIdentity,
 } from "./schemas.js";
 import { terminalStatuses } from "./state-machine.js";
 import { git, runCommand } from "./process.js";
-import { GlobalJobLease } from "./lease.js";
+import { GlobalJobLease, type LeaseToken } from "./lease.js";
 import { ProductionInferenceBroker, type InferenceLease } from "./inference.js";
 import { resolveCodexSubscriptionAuth } from "./openclaw-auth.js";
 import { verifyPrimeInstallation } from "./release.js";
@@ -23,6 +25,7 @@ import {
   buildRemoteInertGitEnvironment,
   installRemoteInertGitGuard,
 } from "./policy.js";
+import { readProcessStartIdentity } from "./worker-identity.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -33,6 +36,8 @@ function readArg(name: string): string {
 
 const stateRoot = readArg("--state-root");
 const jobId = readArg("--job-id");
+const launchNonce = readArg("--launch-nonce");
+const workerNonce = readArg("--worker-nonce");
 const store = new JobStore(stateRoot);
 let controlDir: string | undefined;
 let socketPath: string | undefined;
@@ -47,6 +52,12 @@ let jobAbortController: AbortController | undefined;
 let turnsUsed = 1;
 let cancellationPromise: Promise<void> | undefined;
 let performCancellation: (() => Promise<void>) | undefined;
+let workerIdentity: WorkerIdentity | undefined;
+let leaseToken: LeaseToken = {
+  kind: "launcher",
+  jobId,
+  nonce: launchNonce,
+};
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
   socket.end(
@@ -95,11 +106,19 @@ async function serveCommands(): Promise<void> {
       handled = true;
       void (async () => {
         try {
-          const command = WorkerCommandSchema.parse(
+          const command = WorkerRequestSchema.parse(
             JSON.parse(buffer.slice(0, lf)),
           );
-          if (command.jobId !== jobId) throw new Error("job id mismatch");
-          if (command.operation === "prime_status") {
+          if (!workerIdentity) throw new Error("worker identity unavailable");
+          if (command.jobId !== workerIdentity.jobId)
+            throw new Error("job id mismatch");
+          if (command.workerNonce !== workerIdentity.nonce)
+            throw new Error("worker nonce mismatch");
+          if (command.protocolVersion !== workerIdentity.protocolVersion)
+            throw new Error("worker protocol mismatch");
+          if (command.operation === "worker_handshake") {
+            reply(socket, workerIdentity);
+          } else if (command.operation === "prime_status") {
             reply(socket, await store.readState(jobId));
           } else if (command.operation === "prime_steer") {
             if (!agent) throw new Error("agent is not running");
@@ -135,6 +154,17 @@ async function serveCommands(): Promise<void> {
     server?.listen(socketPath, resolve);
   });
   await chmod(socketPath, 0o600);
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
+  if (!processStartIdentity)
+    throw new Error("could not read worker process start identity");
+  workerIdentity = {
+    jobId,
+    pid: process.pid,
+    processStartIdentity,
+    nonce: workerNonce,
+    socketPath,
+    protocolVersion: WORKER_PROTOCOL_VERSION,
+  };
 }
 
 async function writeTerminalResult(
@@ -210,7 +240,7 @@ async function capturePartialEvidence(
 }
 
 async function main(): Promise<void> {
-  await new GlobalJobLease(stateRoot).claim(jobId, process.pid);
+  const globalLease = new GlobalJobLease(stateRoot);
   const request = await store.readRequest(jobId);
   const controller = new AbortController();
   jobAbortController = controller;
@@ -248,12 +278,18 @@ async function main(): Promise<void> {
   performCancellation = requestCancellation;
   try {
     await serveCommands();
+    leaseToken = await globalLease.claim(leaseToken, workerIdentity!);
+    state = await store.updateState(jobId, state.status, {
+      workerPid: workerIdentity!.pid,
+      workerStartIdentity: workerIdentity!.processStartIdentity,
+      workerNonce: workerIdentity!.nonce,
+      workerProtocolVersion: workerIdentity!.protocolVersion,
+      socketPath: workerIdentity!.socketPath,
+    });
     assertJobActive();
     const executionBackend = new UnsafeLocalExecutionBackend();
     const executionPlan = executionBackend.plan(request, stateRoot);
     state = await store.updateState(jobId, "provisioning", {
-      workerPid: process.pid,
-      socketPath: socketPath!,
       ...executionPlan,
     });
     const execution = await executionBackend.prepare(request, stateRoot, {
@@ -515,12 +551,14 @@ async function main(): Promise<void> {
     if (controlDir) await rm(controlDir, { recursive: true, force: true });
     if (primeRuntimeTmpDir)
       await rm(primeRuntimeTmpDir, { recursive: true, force: true });
-    await new GlobalJobLease(stateRoot).release(jobId).catch(() => undefined);
+    await globalLease.release(leaseToken).catch(() => undefined);
   }
 }
 
 void main().catch(async (error) => {
-  await new GlobalJobLease(stateRoot).release(jobId).catch(() => undefined);
+  await new GlobalJobLease(stateRoot)
+    .release(leaseToken)
+    .catch(() => undefined);
   process.stderr.write(
     `${error instanceof Error ? error.stack : String(error)}\n`,
   );

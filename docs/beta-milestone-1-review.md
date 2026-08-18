@@ -59,11 +59,13 @@ The adapter remains a compile-time contract. It still needs a two-step
 preview/confirmation API, trusted OpenClaw-owned fixture and repository policy,
 host-owned gates, broker/auth ownership, and Discord status components.
 
-### [Strengthen worker identity and recovery](https://github.com/feniix/prime-dispatch-prototype/issues/6)
+### [Add stable worker identity and restart-safe reconnection](https://github.com/feniix/prime-dispatch-prototype/issues/6)
 
-Liveness currently uses a PID without process-start identity. Add PID plus
-start-time verification, supervision, and explicit transcript/worktree resume
-semantics before claiming automatic crash recovery.
+Workers now bind PID plus process-start identity to a random nonce, private
+socket, protocol version, and identity-bound global lease. CLI startup scans
+nonterminal jobs and reconnects only after a nonce-bound handshake. Explicit
+checkpoint recovery and safe transcript/worktree resume remain tracked by
+[issue #11](https://github.com/feniix/prime-dispatch-prototype/issues/11).
 
 ### [Make terminal persistence transactional](https://github.com/feniix/prime-dispatch-prototype/issues/7)
 

@@ -10,6 +10,7 @@ This is not production-ready. The default execution backend is intentionally nam
 
 - **Subscription feasibility gate:** [`spikes/001-codex-subscription`](spikes/001-codex-subscription/README.md) is **VALIDATED**. Real Prime Agent `0.7.2` completed a streamed tool-call fixture run with `gpt-5.6-sol` and high reasoning through OpenClaw-held Codex subscription authentication. Prime received only a scoped, revocable token.
 - **Beta Milestone 1:** **COMPLETE for the disposable-fixture CLI scope, with reviewed limitations.** It productionizes the broker seam, checks the pinned Prime release and entrypoint, adds immutable confirmation and trusted host policy, enforces one global job and finite budgets, and validates real Prime completion and cancellation. Complete dependency-tree integrity remains a follow-up.
+- **Worker reconnection:** detached workers now persist PID plus OS process-start identity, a random nonce, private socket path, and protocol version. CLI startup scans nonterminal jobs and accepts a worker only after both process identity and a nonce-bound socket handshake match.
 - **Operational Discord beta:** not implemented or installed yet. The OpenClaw adapter, owner authorization, confirmation/status components, and retention policy remain later milestones.
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
 - **Control-plane direction:** the current JSON/Zod store remains the Milestone 1 implementation. [ADR-0013](docs/adrs/0013-sqlite-authority-with-json-artifacts.md) supersedes it for future crash-consistent work: SQLite becomes authoritative while JSON, reports, diffs, and logs remain inspectable artifacts.
@@ -53,6 +54,16 @@ flowchart TD
 ```
 
 The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`), while the API schemas and worker IPC retain the explicit operations `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
+
+Every CLI invocation scans nonterminal jobs before handling its requested
+operation. A matching live worker is reconnected without restarting Prime; a
+dead process, reused PID, wrong job, wrong nonce, or incompatible protocol is
+rejected and conservatively reconciled to `interrupted`. A worker whose OS
+identity still matches but whose socket is temporarily unreachable keeps its
+lease and is reported as unverified rather than being replaced. Lifecycle
+events expose deterministic delivery keys and durable per-consumer cursors so
+the later OpenClaw adapter can catch up missed milestone and terminal
+notifications idempotently.
 
 Each job has this layout:
 
@@ -228,9 +239,8 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 
 ## Known limitations
 
-- A surviving job worker can be reached by later CLI/adapter processes. If the job worker itself dies, automatic reconciliation and transcript/worktree resume are not implemented; the last durable state and artifacts remain for inspection.
-- Worker PID identity is not protected against PID reuse. Locks require both age and a missing PID before reclamation, but production needs OS process-start identity or leases.
-- The dispatcher is not a resident scheduler. A failed worker is reconciled when status is next queried, not proactively while no client is running.
+- A surviving job worker is authenticated by process-start identity and a nonce-bound socket handshake. A dead or disproven worker is reconciled to `interrupted`; checkpoint recovery and explicit safe resume remain deferred to issue #11.
+- The dispatcher is not a resident scheduler. Nonterminal jobs are scanned whenever the CLI or future adapter starts, but no reconciliation occurs while no client is running.
 - Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`, but crash injection around every transition has not been exhaustively tested.
 - Token usage is observable only after an upstream response, so a single response can overshoot the remaining token budget and an aborted response may not report usage. The token limit is a soft observable admission ceiling; wall-clock, turn, gate, output, and concurrency limits are externally enforced.
 - The official Prime archive omits runtime dependencies. The archive and configured entrypoint are checked, but the complete loaded dependency tree is not yet represented by a self-contained pinned artifact.
@@ -243,6 +253,6 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 
 ## Production exit criteria
 
-Before adopting this design, add stable worker supervision/recovery, PID-start-identity leases, authoritative cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
+Before adopting this design, add checkpoint recovery and explicit safe resume, authoritative cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 See the [deep-review catalog](docs/beta-milestone-1-review.md) for resolved findings and issue-ready deferred work.

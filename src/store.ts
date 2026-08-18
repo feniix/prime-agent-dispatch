@@ -1,6 +1,7 @@
 import {
   mkdir,
   open,
+  readdir,
   readFile,
   rename,
   rm,
@@ -8,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   EventSchema,
   JobRequestSchema,
@@ -24,6 +25,18 @@ import {
 import { assertTransition } from "./state-machine.js";
 
 const LOCK_STALE_MS = 30_000;
+const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
+
+export type LifecycleNotification = {
+  deliveryKey: string;
+  event: JobEvent;
+};
+
+type NotificationCursor = {
+  consumerId: string;
+  lastSequence: number;
+  updatedAt: string;
+};
 
 async function fsyncDirectory(path: string): Promise<void> {
   const handle = await open(path, "r");
@@ -137,6 +150,20 @@ export class JobStore {
   jobDir(jobId: string): string {
     if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) throw new Error("invalid job id");
     return join(this.root, "jobs", jobId);
+  }
+
+  async listJobIds(): Promise<string[]> {
+    try {
+      return (await readdir(join(this.root, "jobs"), { withFileTypes: true }))
+        .filter(
+          (entry) => entry.isDirectory() && /^[a-zA-Z0-9_-]+$/.test(entry.name),
+        )
+        .map((entry) => entry.name)
+        .sort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
   }
 
   async initialize(request: JobRequest): Promise<JobState> {
@@ -292,6 +319,78 @@ export class JobStore {
     }
   }
 
+  async appendEventOnce(
+    jobId: string,
+    type: string,
+    dedupeKey: string,
+    data: Record<string, unknown>,
+  ): Promise<JobEvent | undefined> {
+    const dir = this.jobDir(jobId);
+    const release = await acquireLock(dir);
+    try {
+      const events = await this.readEvents(jobId);
+      if (
+        events.some(
+          (event) => event.type === type && event.data.dedupeKey === dedupeKey,
+        )
+      )
+        return undefined;
+      return await this.appendEventUnlocked(jobId, type, {
+        ...data,
+        dedupeKey,
+      });
+    } finally {
+      await release();
+    }
+  }
+
+  async pendingLifecycleNotifications(
+    jobId: string,
+    consumerId: string,
+  ): Promise<LifecycleNotification[]> {
+    const cursor = await this.readNotificationCursor(jobId, consumerId);
+    return (await this.readEvents(jobId))
+      .filter(
+        (event) =>
+          event.sequence > cursor.lastSequence &&
+          LIFECYCLE_EVENT_TYPES.has(event.type),
+      )
+      .map((event) => ({
+        deliveryKey: `${jobId}:event:${event.sequence}`,
+        event,
+      }));
+  }
+
+  async acknowledgeLifecycleNotification(
+    jobId: string,
+    consumerId: string,
+    throughSequence: number,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(throughSequence) || throughSequence < 0)
+      throw new Error("invalid lifecycle notification sequence");
+    const dir = this.jobDir(jobId);
+    const release = await acquireLock(dir);
+    try {
+      const events = await this.readEvents(jobId);
+      const finalSequence = events.at(-1)?.sequence ?? 0;
+      if (throughSequence > finalSequence)
+        throw new Error("lifecycle notification cursor exceeds journal");
+      const current = await this.readNotificationCursor(jobId, consumerId);
+      if (throughSequence <= current.lastSequence) return;
+      const next: NotificationCursor = {
+        consumerId,
+        lastSequence: throughSequence,
+        updatedAt: new Date().toISOString(),
+      };
+      await atomicWriteFile(
+        this.notificationCursorPath(jobId, consumerId),
+        `${JSON.stringify(next, null, 2)}\n`,
+      );
+    } finally {
+      await release();
+    }
+  }
+
   async readEvents(jobId: string): Promise<JobEvent[]> {
     const path = join(this.jobDir(jobId), "events.jsonl");
     let text: string;
@@ -333,6 +432,39 @@ export class JobStore {
       }
     }
     return parsed;
+  }
+
+  private notificationCursorPath(jobId: string, consumerId: string): string {
+    if (!consumerId) throw new Error("notification consumer id is required");
+    const digest = createHash("sha256").update(consumerId).digest("hex");
+    return join(this.jobDir(jobId), "notifications", `${digest}.json`);
+  }
+
+  private async readNotificationCursor(
+    jobId: string,
+    consumerId: string,
+  ): Promise<NotificationCursor> {
+    const path = this.notificationCursorPath(jobId, consumerId);
+    try {
+      const parsed = JSON.parse(
+        await readFile(path, "utf8"),
+      ) as NotificationCursor;
+      if (
+        parsed.consumerId !== consumerId ||
+        !Number.isSafeInteger(parsed.lastSequence) ||
+        parsed.lastSequence < 0 ||
+        typeof parsed.updatedAt !== "string"
+      )
+        throw new Error("invalid lifecycle notification cursor");
+      return parsed;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return {
+        consumerId,
+        lastSequence: 0,
+        updatedAt: new Date(0).toISOString(),
+      };
+    }
   }
 
   async writeArtifact(

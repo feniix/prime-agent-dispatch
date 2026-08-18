@@ -4,6 +4,7 @@ import {
   JobStateSchema,
   PrimeStartInputSchema,
   WorkerCommandSchema,
+  WorkerRequestSchema,
 } from "../dist/index.js";
 
 function minimalStart() {
@@ -79,5 +80,30 @@ test("worker IPC accepts only status, steer, and cancel operations", () => {
   );
   assert.throws(() =>
     WorkerCommandSchema.parse({ operation: "prime_result", jobId: "job" }),
+  );
+});
+
+test("worker IPC wire requests require nonce-bound protocol credentials", () => {
+  const authenticated = {
+    operation: "prime_status",
+    jobId: "job",
+    workerNonce: "2cb7191a-38ef-45ff-a17b-511b6fc329d2",
+    protocolVersion: 1,
+  };
+  assert.doesNotThrow(() => WorkerRequestSchema.parse(authenticated));
+  assert.doesNotThrow(() =>
+    WorkerRequestSchema.parse({
+      ...authenticated,
+      operation: "worker_handshake",
+    }),
+  );
+  assert.throws(() =>
+    WorkerRequestSchema.parse({
+      operation: "prime_status",
+      jobId: "job",
+    }),
+  );
+  assert.throws(() =>
+    WorkerRequestSchema.parse({ ...authenticated, protocolVersion: 2 }),
   );
 });

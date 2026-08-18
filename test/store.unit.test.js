@@ -103,3 +103,88 @@ test("event reads reject mismatched job ids and non-contiguous sequences", async
     );
   }
 });
+
+test("lifecycle notification catch-up resumes after an idempotent consumer cursor", async () => {
+  const { store, request } = await storeFixture();
+  await store.updateState(request.jobId, "provisioning");
+  await store.updateState(request.jobId, "running");
+
+  const first = await store.pendingLifecycleNotifications(
+    request.jobId,
+    "discord:fixture-thread",
+  );
+  assert.deepEqual(
+    first.map((notification) => notification.event.data.to),
+    ["provisioning", "running"],
+  );
+  assert.deepEqual(
+    first.map((notification) => notification.deliveryKey),
+    first.map(
+      (notification) => `${request.jobId}:event:${notification.event.sequence}`,
+    ),
+  );
+
+  await store.acknowledgeLifecycleNotification(
+    request.jobId,
+    "discord:fixture-thread",
+    first.at(-1).event.sequence,
+  );
+  await store.acknowledgeLifecycleNotification(
+    request.jobId,
+    "discord:fixture-thread",
+    first.at(-1).event.sequence,
+  );
+  assert.deepEqual(
+    await store.pendingLifecycleNotifications(
+      request.jobId,
+      "discord:fixture-thread",
+    ),
+    [],
+  );
+
+  await store.updateState(request.jobId, "verifying");
+  const resumed = await store.pendingLifecycleNotifications(
+    request.jobId,
+    "discord:fixture-thread",
+  );
+  assert.deepEqual(
+    resumed.map((notification) => notification.event.data.to),
+    ["verifying"],
+  );
+  await store.acknowledgeLifecycleNotification(
+    request.jobId,
+    "discord:fixture-thread",
+    resumed.at(-1).event.sequence,
+  );
+  await store.updateState(request.jobId, "committing");
+  await store.updateState(request.jobId, "succeeded");
+  assert.deepEqual(
+    (
+      await store.pendingLifecycleNotifications(
+        request.jobId,
+        "discord:fixture-thread",
+      )
+    ).map((notification) => notification.event.data.to),
+    ["committing", "succeeded"],
+  );
+});
+
+test("appendEventOnce deduplicates concurrent reconciliation decisions", async () => {
+  const { store, request } = await storeFixture();
+  const results = await Promise.all(
+    Array.from({ length: 4 }, () =>
+      store.appendEventOnce(
+        request.jobId,
+        "worker_reconnected",
+        "worker:nonce-one",
+        { workerNonce: "nonce-one" },
+      ),
+    ),
+  );
+  assert.equal(results.filter(Boolean).length, 1);
+  const events = await store.readEvents(request.jobId);
+  assert.equal(
+    events.filter((event) => event.type === "worker_reconnected").length,
+    1,
+  );
+});

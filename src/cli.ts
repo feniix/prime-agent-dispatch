@@ -30,6 +30,14 @@ function withStateRoot(command: Command): Command {
   );
 }
 
+async function createDispatcher(
+  options: CommonOptions,
+): Promise<PrimeDispatcher> {
+  const dispatcher = new PrimeDispatcher(stateRoot(options));
+  await dispatcher.reconcileNonterminalJobs();
+  return dispatcher;
+}
+
 const program = new Command()
   .name("prime-dispatch")
   .description("Detached single-root Prime job control")
@@ -58,7 +66,7 @@ withStateRoot(
       "accept a fake fixture preview without a second invocation",
     )
     .action(async (options) => {
-      const dispatcher = new PrimeDispatcher(stateRoot(options));
+      const dispatcher = await createDispatcher(options);
       const callerGates = options.gate.map(
         (gate: string) => JSON.parse(gate) as unknown,
       );
@@ -124,7 +132,7 @@ for (const [name, description, action] of [
       .description(description)
       .requiredOption("--job-id <id>")
       .action(async (options) => {
-        const dispatcher = new PrimeDispatcher(stateRoot(options));
+        const dispatcher = await createDispatcher(options);
         print(await dispatcher[action](options.jobId));
       }),
   );
@@ -137,7 +145,7 @@ withStateRoot(
     .requiredOption("--job-id <id>")
     .requiredOption("--message <text>")
     .action(async (options) => {
-      const dispatcher = new PrimeDispatcher(stateRoot(options));
+      const dispatcher = await createDispatcher(options);
       print(await dispatcher.steer(options.jobId, options.message));
     }),
 );
