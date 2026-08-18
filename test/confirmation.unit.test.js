@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -125,6 +125,41 @@ test("CLI refuses launch without confirmation and --yes is explicit fixture acce
   assert.match(JSON.parse(launched.stdout).jobId, /./);
   assert.match(launched.stderr, /resolvedRequest/);
   assert.match(launched.stderr, /requestHash/);
+});
+
+test("CLI preview returns structured JSON and records trusted delivery context", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const preview = await exec(process.execPath, [
+    cli,
+    "start",
+    "--state-root",
+    stateRoot,
+    "--task",
+    "fixture preview",
+    "--repo",
+    repo,
+    "--repo-root",
+    root,
+    "--channel",
+    "discord",
+    "--sender",
+    "owner-1",
+    "--thread",
+    "thread-1",
+    "--delivery",
+    "message-1",
+    "--owner",
+    "--fixture",
+    "--preview",
+  ]);
+  const parsed = JSON.parse(preview.stdout);
+  assert.match(parsed.resolvedRequest.requestHash, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.input.authorization.senderIsOwner, true);
+  assert.equal(parsed.input.authorization.threadId, "thread-1");
+  assert.equal(parsed.input.authorization.deliveryId, "message-1");
+  await assert.rejects(() => readdir(join(stateRoot, "jobs")), {
+    code: "ENOENT",
+  });
 });
 
 test("CLI rejects --yes for host-configured real Prime jobs", async () => {

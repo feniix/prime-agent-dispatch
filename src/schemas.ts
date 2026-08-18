@@ -68,8 +68,13 @@ export const BudgetSchema = z.object({
 });
 
 export const AuthorizationSchema = z.object({
+  provider: z.string().min(1).optional(),
   channelId: z.string().min(1),
   senderId: z.string().min(1),
+  senderIsOwner: z.boolean().optional(),
+  accountId: z.string().min(1).optional(),
+  threadId: z.string().min(1).optional(),
+  deliveryId: z.string().min(1).optional(),
 });
 
 export const AgentConfigSchema = z.discriminatedUnion("kind", [

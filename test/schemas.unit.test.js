@@ -33,6 +33,24 @@ test("prime_start applies bounded defaults", () => {
   });
 });
 
+test("authorization accepts host-supplied owner and delivery identity", () => {
+  const parsed = PrimeStartInputSchema.parse({
+    task: "fixture",
+    repoPath: "/tmp/repo",
+    repoRoots: ["/tmp"],
+    authorization: {
+      channelId: "discord",
+      senderId: "owner",
+      senderIsOwner: true,
+      threadId: "thread",
+      deliveryId: "message",
+    },
+  });
+  assert.equal(parsed.authorization.senderIsOwner, true);
+  assert.equal(parsed.authorization.threadId, "thread");
+  assert.equal(parsed.authorization.deliveryId, "message");
+});
+
 test("prime_start rejects unbounded or malformed values", () => {
   assert.throws(() =>
     PrimeStartInputSchema.parse({
