@@ -11,7 +11,7 @@ This is not production-ready. The default execution backend is intentionally nam
 - **Subscription feasibility gate:** [`spikes/001-codex-subscription`](spikes/001-codex-subscription/README.md) is **VALIDATED**. Real Prime Agent `0.7.2` completed a streamed tool-call fixture run with `gpt-5.6-sol` and high reasoning through OpenClaw-held Codex subscription authentication. Prime received only a scoped, revocable token.
 - **Beta Milestone 1:** **COMPLETE for the disposable-fixture CLI scope, with reviewed limitations.** It productionizes the broker seam, checks the pinned Prime release and entrypoint, adds immutable confirmation and trusted host policy, enforces one global job and finite budgets, and validates real Prime completion and cancellation. Complete dependency-tree integrity remains a follow-up.
 - **Worker reconnection:** detached workers now persist PID plus OS process-start identity, a random nonce, private socket path, and protocol version. CLI startup scans nonterminal jobs and accepts a worker only after both process identity and a nonce-bound socket handshake match.
-- **Operational Discord beta:** not implemented or installed yet. The OpenClaw adapter, owner authorization, confirmation/status components, and retention policy remain later milestones.
+- **Beta Milestone 2:** **IMPLEMENTED for the operational Discord fixture path.** The package in [`openclaw-plugin`](openclaw-plugin/README.md) exposes five owner-only typed tools, hash-bound one-time confirmation, editable status-card delivery, terminal notification catch-up, and the standalone CLI/control boundary. See the [Beta Milestone 2 report](docs/beta-milestone-2.md).
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
 - **Control-plane direction:** the current JSON/Zod store remains the Milestone 1 implementation. [ADR-0013](docs/adrs/0013-sqlite-authority-with-json-artifacts.md) supersedes it for future crash-consistent work: SQLite becomes authoritative while JSON, reports, diffs, and logs remain inspectable artifacts.
 
@@ -23,7 +23,7 @@ The vertical slice now validates detached per-job workers, reconnectable Unix-so
 
 Ordinary tests remain deterministic and use fake Prime/local upstreams. The opt-in real acceptance is fixture-only. This beta does not provide filesystem/network containment, automatic worker-death resume, Apple containers, or an installed OpenClaw plugin.
 
-Recommendation: keep live use limited to disposable fixtures until an operator explicitly selects a trusted repository. The next implementation step is the thin OpenClaw adapter and Discord confirmation/status UX. Containment remains deferred.
+Recommendation: keep live use limited to disposable fixtures until an operator explicitly selects a trusted repository. The next implementation step is the self-contained pinned runtime required before selected real-repository rollout. Containment remains deferred.
 
 See the [Beta Milestone 1 report](docs/beta-milestone-1.md) for TDD evidence, live acceptance evidence, and remaining risks.
 
@@ -31,6 +31,8 @@ See the [Beta Milestone 1 report](docs/beta-milestone-1.md) for TDD evidence, li
 
 ```mermaid
 flowchart TD
+    Discord["Discord owner"]
+    Adapter["OpenClaw adapter<br/>preview · confirm · status card"]
     CLI["prime-dispatch CLI"]
     ControlPlane["Durable control plane<br/>request.json · state.json · events.jsonl"]
     Worker["Detached prime-job worker<br/>Unix socket per active job"]
@@ -43,7 +45,7 @@ flowchart TD
     Commit["Local commit"]
     Artifacts["Diff · report · result artifacts"]
 
-    CLI --> ControlPlane
+    Discord --> Adapter --> CLI --> ControlPlane
     ControlPlane --> Worker
     Worker --> Execution
     Execution --> UnsafeLocal
@@ -53,7 +55,7 @@ flowchart TD
     Worker --> Gates --> Commit --> Artifacts
 ```
 
-The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`), while the API schemas and worker IPC retain the explicit operations `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
+The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`), while the OpenClaw adapter and API schemas expose the explicit operations `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
 
 Every CLI invocation scans nonterminal jobs before handling its requested
 operation. A matching live worker is reconnected without restarting Prime; a
@@ -199,7 +201,7 @@ node dist/cli.js cancel --state-root /tmp/prime-dispatch-state --job-id JOB_ID
 node dist/cli.js result --state-root /tmp/prime-dispatch-state --job-id JOB_ID
 ```
 
-`steer` and `cancel` apply only while the worker socket exists. `status` reads the durable snapshot, and `result` reads the durable terminal artifact.
+`steer` and `cancel` apply only while the worker socket exists. `status` reads the durable snapshot and advances the adapter's idempotent notification cursor, and `result` reads the durable terminal artifact.
 
 ## Prime compatibility
 

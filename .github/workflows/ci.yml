@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install OpenClaw adapter dependencies
+        run: pnpm --dir openclaw-plugin install --frozen-lockfile
+
       - name: Check formatting
         run: pnpm run format
 
@@ -44,5 +47,12 @@ jobs:
       - name: Run deterministic tests
         run: pnpm test
 
+      - name: Build and test installed adapter package
+        run: |
+          pnpm --dir openclaw-plugin run build
+          pnpm --dir openclaw-plugin test
+
       - name: Audit dependencies
-        run: pnpm audit --audit-level=high
+        run: |
+          pnpm audit --audit-level=high
+          pnpm --dir openclaw-plugin audit --audit-level=high
