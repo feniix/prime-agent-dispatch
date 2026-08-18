@@ -167,6 +167,16 @@ withStateRoot(
 
 withStateRoot(
   program
+    .command("jobs")
+    .description("list durable Prime Dispatch job identities")
+    .action(async (options) => {
+      const dispatcher = await createDispatcher(options);
+      print({ jobIds: await dispatcher.store.listJobIds() });
+    }),
+);
+
+withStateRoot(
+  program
     .command("notifications")
     .description(
       "read pending lifecycle notifications for one durable consumer",

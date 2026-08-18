@@ -31,6 +31,12 @@ const configJsonSchema = {
       maximum: 2_000,
       default: 1_800,
     },
+    notificationPollMs: {
+      type: "integer",
+      minimum: 1_000,
+      maximum: 60_000,
+      default: 2_000,
+    },
   },
 } as const;
 
@@ -189,6 +195,85 @@ const plugin = definePluginEntry({
         );
       },
     });
+
+    let notificationTimer: NodeJS.Timeout | undefined;
+    let notificationPumpRunning = false;
+    const pumpNotifications = async () => {
+      if (notificationPumpRunning) return;
+      notificationPumpRunning = true;
+      try {
+        await adapter.catchUpNotifications({
+          async upsertStatusCard(input) {
+            if (input.previousMessageId) {
+              await api.runtime.gateway.request("message.action", {
+                action: "edit",
+                channel: input.route.channel,
+                target: input.route.to,
+                messageId: input.previousMessageId,
+                message: input.text,
+                ...(input.route.accountId
+                  ? { accountId: input.route.accountId }
+                  : {}),
+                ...(input.route.threadId
+                  ? { threadId: input.route.threadId }
+                  : {}),
+              });
+              return input.previousMessageId;
+            }
+            const delivered = await api.runtime.gateway.request<any>("send", {
+              channel: input.route.channel,
+              to: input.route.to,
+              message: input.text,
+              presentation: input.presentation,
+              idempotencyKey: input.deliveryKey,
+              ...(input.route.accountId
+                ? { accountId: input.route.accountId }
+                : {}),
+              ...(input.route.threadId
+                ? { threadId: input.route.threadId }
+                : {}),
+            });
+            return messageIdFromDelivery(delivered);
+          },
+          async deliverTerminal(input) {
+            await api.runtime.gateway.request("send", {
+              channel: input.route.channel,
+              to: input.route.to,
+              message: input.text,
+              presentation: input.presentation,
+              idempotencyKey: input.deliveryKey,
+              ...(input.route.accountId
+                ? { accountId: input.route.accountId }
+                : {}),
+              ...(input.route.threadId
+                ? { threadId: input.route.threadId }
+                : {}),
+            });
+          },
+        });
+      } catch (error) {
+        api.logger.warn(
+          `Prime Dispatch notification catch-up failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        notificationPumpRunning = false;
+      }
+    };
+    api.registerService({
+      id: "prime-dispatch-notifications",
+      start() {
+        void pumpNotifications();
+        notificationTimer = setInterval(
+          () => void pumpNotifications(),
+          config.notificationPollMs ?? 2_000,
+        );
+        notificationTimer.unref();
+      },
+      stop() {
+        if (notificationTimer) clearInterval(notificationTimer);
+        notificationTimer = undefined;
+      },
+    });
   },
 });
 
@@ -238,6 +323,10 @@ function parseConfig(
       typeof config.maxRenderedChars === "number"
         ? config.maxRenderedChars
         : 1_800,
+    notificationPollMs:
+      typeof config.notificationPollMs === "number"
+        ? config.notificationPollMs
+        : 2_000,
   };
 }
 
@@ -300,4 +389,14 @@ function commandResult(value: any) {
     text: JSON.stringify(value.state ?? value.resolvedRequest ?? value),
     presentation: value.presentation,
   };
+}
+
+function messageIdFromDelivery(value: any): string {
+  for (const candidate of [
+    value?.messageId,
+    value?.payload?.messageId,
+    value?.result?.messageId,
+  ])
+    if (typeof candidate === "string" && candidate) return candidate;
+  throw new Error("OpenClaw delivery omitted message id");
 }

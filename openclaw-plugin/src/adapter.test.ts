@@ -18,6 +18,7 @@ async function fixture() {
   const calls: string[][] = [];
   const runCli = vi.fn(async (args: string[]) => {
     calls.push(args);
+    if (args[0] === "jobs") return { jobIds: [] };
     if (args[0] === "notifications") return { notifications: [] };
     if (args[0] === "notification-ack") return { acknowledged: true };
     if (args.includes("--preview")) {
@@ -150,5 +151,61 @@ describe("PrimeDispatchAdapter", () => {
     ).toEqual(["status", "steer", "cancel", "result"]);
     expect(JSON.stringify(status)).not.toContain("must-not-render");
     expect(status.state.summary.length).toBeLessThanOrEqual(512);
+  });
+
+  it("rediscovers jobs, edits one durable status card, and advances delivery once", async () => {
+    const stateRoot = await mkdtemp(join(tmpdir(), "prime-adapter-catchup-"));
+    let acknowledged = false;
+    const runCli = vi.fn(async (args: string[]) => {
+      if (args[0] === "jobs") return { jobIds: ["job-1"] };
+      if (args[0] === "notification-ack") {
+        acknowledged = true;
+        return { acknowledged: true };
+      }
+      if (args[0] === "notifications")
+        return {
+          request: {
+            authorization: {
+              provider: "discord",
+              channelId: "channel-1",
+              senderId: "owner-1",
+              senderIsOwner: true,
+              threadId: "thread-1",
+            },
+          },
+          state: { status: "succeeded" },
+          notifications: acknowledged
+            ? []
+            : [
+                {
+                  deliveryKey: "job-1:event:9",
+                  event: {
+                    sequence: 9,
+                    type: "state_changed",
+                    data: { to: "succeeded" },
+                  },
+                },
+              ],
+        };
+      throw new Error(`unexpected CLI call: ${args[0]}`);
+    });
+    const adapter = new PrimeDispatchAdapter(
+      {
+        cliPath: "/trusted/cli.js",
+        stateRoot,
+        hostConfigPath: "/trusted/host.json",
+        confirmationTtlMs: 60_000,
+        maxRenderedChars: 512,
+      },
+      { runCli },
+    );
+    const delivery = {
+      upsertStatusCard: vi.fn(async () => "message-1"),
+      deliverTerminal: vi.fn(async () => undefined),
+    };
+    expect(await adapter.catchUpNotifications(delivery)).toBe(1);
+    expect(await adapter.catchUpNotifications(delivery)).toBe(0);
+    expect(delivery.upsertStatusCard).toHaveBeenCalledTimes(1);
+    expect(delivery.deliverTerminal).toHaveBeenCalledTimes(1);
   });
 });

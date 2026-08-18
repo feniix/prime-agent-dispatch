@@ -13,6 +13,9 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       },
       registerTool: vi.fn((_factory, options) => tools.push(...options.names)),
       registerCommand: vi.fn((command) => commands.push(command.name)),
+      registerService: vi.fn(),
+      runtime: { gateway: { request: vi.fn() } },
+      logger: { warn: vi.fn() },
     };
     plugin.register(api as any);
     expect(tools).toEqual([

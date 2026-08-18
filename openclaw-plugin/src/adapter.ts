@@ -8,6 +8,7 @@ export type PrimeDispatchPluginConfig = {
   hostConfigPath: string;
   confirmationTtlMs: number;
   maxRenderedChars: number;
+  notificationPollMs?: number;
 };
 
 export type TrustedToolContext = {
@@ -18,6 +19,34 @@ export type TrustedToolContext = {
   accountId?: string;
   threadId?: string;
   deliveryId?: string;
+};
+
+export type NotificationDelivery = {
+  upsertStatusCard(input: {
+    jobId: string;
+    route: {
+      channel: string;
+      to: string;
+      accountId?: string;
+      threadId?: string;
+    };
+    text: string;
+    presentation: Presentation;
+    previousMessageId?: string;
+    deliveryKey: string;
+  }): Promise<string>;
+  deliverTerminal(input: {
+    jobId: string;
+    route: {
+      channel: string;
+      to: string;
+      accountId?: string;
+      threadId?: string;
+    };
+    text: string;
+    presentation: Presentation;
+    deliveryKey: string;
+  }): Promise<void>;
 };
 
 type CliRunner = (args: string[]) => Promise<unknown>;
@@ -34,7 +63,7 @@ type ConfirmationRecord = {
   launchArgs: string[];
 };
 
-type Presentation = {
+export type Presentation = {
   title: string;
   tone: "info" | "success" | "warning" | "danger";
   blocks: Array<Record<string, unknown>>;
@@ -192,6 +221,92 @@ export class PrimeDispatchAdapter {
     );
   }
 
+  async catchUpNotifications(delivery: NotificationDelivery): Promise<number> {
+    const listing = asRecord(
+      await this.runCli(["jobs", "--state-root", this.config.stateRoot]),
+    );
+    const jobIds = Array.isArray(listing.jobIds)
+      ? listing.jobIds.filter(
+          (value): value is string => typeof value === "string",
+        )
+      : [];
+    let delivered = 0;
+    for (const jobId of jobIds) {
+      const consumerId = "openclaw:discord-status-v1";
+      const pending = asRecord(
+        await this.runCli([
+          "notifications",
+          "--state-root",
+          this.config.stateRoot,
+          "--job-id",
+          jobId,
+          "--consumer-id",
+          consumerId,
+        ]),
+      );
+      const notifications = Array.isArray(pending.notifications)
+        ? pending.notifications
+        : [];
+      if (notifications.length === 0) continue;
+      const request = asRecord(pending.request);
+      const authorization = asRecord(request.authorization);
+      if (authorization.senderIsOwner !== true) continue;
+      const route = {
+        channel: stringField(authorization, "provider"),
+        to: stringField(authorization, "channelId"),
+        ...(typeof authorization.accountId === "string"
+          ? { accountId: authorization.accountId }
+          : {}),
+        ...(typeof authorization.threadId === "string"
+          ? { threadId: authorization.threadId }
+          : {}),
+      };
+      const state = asRecord(pending.state);
+      const status = stringField(state, "status");
+      const last = asRecord(notifications.at(-1));
+      const event = asRecord(last.event);
+      const sequence = event.sequence;
+      if (typeof sequence !== "number")
+        throw new Error("notification omitted sequence");
+      const deliveryKey = stringField(last, "deliveryKey");
+      const previousMessageId = await this.readStatusCard(jobId);
+      const text = `Prime job ${jobId}: ${status}`.slice(
+        0,
+        this.config.maxRenderedChars,
+      );
+      const messageId = await delivery.upsertStatusCard({
+        jobId,
+        route,
+        text,
+        presentation: statusPresentation(jobId, status),
+        ...(previousMessageId ? { previousMessageId } : {}),
+        deliveryKey,
+      });
+      await this.writeStatusCard(jobId, messageId);
+      if (["succeeded", "failed", "cancelled", "interrupted"].includes(status))
+        await delivery.deliverTerminal({
+          jobId,
+          route,
+          text,
+          presentation: statusPresentation(jobId, status),
+          deliveryKey: `${deliveryKey}:terminal`,
+        });
+      await this.runCli([
+        "notification-ack",
+        "--state-root",
+        this.config.stateRoot,
+        "--job-id",
+        jobId,
+        "--consumer-id",
+        consumerId,
+        "--through-sequence",
+        String(sequence),
+      ]);
+      delivered += notifications.length;
+    }
+    return delivered;
+  }
+
   private async confirm(
     token: string,
     context: TrustedToolContext,
@@ -294,6 +409,39 @@ export class PrimeDispatchAdapter {
       "confirmations",
       `${token}.json`,
     );
+  }
+
+  private statusCardPath(jobId: string): string {
+    if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) throw new Error("invalid job id");
+    return join(
+      this.config.stateRoot,
+      "openclaw",
+      "status-cards",
+      `${jobId}.json`,
+    );
+  }
+
+  private async readStatusCard(jobId: string): Promise<string | undefined> {
+    try {
+      const record = asRecord(
+        JSON.parse(await readFile(this.statusCardPath(jobId), "utf8")),
+      );
+      return typeof record.messageId === "string"
+        ? record.messageId
+        : undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  private async writeStatusCard(
+    jobId: string,
+    messageId: string,
+  ): Promise<void> {
+    const path = this.statusCardPath(jobId);
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await atomicWrite(path, { schemaVersion: 1, jobId, messageId });
   }
 
   private async writeConfirmation(record: ConfirmationRecord): Promise<void> {

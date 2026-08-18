@@ -25,6 +25,12 @@
         "minimum": 256,
         "maximum": 2000,
         "default": 1800
+      },
+      "notificationPollMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "default": 2000
       }
     }
   },
