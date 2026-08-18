@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const SCHEMA_VERSION = 1 as const;
+export const WORKER_PROTOCOL_VERSION = 1 as const;
 export const HOST_MAX_WALL_CLOCK_MS = 30 * 60_000;
 export const HOST_MAX_MODEL_TOKENS = 250_000;
 export const HOST_MAX_PRIME_TURNS = 50;
@@ -114,6 +115,16 @@ export const JobRequestSchema = PrimeStartInputSchema.extend({
 });
 export type JobRequest = z.infer<typeof JobRequestSchema>;
 
+export const WorkerIdentitySchema = z.object({
+  jobId: z.string().min(1),
+  pid: z.number().int().positive(),
+  processStartIdentity: z.string().min(1),
+  nonce: z.string().uuid(),
+  socketPath: z.string().min(1),
+  protocolVersion: z.literal(WORKER_PROTOCOL_VERSION),
+});
+export type WorkerIdentity = z.infer<typeof WorkerIdentitySchema>;
+
 export const JobStateSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   revision: z.number().int().nonnegative(),
@@ -122,6 +133,9 @@ export const JobStateSchema = z.object({
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   workerPid: z.number().int().positive().optional(),
+  workerStartIdentity: z.string().min(1).optional(),
+  workerNonce: z.string().uuid().optional(),
+  workerProtocolVersion: z.literal(WORKER_PROTOCOL_VERSION).optional(),
   socketPath: z.string().optional(),
   worktreePath: z.string().optional(),
   branchName: z.string().optional(),
