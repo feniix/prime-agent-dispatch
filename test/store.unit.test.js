@@ -151,6 +151,22 @@ test("lifecycle notification catch-up resumes after an idempotent consumer curso
     resumed.map((notification) => notification.event.data.to),
     ["verifying"],
   );
+  await store.acknowledgeLifecycleNotification(
+    request.jobId,
+    "discord:fixture-thread",
+    resumed.at(-1).event.sequence,
+  );
+  await store.updateState(request.jobId, "committing");
+  await store.updateState(request.jobId, "succeeded");
+  assert.deepEqual(
+    (
+      await store.pendingLifecycleNotifications(
+        request.jobId,
+        "discord:fixture-thread",
+      )
+    ).map((notification) => notification.event.data.to),
+    ["committing", "succeeded"],
+  );
 });
 
 test("appendEventOnce deduplicates concurrent reconciliation decisions", async () => {
