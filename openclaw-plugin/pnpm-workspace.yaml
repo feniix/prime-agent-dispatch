@@ -1,0 +1,8 @@
+allowBuilds:
+  "@google/genai": true
+  esbuild: true
+  openclaw: true
+  protobufjs: true
+  tree-sitter-bash: true
+overrides:
+  undici: 8.9.0

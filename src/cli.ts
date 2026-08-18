@@ -53,6 +53,11 @@ withStateRoot(
     .option("--repo-root <path>", "allowed repository root", collect, [])
     .requiredOption("--channel <id>")
     .requiredOption("--sender <id>")
+    .option("--provider <id>", "trusted delivery provider identity")
+    .option("--owner", "record trusted OpenClaw owner authorization")
+    .option("--account <id>", "trusted delivery account identity")
+    .option("--thread <id>", "trusted delivery thread identity")
+    .option("--delivery <id>", "trusted inbound delivery identity")
     .option("--base <ref>")
     .option("--fixture")
     .option("--unsafe-allow-live-repo")
@@ -61,6 +66,7 @@ withStateRoot(
     .option("--host-config <path>")
     .addOption(new Option("--agent <kind>").choices(["fake", "prime"]))
     .option("--confirm-hash <sha256>")
+    .option("--preview", "return the resolved request without launching")
     .option(
       "--yes",
       "accept a fake fixture preview without a second invocation",
@@ -94,12 +100,21 @@ withStateRoot(
             : {}),
         },
         authorization: {
+          ...(options.provider ? { provider: options.provider } : {}),
           channelId: options.channel,
           senderId: options.sender,
+          ...(options.owner ? { senderIsOwner: true } : {}),
+          ...(options.account ? { accountId: options.account } : {}),
+          ...(options.thread ? { threadId: options.thread } : {}),
+          ...(options.delivery ? { deliveryId: options.delivery } : {}),
         },
         agent: hostPolicy?.agent ?? { kind: "fake" },
       });
       const preview = await dispatcher.preview(input);
+      if (options.preview) {
+        print({ resolvedRequest: preview.summary, input: preview.input });
+        return;
+      }
       process.stderr.write(
         `${JSON.stringify({ resolvedRequest: preview.summary }, null, 2)}\n`,
       );
@@ -147,6 +162,58 @@ withStateRoot(
     .action(async (options) => {
       const dispatcher = await createDispatcher(options);
       print(await dispatcher.steer(options.jobId, options.message));
+    }),
+);
+
+withStateRoot(
+  program
+    .command("jobs")
+    .description("list durable Prime Dispatch job identities")
+    .action(async (options) => {
+      const dispatcher = await createDispatcher(options);
+      print({ jobIds: await dispatcher.store.listJobIds() });
+    }),
+);
+
+withStateRoot(
+  program
+    .command("notifications")
+    .description(
+      "read pending lifecycle notifications for one durable consumer",
+    )
+    .requiredOption("--job-id <id>")
+    .requiredOption("--consumer-id <id>")
+    .action(async (options) => {
+      const dispatcher = await createDispatcher(options);
+      print({
+        request: await dispatcher.store.readRequest(options.jobId),
+        state: await dispatcher.store.readState(options.jobId),
+        notifications: await dispatcher.store.pendingLifecycleNotifications(
+          options.jobId,
+          options.consumerId,
+        ),
+      });
+    }),
+);
+
+withStateRoot(
+  program
+    .command("notification-ack")
+    .description("advance one durable lifecycle notification cursor")
+    .requiredOption("--job-id <id>")
+    .requiredOption("--consumer-id <id>")
+    .requiredOption("--through-sequence <sequence>")
+    .action(async (options) => {
+      const dispatcher = await createDispatcher(options);
+      await dispatcher.store.acknowledgeLifecycleNotification(
+        options.jobId,
+        options.consumerId,
+        Number(options.throughSequence),
+      );
+      print({
+        acknowledged: true,
+        throughSequence: Number(options.throughSequence),
+      });
     }),
 );
 

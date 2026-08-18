@@ -1,0 +1,53 @@
+{
+  "id": "prime-dispatch",
+  "name": "Prime Dispatch",
+  "description": "Owner-only Discord adapter for detached Prime fixture jobs.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["cliPath", "stateRoot", "hostConfigPath"],
+    "properties": {
+      "cliPath": { "type": "string", "minLength": 1 },
+      "stateRoot": { "type": "string", "minLength": 1 },
+      "hostConfigPath": { "type": "string", "minLength": 1 },
+      "confirmationTtlMs": {
+        "type": "integer",
+        "minimum": 10000,
+        "maximum": 900000,
+        "default": 300000
+      },
+      "maxRenderedChars": {
+        "type": "integer",
+        "minimum": 256,
+        "maximum": 2000,
+        "default": 1800
+      },
+      "notificationPollMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "default": 2000
+      }
+    }
+  },
+  "contracts": {
+    "tools": [
+      "prime_start",
+      "prime_status",
+      "prime_steer",
+      "prime_cancel",
+      "prime_result"
+    ]
+  },
+  "toolMetadata": {
+    "prime_start": { "optional": true },
+    "prime_status": { "optional": true },
+    "prime_steer": { "optional": true },
+    "prime_cancel": { "optional": true },
+    "prime_result": { "optional": true }
+  }
+}

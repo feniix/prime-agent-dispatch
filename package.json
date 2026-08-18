@@ -14,7 +14,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js",
-    "test:live": "PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test test/live-prime.acceptance.test.js"
+    "test:live": "PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test test/live-prime.acceptance.test.js",
+    "test:adapter": "corepack pnpm --dir openclaw-plugin run build && corepack pnpm --dir openclaw-plugin test"
   },
   "dependencies": {
     "canonicalize": "4.0.0",

@@ -1,0 +1,33 @@
+{
+  "name": "openclaw-plugin-prime-dispatch",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "packageManager": "pnpm@11.21.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "plugin:validate": "pnpm build && pnpm test",
+    "test": "vitest run --config ./vitest.config.ts"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.7.1"
+  },
+  "dependencies": {
+    "typebox": "1.1.39"
+  },
+  "devDependencies": {
+    "openclaw": "2026.7.1",
+    "typescript": "5.9.2",
+    "vitest": "3.2.6"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}
