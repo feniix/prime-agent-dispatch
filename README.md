@@ -114,15 +114,22 @@ Same-state transitions are idempotent. Other transitions are validated explicitl
 
 ## Install and verify
 
-Requires Node.js 22 or newer and Git.
+Requires Node.js 22 or newer and Git. CI uses Node.js 24 and the
+repository-pinned pnpm version.
 
 ```bash
 cd /var/lib/evie-agent/src/prime-dispatch-prototype
-pnpm install
+pnpm install --frozen-lockfile
 pnpm run format
 pnpm run typecheck
 pnpm test
+pnpm audit --audit-level=high
 ```
+
+Pull requests and pushes to `main` run the same deterministic checks in
+GitHub Actions. If branch protection is enabled, require the `CI / quality`
+check. The credentialed `test:live` acceptance remains opt-in and does not run
+in ordinary CI.
 
 The real Codex-subscription fixture is opt-in:
 
