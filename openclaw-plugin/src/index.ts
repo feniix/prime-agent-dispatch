@@ -174,6 +174,7 @@ const plugin = definePluginEntry({
       description: "Confirm one immutable Prime Dispatch preview",
       acceptsArgs: true,
       requireAuth: true,
+      requiredScopes: ["operator.admin"],
       exposeSenderIsOwner: true,
       channels: ["discord"],
       async handler(context) {
