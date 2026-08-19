@@ -18,6 +18,7 @@
     "openclaw": ">=2026.7.1"
   },
   "dependencies": {
+    "@openclaw/discord": "2026.7.1",
     "typebox": "1.1.39"
   },
   "devDependencies": {

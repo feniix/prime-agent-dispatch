@@ -2,9 +2,15 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type {
+  OpenClawPluginApi,
+  OpenClawPluginToolContext,
+} from "openclaw/plugin-sdk/plugin-entry";
+import { editDiscordComponentMessage } from "@openclaw/discord/dist/runtime-api.send.js";
+import type { DiscordComponentMessageSpec } from "openclaw/plugin-sdk/discord";
 import {
   PrimeDispatchAdapter,
+  type NotificationDelivery,
   type PrimeDispatchPluginConfig,
   type TrustedToolContext,
 } from "./adapter.js";
@@ -202,55 +208,7 @@ const plugin = definePluginEntry({
       if (notificationPumpRunning) return;
       notificationPumpRunning = true;
       try {
-        await adapter.catchUpNotifications({
-          async upsertStatusCard(input) {
-            if (input.previousMessageId) {
-              await api.runtime.gateway.request("message.action", {
-                action: "edit",
-                channel: input.route.channel,
-                target: input.route.to,
-                messageId: input.previousMessageId,
-                message: input.text,
-                ...(input.route.accountId
-                  ? { accountId: input.route.accountId }
-                  : {}),
-                ...(input.route.threadId
-                  ? { threadId: input.route.threadId }
-                  : {}),
-              });
-              return input.previousMessageId;
-            }
-            const delivered = await api.runtime.gateway.request<any>("send", {
-              channel: input.route.channel,
-              to: input.route.to,
-              message: input.text,
-              presentation: input.presentation,
-              idempotencyKey: input.deliveryKey,
-              ...(input.route.accountId
-                ? { accountId: input.route.accountId }
-                : {}),
-              ...(input.route.threadId
-                ? { threadId: input.route.threadId }
-                : {}),
-            });
-            return messageIdFromDelivery(delivered);
-          },
-          async deliverTerminal(input) {
-            await api.runtime.gateway.request("send", {
-              channel: input.route.channel,
-              to: input.route.to,
-              message: input.text,
-              presentation: input.presentation,
-              idempotencyKey: input.deliveryKey,
-              ...(input.route.accountId
-                ? { accountId: input.route.accountId }
-                : {}),
-              ...(input.route.threadId
-                ? { threadId: input.route.threadId }
-                : {}),
-            });
-          },
-        });
+        await adapter.catchUpNotifications(createNotificationDelivery(api));
       } catch (error) {
         api.logger.warn(
           `Prime Dispatch notification catch-up failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -278,6 +236,91 @@ const plugin = definePluginEntry({
 });
 
 export default plugin;
+
+type NotificationApi = Pick<OpenClawPluginApi, "config" | "runtime">;
+type EditDiscordComponentMessage = typeof editDiscordComponentMessage;
+type LoadedOutbound = NonNullable<
+  Awaited<
+    ReturnType<NotificationApi["runtime"]["channel"]["outbound"]["loadAdapter"]>
+  >
+>;
+type RenderPresentationInput = Parameters<
+  NonNullable<LoadedOutbound["renderPresentation"]>
+>[0];
+
+export function createNotificationDelivery(
+  api: NotificationApi,
+  dependencies: {
+    editDiscordComponentMessage: EditDiscordComponentMessage;
+  } = { editDiscordComponentMessage },
+): NotificationDelivery {
+  type DeliveryInput = Parameters<NotificationDelivery["upsertStatusCard"]>[0];
+
+  const render = async (input: DeliveryInput) => {
+    if (input.route.channel !== "discord")
+      throw new Error("Prime Dispatch notification route must be Discord");
+    const outbound = await api.runtime.channel.outbound.loadAdapter("discord");
+    if (!outbound?.renderPresentation || !outbound.sendPayload)
+      throw new Error(
+        "Discord outbound adapter lacks presentation or payload delivery",
+      );
+    const presentation =
+      input.presentation as RenderPresentationInput["presentation"];
+    const payload: RenderPresentationInput["payload"] = {
+      text: input.text,
+      presentation,
+    };
+    const context: RenderPresentationInput["ctx"] = {
+      cfg: api.config,
+      to: input.route.to,
+      text: input.text,
+      payload,
+      deliveryQueueId: input.deliveryKey,
+      ...(input.route.accountId ? { accountId: input.route.accountId } : {}),
+      ...(input.route.threadId ? { threadId: input.route.threadId } : {}),
+    };
+    const rendered = await outbound.renderPresentation({
+      payload,
+      presentation,
+      ctx: context,
+    });
+    if (!rendered)
+      throw new Error("Discord could not render the status presentation");
+    return { context, outbound, rendered };
+  };
+
+  const send = async (input: DeliveryInput): Promise<string> => {
+    const { context, outbound, rendered } = await render(input);
+    const sendPayload = outbound.sendPayload;
+    if (!sendPayload)
+      throw new Error("Discord outbound adapter lacks payload delivery");
+    return messageIdFromDelivery(
+      await sendPayload({ ...context, payload: rendered }),
+    );
+  };
+
+  return {
+    async upsertStatusCard(input) {
+      if (!input.previousMessageId) return await send(input);
+      const { rendered } = await render(input);
+      await dependencies.editDiscordComponentMessage(
+        discordEditTarget(input.route.to, input.route.threadId),
+        input.previousMessageId,
+        discordComponentSpec(rendered),
+        {
+          cfg: api.config,
+          ...(input.route.accountId
+            ? { accountId: input.route.accountId }
+            : {}),
+        },
+      );
+      return input.previousMessageId;
+    },
+    async deliverTerminal(input) {
+      await send(input);
+    },
+  };
+}
 
 function registerSimpleTool(
   api: Parameters<Parameters<typeof definePluginEntry>[0]["register"]>[0],
@@ -399,4 +442,20 @@ function messageIdFromDelivery(value: any): string {
   ])
     if (typeof candidate === "string" && candidate) return candidate;
   throw new Error("OpenClaw delivery omitted message id");
+}
+
+function discordEditTarget(to: string, threadId?: string): string {
+  return threadId ? `channel:${threadId}` : to;
+}
+
+function discordComponentSpec(value: unknown): DiscordComponentMessageSpec {
+  const payload = value as {
+    channelData?: {
+      discord?: { presentationComponents?: unknown };
+    };
+  };
+  const spec = payload.channelData?.discord?.presentationComponents;
+  if (!spec || typeof spec !== "object" || Array.isArray(spec))
+    throw new Error("Discord rendered payload omitted presentation components");
+  return spec as DiscordComponentMessageSpec;
 }
