@@ -1,7 +1,33 @@
 import { describe, expect, it, vi } from "vitest";
-import plugin, { createNotificationDelivery } from "./index.js";
+import plugin, {
+  createNotificationDelivery,
+  trustedCommandContext,
+} from "./index.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
+  it("normalizes a native Discord thread command to the typed-tool delivery route", () => {
+    expect(
+      trustedCommandContext({
+        senderId: "owner-1",
+        senderIsOwner: true,
+        channel: "discord",
+        channelId: "thread-1",
+        to: "slash:owner-1",
+        accountId: "default",
+        messageThreadId: "thread-1",
+        sessionId: "session-1",
+      } as any),
+    ).toEqual({
+      senderId: "owner-1",
+      senderIsOwner: true,
+      channel: "discord",
+      to: "channel:thread-1",
+      accountId: "default",
+      threadId: "thread-1",
+      deliveryId: "session-1",
+    });
+  });
+
   it("registers five optional typed tools and Discord confirmation commands", () => {
     const tools: string[] = [];
     const commands: string[] = [];

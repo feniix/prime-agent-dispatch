@@ -5,6 +5,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
+  PluginCommandContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { editDiscordComponentMessage } from "@openclaw/discord/dist/runtime-api.send.js";
 import type { DiscordComponentMessageSpec } from "openclaw/plugin-sdk/discord";
@@ -402,16 +403,23 @@ function trustedContext(
   };
 }
 
-function trustedCommandContext(context: any): TrustedToolContext {
+export function trustedCommandContext(
+  context: PluginCommandContext,
+): TrustedToolContext {
+  const channelId = context.channelId?.trim();
+  const deliveryTarget =
+    context.channel === "discord" && channelId
+      ? channelId.startsWith("channel:")
+        ? channelId
+        : `channel:${channelId}`
+      : (context.to ?? channelId);
   return {
     ...(context.senderId ? { senderId: context.senderId } : {}),
     ...(context.senderIsOwner === undefined
       ? {}
       : { senderIsOwner: context.senderIsOwner }),
     ...(context.channel ? { channel: context.channel } : {}),
-    ...((context.to ?? context.channelId)
-      ? { to: context.to ?? context.channelId }
-      : {}),
+    ...(deliveryTarget ? { to: deliveryTarget } : {}),
     ...(context.accountId ? { accountId: context.accountId } : {}),
     ...(context.messageThreadId === undefined
       ? {}
