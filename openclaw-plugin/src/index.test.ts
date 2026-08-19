@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import plugin from "./index.js";
+import plugin, { createNotificationDelivery } from "./index.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
   it("registers five optional typed tools and Discord confirmation commands", () => {
@@ -14,7 +14,7 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       registerTool: vi.fn((_factory, options) => tools.push(...options.names)),
       registerCommand: vi.fn((command) => commands.push(command.name)),
       registerService: vi.fn(),
-      runtime: { gateway: { request: vi.fn() } },
+      runtime: { channel: { outbound: { loadAdapter: vi.fn() } } },
       logger: { warn: vi.fn() },
     };
     plugin.register(api as any);
@@ -26,5 +26,104 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       "prime_result",
     ]);
     expect(commands).toEqual(["prime-confirm", "prime-status"]);
+  });
+
+  it("delivers Discord status updates through supported public plugin surfaces", async () => {
+    const sendPayload = vi
+      .fn()
+      .mockResolvedValueOnce({ channel: "discord", messageId: "message-1" })
+      .mockResolvedValueOnce({ channel: "discord", messageId: "message-2" });
+    const renderPresentation = vi.fn(async ({ payload, presentation }) => ({
+      ...payload,
+      channelData: {
+        discord: {
+          presentationComponents: {
+            blocks: presentation.blocks,
+          },
+        },
+      },
+    }));
+    const loadAdapter = vi.fn(async () => ({
+      deliveryMode: "direct",
+      renderPresentation,
+      sendPayload,
+    }));
+    const editDiscordComponentMessage = vi.fn(async () => ({
+      messageId: "message-1",
+      channelId: "thread-1",
+      receipt: {},
+    }));
+    const gatewayRequest = vi.fn(() => {
+      throw new Error(
+        "Gateway requests are only available to bundled or trusted official plugins.",
+      );
+    });
+    const api = {
+      config: {},
+      runtime: {
+        channel: { outbound: { loadAdapter } },
+        gateway: { request: gatewayRequest },
+      },
+    };
+    const delivery = createNotificationDelivery(api as any, {
+      editDiscordComponentMessage,
+    });
+    const route = {
+      channel: "discord",
+      to: "channel-1",
+      accountId: "default",
+      threadId: "thread-1",
+    };
+    const presentation = {
+      title: "Prime job job-1",
+      tone: "info" as const,
+      blocks: [{ type: "text", text: "Status: running" }],
+    };
+
+    await expect(
+      delivery.upsertStatusCard({
+        jobId: "job-1",
+        route,
+        text: "Prime job job-1: running",
+        presentation,
+        deliveryKey: "job-1:event:1",
+      }),
+    ).resolves.toBe("message-1");
+    await expect(
+      delivery.upsertStatusCard({
+        jobId: "job-1",
+        route,
+        text: "Prime job job-1: succeeded",
+        presentation: { ...presentation, tone: "success" },
+        previousMessageId: "message-1",
+        deliveryKey: "job-1:event:8",
+      }),
+    ).resolves.toBe("message-1");
+    await delivery.deliverTerminal({
+      jobId: "job-1",
+      route,
+      text: "Prime job job-1: succeeded",
+      presentation: { ...presentation, tone: "success" },
+      deliveryKey: "job-1:event:8:terminal",
+    });
+
+    expect(loadAdapter).toHaveBeenCalledWith("discord");
+    expect(sendPayload).toHaveBeenCalledTimes(2);
+    expect(sendPayload).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        to: "channel-1",
+        threadId: "thread-1",
+        accountId: "default",
+        deliveryQueueId: "job-1:event:1",
+      }),
+    );
+    expect(editDiscordComponentMessage).toHaveBeenCalledWith(
+      "channel:thread-1",
+      "message-1",
+      expect.objectContaining({ blocks: presentation.blocks }),
+      expect.objectContaining({ cfg: {}, accountId: "default" }),
+    );
+    expect(gatewayRequest).not.toHaveBeenCalled();
   });
 });

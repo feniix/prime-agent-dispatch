@@ -11,6 +11,9 @@ importers:
 
   .:
     dependencies:
+      '@openclaw/discord':
+        specifier: 2026.7.1
+        version: 2026.7.1(openclaw@2026.7.1)
       typebox:
         specifier: 1.1.39
         version: 1.1.39
@@ -322,6 +325,21 @@ packages:
   '@openclaw/ai@2026.7.1':
     resolution: {integrity: sha512-FsKy5DXSHf4qyN8Huoz/10HZRgoEwLF4uk8UWaCafaIler+q5Fsl51HcrIqIrEe0S38OT7LOaxnR++MOshAlmw==}
     engines: {node: '>=22.19.0'}
+
+  '@openclaw/discord@2026.7.1':
+    resolution: {integrity: sha512-tZfdC1YA8oVLvc2BK1w0F6rUljS5ugCOp2uWe0vPsbG1fbzVVIO4V32RoqZznGHe5u2R9u4n1aV5Z/qa1m2oFg==}
+    peerDependencies:
+      openclaw: '>=2026.7.1'
+    peerDependenciesMeta:
+      openclaw:
+        optional: true
+    bundledDependencies:
+      - '@discordjs/voice'
+      - discord-api-types
+      - libopus-wasm
+      - typebox
+      - undici
+      - ws
 
   '@openclaw/fs-safe@0.4.1':
     resolution: {integrity: sha512-hQi+BxO10KdRFlYUot1syC+hTaUnGeQNdqX5kwkKJig8CFq1tKsYJLPm+zkiiGsSKOprPAquQl/txejEhpKPgg==}
@@ -2042,6 +2060,10 @@ snapshots:
       - utf-8-validate
       - ws
       - zod
+
+  '@openclaw/discord@2026.7.1(openclaw@2026.7.1)':
+    optionalDependencies:
+      openclaw: 2026.7.1
 
   '@openclaw/fs-safe@0.4.1':
     optionalDependencies:
