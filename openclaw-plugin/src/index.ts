@@ -5,6 +5,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
+  PluginCommandContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { editDiscordComponentMessage } from "@openclaw/discord/dist/runtime-api.send.js";
 import type { DiscordComponentMessageSpec } from "openclaw/plugin-sdk/discord";
@@ -173,17 +174,27 @@ const plugin = definePluginEntry({
       description: "Confirm one immutable Prime Dispatch preview",
       acceptsArgs: true,
       requireAuth: true,
+      requiredScopes: ["operator.admin"],
       exposeSenderIsOwner: true,
       channels: ["discord"],
       async handler(context) {
-        const token = context.args?.trim();
-        if (!token) throw new Error("confirmation token is required");
-        return commandResult(
-          await adapter.start(
-            { action: "confirm", confirmationToken: token },
-            trustedCommandContext(context),
-          ),
-        );
+        let trusted: TrustedToolContext = {};
+        try {
+          const token = context.args?.trim();
+          if (!token) throw new Error("confirmation token is required");
+          trusted = trustedCommandContext(context);
+          return commandResult(
+            await adapter.start(
+              { action: "confirm", confirmationToken: token },
+              trusted,
+            ),
+          );
+        } catch (error) {
+          api.logger.warn(
+            `Prime confirmation command failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return { text: confirmationCommandFailure(error, trusted) };
+        }
       },
     });
     api.registerCommand({
@@ -402,22 +413,64 @@ function trustedContext(
   };
 }
 
-function trustedCommandContext(context: any): TrustedToolContext {
+export function trustedCommandContext(
+  context: PluginCommandContext,
+): TrustedToolContext {
+  const channelId =
+    context.channelId === undefined
+      ? undefined
+      : String(context.channelId).trim();
+  const deliveryTarget =
+    context.channel === "discord" && channelId
+      ? channelId.startsWith("channel:")
+        ? channelId
+        : `channel:${channelId}`
+      : (context.to ?? channelId);
   return {
     ...(context.senderId ? { senderId: context.senderId } : {}),
     ...(context.senderIsOwner === undefined
       ? {}
       : { senderIsOwner: context.senderIsOwner }),
     ...(context.channel ? { channel: context.channel } : {}),
-    ...((context.to ?? context.channelId)
-      ? { to: context.to ?? context.channelId }
-      : {}),
+    ...(deliveryTarget ? { to: deliveryTarget } : {}),
     ...(context.accountId ? { accountId: context.accountId } : {}),
     ...(context.messageThreadId === undefined
       ? {}
       : { threadId: String(context.messageThreadId) }),
     ...(context.sessionId ? { deliveryId: context.sessionId } : {}),
   };
+}
+
+export function confirmationCommandFailure(
+  error: unknown,
+  context: TrustedToolContext,
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const safeMessages = new Set([
+    "confirmation expired",
+    "confirmation context does not match the preview",
+    "confirmation was already used",
+    "confirmation is already being used",
+    "invalid confirmation record",
+    "Prime Dispatch is owner-only",
+    "Prime Dispatch beta is Discord-only",
+    "trusted sender identity is unavailable",
+    "trusted delivery channel identity is unavailable",
+    "confirmation token is required",
+  ]);
+  if (!safeMessages.has(message))
+    return "Prime confirmation failed before dispatch; inspect the gateway log";
+  if (message !== "confirmation context does not match the preview")
+    return `Prime confirmation failed: ${message}`;
+  return `Prime confirmation failed: ${message}; native context=${JSON.stringify(
+    {
+      senderId: context.senderId,
+      channel: context.channel,
+      to: context.to,
+      accountId: context.accountId,
+      threadId: context.threadId,
+    },
+  )}`;
 }
 
 function result(value: any) {

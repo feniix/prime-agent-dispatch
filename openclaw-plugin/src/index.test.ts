@@ -1,10 +1,72 @@
 import { describe, expect, it, vi } from "vitest";
-import plugin, { createNotificationDelivery } from "./index.js";
+import plugin, {
+  confirmationCommandFailure,
+  createNotificationDelivery,
+  trustedCommandContext,
+} from "./index.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
+  it("normalizes a native Discord thread command to the typed-tool delivery route", () => {
+    expect(
+      trustedCommandContext({
+        senderId: "owner-1",
+        senderIsOwner: true,
+        channel: "discord",
+        channelId: "thread-1",
+        to: "slash:owner-1",
+        accountId: "default",
+        messageThreadId: "thread-1",
+        sessionId: "session-1",
+      } as any),
+    ).toEqual({
+      senderId: "owner-1",
+      senderIsOwner: true,
+      channel: "discord",
+      to: "channel:thread-1",
+      accountId: "default",
+      threadId: "thread-1",
+      deliveryId: "session-1",
+    });
+  });
+
+  it("normalizes non-string native Discord channel ids defensively", () => {
+    expect(
+      trustedCommandContext({
+        senderId: "owner-1",
+        senderIsOwner: true,
+        channel: "discord",
+        channelId: 12345,
+        to: "slash:owner-1",
+      } as any),
+    ).toMatchObject({
+      to: "channel:12345",
+    });
+  });
+
+  it("returns an actionable owner-visible diagnostic for command context mismatches", () => {
+    expect(
+      confirmationCommandFailure(
+        new Error("confirmation context does not match the preview"),
+        {
+          senderId: "owner-1",
+          channel: "discord",
+          to: "channel:thread-1",
+          accountId: "default",
+          threadId: "thread-1",
+        },
+      ),
+    ).toContain(
+      'native context={"senderId":"owner-1","channel":"discord","to":"channel:thread-1","accountId":"default","threadId":"thread-1"}',
+    );
+  });
+
   it("registers five optional typed tools and Discord confirmation commands", () => {
     const tools: string[] = [];
-    const commands: string[] = [];
+    const commands: Array<{
+      name: string;
+      requiredScopes?: string[];
+      exposeSenderIsOwner?: boolean;
+    }> = [];
     const api = {
       pluginConfig: {
         cliPath: "/trusted/cli.js",
@@ -12,7 +74,7 @@ describe("Prime Dispatch OpenClaw plugin", () => {
         hostConfigPath: "/trusted/host.json",
       },
       registerTool: vi.fn((_factory, options) => tools.push(...options.names)),
-      registerCommand: vi.fn((command) => commands.push(command.name)),
+      registerCommand: vi.fn((command) => commands.push(command)),
       registerService: vi.fn(),
       runtime: { channel: { outbound: { loadAdapter: vi.fn() } } },
       logger: { warn: vi.fn() },
@@ -25,7 +87,16 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       "prime_cancel",
       "prime_result",
     ]);
-    expect(commands).toEqual(["prime-confirm", "prime-status"]);
+    expect(commands.map((command) => command.name)).toEqual([
+      "prime-confirm",
+      "prime-status",
+    ]);
+    expect(
+      commands.find((command) => command.name === "prime-confirm"),
+    ).toMatchObject({
+      requiredScopes: ["operator.admin"],
+      exposeSenderIsOwner: true,
+    });
   });
 
   it("delivers Discord status updates through supported public plugin surfaces", async () => {
