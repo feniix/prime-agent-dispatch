@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import plugin, {
+  confirmationCommandFailure,
   createNotificationDelivery,
   trustedCommandContext,
 } from "./index.js";
@@ -26,6 +27,23 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       threadId: "thread-1",
       deliveryId: "session-1",
     });
+  });
+
+  it("returns an actionable owner-visible diagnostic for command context mismatches", () => {
+    expect(
+      confirmationCommandFailure(
+        new Error("confirmation context does not match the preview"),
+        {
+          senderId: "owner-1",
+          channel: "discord",
+          to: "channel:thread-1",
+          accountId: "default",
+          threadId: "thread-1",
+        },
+      ),
+    ).toContain(
+      'native context={"senderId":"owner-1","channel":"discord","to":"channel:thread-1","accountId":"default","threadId":"thread-1"}',
+    );
   });
 
   it("registers five optional typed tools and Discord confirmation commands", () => {

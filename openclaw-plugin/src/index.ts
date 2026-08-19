@@ -179,12 +179,17 @@ const plugin = definePluginEntry({
       async handler(context) {
         const token = context.args?.trim();
         if (!token) throw new Error("confirmation token is required");
-        return commandResult(
-          await adapter.start(
-            { action: "confirm", confirmationToken: token },
-            trustedCommandContext(context),
-          ),
-        );
+        const trusted = trustedCommandContext(context);
+        try {
+          return commandResult(
+            await adapter.start(
+              { action: "confirm", confirmationToken: token },
+              trusted,
+            ),
+          );
+        } catch (error) {
+          return { text: confirmationCommandFailure(error, trusted) };
+        }
       },
     });
     api.registerCommand({
@@ -426,6 +431,37 @@ export function trustedCommandContext(
       : { threadId: String(context.messageThreadId) }),
     ...(context.sessionId ? { deliveryId: context.sessionId } : {}),
   };
+}
+
+export function confirmationCommandFailure(
+  error: unknown,
+  context: TrustedToolContext,
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const safeMessages = new Set([
+    "confirmation expired",
+    "confirmation context does not match the preview",
+    "confirmation was already used",
+    "confirmation is already being used",
+    "invalid confirmation record",
+    "Prime Dispatch is owner-only",
+    "Prime Dispatch beta is Discord-only",
+    "trusted sender identity is unavailable",
+    "trusted delivery channel identity is unavailable",
+  ]);
+  if (!safeMessages.has(message))
+    return "Prime confirmation failed before dispatch; inspect the gateway log";
+  if (message !== "confirmation context does not match the preview")
+    return `Prime confirmation failed: ${message}`;
+  return `Prime confirmation failed: ${message}; native context=${JSON.stringify(
+    {
+      senderId: context.senderId,
+      channel: context.channel,
+      to: context.to,
+      accountId: context.accountId,
+      threadId: context.threadId,
+    },
+  )}`;
 }
 
 function result(value: any) {
