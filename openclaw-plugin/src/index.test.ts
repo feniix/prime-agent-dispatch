@@ -29,6 +29,20 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     });
   });
 
+  it("normalizes non-string native Discord channel ids defensively", () => {
+    expect(
+      trustedCommandContext({
+        senderId: "owner-1",
+        senderIsOwner: true,
+        channel: "discord",
+        channelId: 12345,
+        to: "slash:owner-1",
+      } as any),
+    ).toMatchObject({
+      to: "channel:12345",
+    });
+  });
+
   it("returns an actionable owner-visible diagnostic for command context mismatches", () => {
     expect(
       confirmationCommandFailure(

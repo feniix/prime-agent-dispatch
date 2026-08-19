@@ -177,10 +177,11 @@ const plugin = definePluginEntry({
       exposeSenderIsOwner: true,
       channels: ["discord"],
       async handler(context) {
-        const token = context.args?.trim();
-        if (!token) throw new Error("confirmation token is required");
-        const trusted = trustedCommandContext(context);
+        let trusted: TrustedToolContext = {};
         try {
+          const token = context.args?.trim();
+          if (!token) throw new Error("confirmation token is required");
+          trusted = trustedCommandContext(context);
           return commandResult(
             await adapter.start(
               { action: "confirm", confirmationToken: token },
@@ -188,6 +189,9 @@ const plugin = definePluginEntry({
             ),
           );
         } catch (error) {
+          api.logger.warn(
+            `Prime confirmation command failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
           return { text: confirmationCommandFailure(error, trusted) };
         }
       },
@@ -411,7 +415,10 @@ function trustedContext(
 export function trustedCommandContext(
   context: PluginCommandContext,
 ): TrustedToolContext {
-  const channelId = context.channelId?.trim();
+  const channelId =
+    context.channelId === undefined
+      ? undefined
+      : String(context.channelId).trim();
   const deliveryTarget =
     context.channel === "discord" && channelId
       ? channelId.startsWith("channel:")
@@ -448,6 +455,7 @@ export function confirmationCommandFailure(
     "Prime Dispatch beta is Discord-only",
     "trusted sender identity is unavailable",
     "trusted delivery channel identity is unavailable",
+    "confirmation token is required",
   ]);
   if (!safeMessages.has(message))
     return "Prime confirmation failed before dispatch; inspect the gateway log";
