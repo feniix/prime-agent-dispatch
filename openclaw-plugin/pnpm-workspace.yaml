@@ -5,4 +5,5 @@ allowBuilds:
   protobufjs: true
   tree-sitter-bash: true
 overrides:
+  tar: 7.5.21
   undici: 8.9.0
