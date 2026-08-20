@@ -6,6 +6,11 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createParser } from "eventsource-parser";
+import {
+  TokenUsageSchema,
+  type InferenceRequestUsage,
+  type TokenUsage,
+} from "./schemas.js";
 
 export type InferenceLease = {
   endpoint: URL;
@@ -49,15 +54,69 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function responseUsageTokens(data: unknown) {
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function responseUsage(data: unknown): TokenUsage | undefined {
   const payload = asRecord(data);
   const response = asRecord(payload?.response);
   const usage = asRecord(response?.usage);
-  return typeof usage?.total_tokens === "number" &&
-    Number.isSafeInteger(usage.total_tokens) &&
-    usage.total_tokens >= 0
-    ? usage.total_tokens
-    : 0;
+  const totalTokens = nonnegativeInteger(usage?.total_tokens);
+  if (totalTokens === undefined) return undefined;
+  const inputDetails = asRecord(usage?.input_tokens_details);
+  const outputDetails = asRecord(usage?.output_tokens_details);
+  const candidate = {
+    ...(nonnegativeInteger(usage?.input_tokens) !== undefined
+      ? { inputTokens: nonnegativeInteger(usage?.input_tokens) }
+      : {}),
+    ...(nonnegativeInteger(inputDetails?.cached_tokens) !== undefined
+      ? { cachedInputTokens: nonnegativeInteger(inputDetails?.cached_tokens) }
+      : {}),
+    ...(nonnegativeInteger(usage?.output_tokens) !== undefined
+      ? { outputTokens: nonnegativeInteger(usage?.output_tokens) }
+      : {}),
+    ...(nonnegativeInteger(outputDetails?.reasoning_tokens) !== undefined
+      ? { reasoningTokens: nonnegativeInteger(outputDetails?.reasoning_tokens) }
+      : {}),
+    totalTokens,
+  };
+  const parsed = TokenUsageSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : undefined;
+}
+
+type ParsedTerminalUsage = Omit<InferenceRequestUsage, "finalizedAt">;
+
+export function parseTerminalUsageEvent(
+  eventName: string | undefined,
+  data: unknown,
+): ParsedTerminalUsage | undefined {
+  const payload = asRecord(data);
+  const type =
+    eventName || (typeof payload?.type === "string" ? payload.type : undefined);
+  const outcome =
+    type === "response.completed"
+      ? "completed"
+      : type === "response.failed" || type === "response.incomplete"
+        ? "failed"
+        : undefined;
+  if (!outcome) return undefined;
+  const response = asRecord(payload?.response);
+  const requestId = response?.id;
+  if (typeof requestId !== "string" || !requestId) return undefined;
+  const usage = responseUsage(data);
+  return {
+    requestId,
+    outcome,
+    completeness: usage
+      ? outcome === "completed"
+        ? "complete"
+        : "partial"
+      : "unknown",
+    ...(usage ? { usage } : {}),
+  };
 }
 
 function isEventStream(contentType: string): boolean {
@@ -310,7 +369,7 @@ export class ProductionInferenceBroker {
               );
               responseTokens = Math.max(
                 responseTokens,
-                responseUsageTokens(data),
+                responseUsage(data)?.totalTokens ?? 0,
               );
             },
           })

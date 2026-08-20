@@ -173,6 +173,56 @@ export const GateResultSchema = z.object({
 });
 export type GateResult = z.infer<typeof GateResultSchema>;
 
+const TokenCountSchema = z.number().int().nonnegative().safe();
+
+export const TokenUsageSchema = z
+  .object({
+    inputTokens: TokenCountSchema.optional(),
+    cachedInputTokens: TokenCountSchema.optional(),
+    outputTokens: TokenCountSchema.optional(),
+    reasoningTokens: TokenCountSchema.optional(),
+    totalTokens: TokenCountSchema,
+  })
+  .superRefine((usage, context) => {
+    if (
+      usage.inputTokens !== undefined &&
+      usage.outputTokens !== undefined &&
+      usage.totalTokens !== usage.inputTokens + usage.outputTokens
+    )
+      context.addIssue({
+        code: "custom",
+        message: "totalTokens must equal inputTokens plus outputTokens",
+      });
+    if (
+      usage.cachedInputTokens !== undefined &&
+      usage.inputTokens !== undefined &&
+      usage.cachedInputTokens > usage.inputTokens
+    )
+      context.addIssue({
+        code: "custom",
+        message: "cachedInputTokens cannot exceed inputTokens",
+      });
+    if (
+      usage.reasoningTokens !== undefined &&
+      usage.outputTokens !== undefined &&
+      usage.reasoningTokens > usage.outputTokens
+    )
+      context.addIssue({
+        code: "custom",
+        message: "reasoningTokens cannot exceed outputTokens",
+      });
+  });
+export type TokenUsage = z.infer<typeof TokenUsageSchema>;
+
+export const InferenceRequestUsageSchema = z.object({
+  requestId: z.string().min(1).max(256),
+  outcome: z.enum(["completed", "failed", "cancelled", "transport_error"]),
+  completeness: z.enum(["complete", "partial", "unknown"]),
+  usage: TokenUsageSchema.optional(),
+  finalizedAt: z.string().datetime(),
+});
+export type InferenceRequestUsage = z.infer<typeof InferenceRequestUsageSchema>;
+
 export const JobResultSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   jobId: z.string(),
