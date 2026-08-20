@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runCommand } from "../dist/process.js";
+import { runCommand, truncateUtf8 } from "../dist/process.js";
 
 test("command arguments are passed literally without a shell", async () => {
   const literal = "$(printf should-not-run); exit 99";
@@ -22,8 +22,30 @@ test("stdout and stderr capture obey the shared output ceiling", async () => {
     ],
     { maxOutputBytes: 12 },
   );
-  assert.equal(result.stdout, "a".repeat(12));
-  assert.equal(result.stderr, "b".repeat(12));
+  assert.equal(
+    Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr),
+    12,
+  );
+});
+
+test("output ceilings never split a UTF-8 character or exceed the byte limit", async () => {
+  const result = await runCommand(
+    process.execPath,
+    ["-e", "process.stdout.write('😀😀'); process.stderr.write('😀😀')"],
+    { maxOutputBytes: 5 },
+  );
+  assert.ok(
+    Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr) <= 5,
+  );
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /�/);
+  assert.equal(truncateUtf8("😀😀", 5), "😀");
+
+  const partial = await runCommand(
+    process.execPath,
+    ["-e", "process.stdout.write('😀')"],
+    { maxOutputBytes: 3 },
+  );
+  assert.equal(partial.stdout, "");
 });
 
 test("spawn errors reject instead of producing a false command result", async () => {

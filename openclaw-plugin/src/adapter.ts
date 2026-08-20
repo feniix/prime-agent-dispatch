@@ -6,6 +6,8 @@ export type PrimeDispatchPluginConfig = {
   cliPath: string;
   stateRoot: string;
   hostConfigPath: string;
+  openclawStateDir?: string;
+  openclawConfigPath?: string;
   confirmationTtlMs: number;
   maxRenderedChars: number;
   notificationPollMs?: number;

@@ -10,13 +10,13 @@ import {
   realpath,
   rename,
   rm,
-  stat,
   symlink,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
+import { acquireProcessDirectoryLock } from "./process-lock.js";
 
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
@@ -130,6 +130,7 @@ type InstallManifest = {
   releases: Array<{
     id: string;
     sourceDigest: string;
+    publishedDigest?: string;
     installedAt: string;
   }>;
 };
@@ -138,6 +139,7 @@ type ReleaseMetadata = {
   schemaVersion: 1;
   releaseId: string;
   sourceDigest: string;
+  publishedDigest?: string;
   preparedAt: string;
 };
 
@@ -252,7 +254,7 @@ export async function installOpenClaw(
       };
     }
 
-    await prepareRelease(
+    const releaseMetadata = await prepareRelease(
       sourceRoot,
       releaseRoot,
       releaseId,
@@ -307,6 +309,7 @@ export async function installOpenClaw(
           existingManifest?.releases ?? [],
           releaseId,
           sourceDigest,
+          requirePublishedDigest(releaseMetadata),
           now,
         ),
       };
@@ -361,7 +364,21 @@ export async function rollbackOpenClaw(
       throw new Error("no previous Prime Dispatch release is available");
     const targetRelease = manifest.previousRelease;
     const targetRoot = join(layout.releasesRoot, targetRelease);
-    await readReleaseMetadata(targetRoot);
+    const targetEntry = manifest.releases.find(
+      (release) => release.id === targetRelease,
+    );
+    if (
+      !targetEntry?.publishedDigest ||
+      !(await releaseMatches(
+        targetRoot,
+        targetRelease,
+        targetEntry.sourceDigest,
+        targetEntry.publishedDigest,
+      ))
+    )
+      throw new Error(
+        `release ${targetRelease} failed published-content verification`,
+      );
     const snapshot = await readConfigSnapshot(dependencies);
     const configPatch = installConfigPatch(layout, snapshot.allow, options);
     const currentRestore = await switchDirectoryLink(
@@ -537,7 +554,8 @@ export async function auditOpenClawInstall(
     if (
       metadata &&
       (metadata.releaseId !== release.id ||
-        metadata.sourceDigest !== release.sourceDigest)
+        metadata.sourceDigest !== release.sourceDigest ||
+        metadata.publishedDigest !== release.publishedDigest)
     )
       violations.push(
         `release metadata does not match install manifest: ${releaseRoot}`,
@@ -553,6 +571,26 @@ export async function auditOpenClawInstall(
     if (actualDigest && actualDigest !== release.sourceDigest)
       violations.push(
         `source digest does not match release metadata: ${releaseRoot}`,
+      );
+    const publishedDigest = await digestPublishedRelease(releaseRoot).catch(
+      (error: unknown) => {
+        violations.push(
+          `published release content is invalid in ${releaseRoot}: ${errorMessage(error)}`,
+        );
+        return undefined;
+      },
+    );
+    if (!release.publishedDigest || !metadata?.publishedDigest)
+      violations.push(
+        `published content digest is missing from release metadata: ${releaseRoot}`,
+      );
+    else if (
+      publishedDigest &&
+      (publishedDigest !== release.publishedDigest ||
+        publishedDigest !== metadata.publishedDigest)
+    )
+      violations.push(
+        `published content digest does not match release metadata: ${releaseRoot}`,
       );
   }
   if (manifest.active) {
@@ -597,6 +635,8 @@ function installConfigEntry(
       cliPath: join(layout.currentLink, "runtime", "dist", "cli.js"),
       stateRoot: layout.stateRoot,
       hostConfigPath: layout.hostConfigPath,
+      openclawStateDir: layout.openclawStateDir,
+      openclawConfigPath: layout.openclawConfigPath,
       confirmationTtlMs: options.confirmationTtlMs ?? 300_000,
       maxRenderedChars: options.maxRenderedChars ?? 1_800,
       notificationPollMs: options.notificationPollMs ?? 2_000,
@@ -702,102 +742,15 @@ async function ensureRealDirectory(
   if (owned) await chmod(path, 0o700);
 }
 
-async function acquireInstallLock(
+function acquireInstallLock(
   layout: OpenClawInstallLayout,
 ): Promise<() => Promise<void>> {
-  const nonce = randomUUID();
-  while (true) {
-    try {
-      await mkdir(layout.lockPath, { mode: 0o700 });
-      await atomicWriteFile(
-        join(layout.lockPath, "owner.json"),
-        `${JSON.stringify({
-          pid: process.pid,
-          createdAtMs: Date.now(),
-          nonce,
-        })}\n`,
-      );
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (!(await reclaimStaleInstallLock(layout)))
-        throw new Error("Prime Dispatch OpenClaw lifecycle is already running");
-    }
-  }
-  return async () => {
-    const owner = await readInstallLockOwner(layout.lockPath).catch(
-      () => undefined,
-    );
-    if (owner?.nonce === nonce)
-      await rm(layout.lockPath, { recursive: true, force: true });
-  };
-}
-
-type InstallLockOwner = {
-  pid: number;
-  createdAtMs: number;
-  nonce: string;
-};
-
-async function reclaimStaleInstallLock(
-  layout: OpenClawInstallLayout,
-): Promise<boolean> {
-  const owner = await readInstallLockOwner(layout.lockPath).catch(
-    () => undefined,
-  );
-  let stale: boolean;
-  if (owner) {
-    stale =
-      Date.now() - owner.createdAtMs > INSTALL_LOCK_STALE_MS &&
-      !processExists(owner.pid);
-  } else {
-    const lockStat = await stat(layout.lockPath).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      },
-    );
-    if (!lockStat) return true;
-    stale = Date.now() - lockStat.mtimeMs > INSTALL_LOCK_STALE_MS;
-  }
-  if (!stale) return false;
-  const abandoned = join(
-    layout.installRoot,
-    `.abandoned-install-lock-${randomUUID()}`,
-  );
-  try {
-    await rename(layout.lockPath, abandoned);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
-  }
-  await rm(abandoned, { recursive: true, force: true });
-  return true;
-}
-
-async function readInstallLockOwner(path: string): Promise<InstallLockOwner> {
-  const value = JSON.parse(
-    await readFile(join(path, "owner.json"), "utf8"),
-  ) as Partial<InstallLockOwner>;
-  if (
-    !Number.isSafeInteger(value.pid) ||
-    (value.pid ?? 0) <= 0 ||
-    typeof value.createdAtMs !== "number" ||
-    !Number.isFinite(value.createdAtMs) ||
-    typeof value.nonce !== "string" ||
-    !value.nonce
-  )
-    throw new Error("Prime Dispatch install lock owner is invalid");
-  return value as InstallLockOwner;
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+  return acquireProcessDirectoryLock(layout.lockPath, {
+    staleMs: INSTALL_LOCK_STALE_MS,
+    timeoutMs: 0,
+    busyError: "Prime Dispatch OpenClaw lifecycle is already running",
+    identityError: "could not identify OpenClaw lifecycle process",
+  });
 }
 
 async function prepareRelease(
@@ -807,11 +760,11 @@ async function prepareRelease(
   sourceDigest: string,
   layout: OpenClawInstallLayout,
   dependencies: OpenClawLifecycleDependencies,
-): Promise<void> {
+): Promise<ReleaseMetadata> {
   if (await pathExists(releaseRoot)) {
     if (!(await releaseMatches(releaseRoot, releaseId, sourceDigest)))
       throw new Error(`release ${releaseId} already exists with other content`);
-    return;
+    return await readReleaseMetadata(releaseRoot);
   }
   const staging = join(
     layout.releasesRoot,
@@ -836,10 +789,12 @@ async function prepareRelease(
     ]);
     await dependencies.installProductionDependencies(runtimeRoot);
     await dependencies.installProductionDependencies(pluginRoot);
+    const publishedDigest = await digestPublishedRelease(staging);
     const metadata: ReleaseMetadata = {
       schemaVersion: INSTALL_SCHEMA_VERSION,
       releaseId,
       sourceDigest,
+      publishedDigest,
       preparedAt: dependencies.now().toISOString(),
     };
     await atomicWriteFile(
@@ -848,6 +803,7 @@ async function prepareRelease(
     );
     await secureTree(staging);
     await rename(staging, releaseRoot);
+    return metadata;
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;
@@ -896,6 +852,55 @@ async function digestPreparedReleaseSource(
   return hash.digest("hex");
 }
 
+async function digestPublishedRelease(releaseRoot: string): Promise<string> {
+  const hash = createHash("sha256");
+  const canonicalReleaseRoot = await realpath(releaseRoot);
+  await digestPublishedPath(
+    join(releaseRoot, "runtime"),
+    "runtime",
+    canonicalReleaseRoot,
+    hash,
+  );
+  await digestPublishedPath(
+    join(releaseRoot, "plugin"),
+    "plugin",
+    canonicalReleaseRoot,
+    hash,
+  );
+  return hash.digest("hex");
+}
+
+async function digestPublishedPath(
+  path: string,
+  relativePath: string,
+  releaseRoot: string,
+  hash: ReturnType<typeof createHash>,
+): Promise<void> {
+  const value = await lstat(path);
+  if (value.isSymbolicLink()) {
+    const target = await readlink(path);
+    const canonicalTarget = await realpath(path).catch(() => undefined);
+    if (!canonicalTarget || !isWithin(releaseRoot, canonicalTarget))
+      throw new Error(`release symlink escapes ${releaseRoot}: ${path}`);
+    hash.update(`l:${relativePath}\0${target}\0`);
+    return;
+  }
+  hash.update(`${value.isDirectory() ? "d" : "f"}:${relativePath}\0`);
+  if (value.isDirectory()) {
+    for (const child of (await readdir(path)).sort())
+      await digestPublishedPath(
+        join(path, child),
+        join(relativePath, child),
+        releaseRoot,
+        hash,
+      );
+  } else if (value.isFile()) {
+    hash.update(await readFile(path));
+  } else {
+    throw new Error(`release contains an unsupported entry: ${path}`);
+  }
+}
+
 async function digestPath(
   path: string,
   relativePath: string,
@@ -923,6 +928,7 @@ async function releaseMatches(
   releaseRoot: string,
   releaseId: string,
   sourceDigest: string,
+  expectedPublishedDigest?: string,
 ): Promise<boolean> {
   const metadata = await readReleaseMetadata(releaseRoot).catch(
     () => undefined,
@@ -930,8 +936,13 @@ async function releaseMatches(
   return (
     metadata?.releaseId === releaseId &&
     metadata.sourceDigest === sourceDigest &&
+    Boolean(metadata.publishedDigest) &&
+    (!expectedPublishedDigest ||
+      metadata.publishedDigest === expectedPublishedDigest) &&
     (await digestPreparedReleaseSource(releaseRoot).catch(() => undefined)) ===
-      sourceDigest
+      sourceDigest &&
+    (await digestPublishedRelease(releaseRoot).catch(() => undefined)) ===
+      metadata.publishedDigest
   );
 }
 
@@ -946,10 +957,21 @@ async function readReleaseMetadata(
     typeof value.releaseId !== "string" ||
     typeof value.sourceDigest !== "string" ||
     !/^[a-f0-9]{64}$/.test(value.sourceDigest) ||
+    (value.publishedDigest !== undefined &&
+      (typeof value.publishedDigest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(value.publishedDigest))) ||
     typeof value.preparedAt !== "string"
   )
     throw new Error(`release metadata is invalid in ${releaseRoot}`);
   return value as ReleaseMetadata;
+}
+
+function requirePublishedDigest(metadata: ReleaseMetadata): string {
+  if (!metadata.publishedDigest)
+    throw new Error(
+      `release ${metadata.releaseId} has no published content digest`,
+    );
+  return metadata.publishedDigest;
 }
 
 async function installHostConfig(
@@ -1206,6 +1228,8 @@ async function readInstallManifest(
         !release ||
         typeof release.id !== "string" ||
         typeof release.sourceDigest !== "string" ||
+        (release.publishedDigest !== undefined &&
+          typeof release.publishedDigest !== "string") ||
         typeof release.installedAt !== "string",
     )
   )
@@ -1222,6 +1246,11 @@ async function readInstallManifest(
     validateReleaseId(release.id);
     if (!/^[a-f0-9]{64}$/.test(release.sourceDigest))
       throw new Error(`release ${release.id} has an invalid source digest`);
+    if (
+      release.publishedDigest !== undefined &&
+      !/^[a-f0-9]{64}$/.test(release.publishedDigest)
+    )
+      throw new Error(`release ${release.id} has an invalid published digest`);
     if (!Number.isFinite(Date.parse(release.installedAt)))
       throw new Error(`release ${release.id} has an invalid install time`);
     if (releaseIds.has(release.id))
@@ -1252,15 +1281,23 @@ function upsertRelease(
   releases: InstallManifest["releases"],
   id: string,
   sourceDigest: string,
+  publishedDigest: string,
   installedAt: string,
 ): InstallManifest["releases"] {
   const existing = releases.find((release) => release.id === id);
   if (existing) {
     if (existing.sourceDigest !== sourceDigest)
       throw new Error(`release ${id} has conflicting source digests`);
-    return releases;
+    if (
+      existing.publishedDigest &&
+      existing.publishedDigest !== publishedDigest
+    )
+      throw new Error(`release ${id} has conflicting published digests`);
+    return releases.map((release) =>
+      release.id === id ? { ...release, publishedDigest } : release,
+    );
   }
-  return [...releases, { id, sourceDigest, installedAt }];
+  return [...releases, { id, sourceDigest, publishedDigest, installedAt }];
 }
 
 function validateReleaseId(value: string): void {

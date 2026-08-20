@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, readFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -59,6 +65,63 @@ test("concurrent event writers receive unique monotonic sequences", async () => 
   assert.deepEqual(
     events.map((event) => event.sequence),
     Array.from({ length: 9 }, (_, index) => index + 1),
+  );
+});
+
+test("stale locks are reclaimed after PID reuse", async () => {
+  const { store, request } = await storeFixture();
+  const lockPath = join(store.jobDir(request.jobId), ".lock");
+  await mkdir(lockPath);
+  await writeFile(
+    join(lockPath, "owner.json"),
+    JSON.stringify({
+      pid: process.pid,
+      processStartIdentity: "reused-process-identity",
+      createdAtMs: Date.now() - 60_000,
+      nonce: "stale-lock",
+    }),
+  );
+
+  const startedAt = Date.now();
+  await Promise.all(
+    Array.from({ length: 4 }, (_, index) =>
+      store.appendEvent(request.jobId, "after_pid_reuse", { index }),
+    ),
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
+  assert.deepEqual(
+    (await store.readEvents(request.jobId))
+      .filter((event) => event.type === "after_pid_reuse")
+      .map((event) => event.sequence),
+    [2, 3, 4, 5],
+  );
+});
+
+test("stale reclaim guards do not permanently wedge a job lock", async () => {
+  const { store, request } = await storeFixture();
+  const jobDir = store.jobDir(request.jobId);
+  const lockPath = join(jobDir, ".lock");
+  const reclaimPath = join(jobDir, ".lock-reclaim");
+  for (const [path, nonce] of [
+    [lockPath, "stale-lock"],
+    [reclaimPath, "stale-reclaimer"],
+  ]) {
+    await mkdir(path);
+    await writeFile(
+      join(path, "owner.json"),
+      JSON.stringify({
+        pid: process.pid,
+        processStartIdentity: "reused-process-identity",
+        createdAtMs: Date.now() - 60_000,
+        nonce,
+      }),
+    );
+  }
+
+  await store.appendEvent(request.jobId, "after_reclaimer_crash", {});
+  assert.equal(
+    (await store.readEvents(request.jobId)).at(-1).type,
+    "after_reclaimer_crash",
   );
 });
 

@@ -204,6 +204,8 @@ test("plans stable durable paths and the exact OpenClaw config delta", async () 
               ),
               stateRoot: layout.stateRoot,
               hostConfigPath: layout.hostConfigPath,
+              openclawStateDir: layout.openclawStateDir,
+              openclawConfigPath: layout.openclawConfigPath,
               confirmationTtlMs: 300_000,
               maxRenderedChars: 1_800,
               notificationPollMs: 2_000,
@@ -606,14 +608,15 @@ test("rejects a symlinked install root without chmodding the foreign target", as
   }
 });
 
-test("reclaims an abandoned lifecycle lock after the owner process is gone", async () => {
+test("reclaims an abandoned lifecycle lock after PID reuse", async () => {
   const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
     await fixture();
   try {
     const layout = openClawLayout(openclawStateDir);
     await mkdir(layout.lockPath, { recursive: true });
     await writeJson(join(layout.lockPath, "owner.json"), {
-      pid: 999_999_999,
+      pid: process.pid,
+      processStartIdentity: "reused-process-identity",
       createdAtMs: 0,
       nonce: "abandoned",
     });
@@ -628,6 +631,79 @@ test("reclaims an abandoned lifecycle lock after the owner process is gone", asy
     );
     assert.equal(result.currentRelease, "release-1");
     assert.equal(await pathExists(layout.lockPath), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reclaims an abandoned lifecycle reclaim guard after PID reuse", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    const layout = openClawLayout(openclawStateDir);
+    for (const [path, nonce] of [
+      [layout.lockPath, "abandoned-lock"],
+      [`${layout.lockPath}.reclaim`, "abandoned-reclaimer"],
+    ]) {
+      await mkdir(path, { recursive: true });
+      await writeJson(join(path, "owner.json"), {
+        pid: process.pid,
+        processStartIdentity: "reused-process-identity",
+        createdAtMs: 0,
+        nonce,
+      });
+    }
+
+    const result = await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    assert.equal(result.currentRelease, "release-1");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects published symlinks that escape through another release symlink", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    const outside = join(root, "outside");
+    await writeFile(outside, "foreign\n");
+    const installDependencies = dependencies.installProductionDependencies;
+    dependencies.installProductionDependencies = async (path) => {
+      await installDependencies(path);
+      if (path.endsWith(`${path.includes("\\") ? "\\" : "/"}runtime`)) {
+        await symlink(outside, join(dirname(path), "escape"));
+        await symlink(
+          "../../escape",
+          join(path, "node_modules", "chained-escape"),
+        );
+      }
+    };
+
+    await assert.rejects(
+      () =>
+        installOpenClaw(
+          {
+            openclawStateDir,
+            sourceRoot,
+            hostConfigSource,
+            releaseId: "release-1",
+          },
+          dependencies,
+        ),
+      /release symlink escapes/,
+    );
+    assert.equal(
+      await pathExists(openClawLayout(openclawStateDir).currentLink),
+      false,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -763,6 +839,82 @@ test("audits released source content instead of trusting release metadata", asyn
     assert.match(
       (await auditOpenClawInstall(openclawStateDir)).join("\n"),
       /source digest does not match release metadata/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("refuses to roll back to a release whose published content changed", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    await writeSource(sourceRoot, "two");
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-2",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    await writeFile(
+      join(layout.releasesRoot, "release-1", "plugin", "dist", "index.js"),
+      "// tampered\n",
+    );
+
+    await assert.rejects(
+      () => rollbackOpenClaw({ openclawStateDir }, dependencies),
+      /release release-1 failed published-content verification/,
+    );
+    assert.equal(
+      await readlink(layout.currentLink),
+      join("releases", "release-2"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audits installed production dependency content", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    await writeFile(
+      join(
+        layout.releasesRoot,
+        "release-1",
+        "runtime",
+        "node_modules",
+        ".installed",
+      ),
+      "tampered\n",
+    );
+
+    assert.match(
+      (await auditOpenClawInstall(openclawStateDir)).join("\n"),
+      /published content digest does not match release metadata/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -25,10 +25,16 @@ $OPENCLAW_STATE_DIR/
 
 Directories are mode `0700` and regular files are mode `0600`. The installer
 rejects release-source symlinks, installs lockfile-pinned production
-dependencies inside each release, validates the host policy and resulting
-OpenClaw configuration, and changes active symlinks atomically. The shared
+dependencies inside each release, records a digest over the complete published
+runtime and plugin trees, validates the host policy and resulting OpenClaw
+configuration, and changes active symlinks atomically. Audit and rollback both
+recompute that digest before trusting a release. The shared
 state and host policy live outside releases, so upgrades and rollbacks do not
 replace job evidence.
+
+The generated plugin entry also records the exact OpenClaw state directory and
+configuration path. Detached workers therefore resolve OAuth from the same
+profile as the Gateway, including non-default OpenClaw state directories.
 
 ## Build and preview
 

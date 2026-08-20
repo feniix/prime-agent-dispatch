@@ -35,7 +35,9 @@ The lifecycle manages an OpenClaw entry equivalent to:
         "config": {
           "cliPath": "$OPENCLAW_STATE_DIR/prime-dispatch/current/runtime/dist/cli.js",
           "stateRoot": "$OPENCLAW_STATE_DIR/prime-dispatch/state",
-          "hostConfigPath": "$OPENCLAW_STATE_DIR/prime-dispatch/config/host.json"
+          "hostConfigPath": "$OPENCLAW_STATE_DIR/prime-dispatch/config/host.json",
+          "openclawStateDir": "$OPENCLAW_STATE_DIR",
+          "openclawConfigPath": "$OPENCLAW_STATE_DIR/openclaw.json"
         }
       }
     }

@@ -47,6 +47,20 @@ function createJobId(): string {
     .slice(0, 14)}-${randomUUID().slice(0, 12)}`;
 }
 
+export function buildWorkerEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    PATH: environment.PATH,
+    LANG: environment.LANG,
+    LC_ALL: environment.LC_ALL,
+    TMPDIR: environment.TMPDIR,
+    OPENCLAW_STATE_DIR: environment.OPENCLAW_STATE_DIR,
+    OPENCLAW_CONFIG_PATH: environment.OPENCLAW_CONFIG_PATH,
+    OPENCLAW_PACKAGE_JSON: environment.OPENCLAW_PACKAGE_JSON,
+  };
+}
+
 export class PrimeDispatcher {
   readonly store: JobStore;
   readonly stateRoot: string;
@@ -129,12 +143,7 @@ export class PrimeDispatcher {
         {
           detached: true,
           stdio: ["ignore", logFd, logFd],
-          env: {
-            PATH: process.env.PATH,
-            LANG: process.env.LANG,
-            LC_ALL: process.env.LC_ALL,
-            TMPDIR: process.env.TMPDIR,
-          },
+          env: buildWorkerEnvironment(),
         },
       );
       closeSync(logFd);
@@ -313,9 +322,9 @@ export class PrimeDispatcher {
       error?: string;
     }> = [];
     for (const jobId of await this.store.listJobIds()) {
-      const current = await this.store.readState(jobId);
-      if (terminalStatuses.has(current.status)) continue;
       try {
+        const current = await this.store.readState(jobId);
+        if (terminalStatuses.has(current.status)) continue;
         results.push({ jobId, state: (await this.status(jobId)) as JobState });
       } catch (error) {
         results.push({

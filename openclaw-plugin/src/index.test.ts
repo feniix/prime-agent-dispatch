@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import plugin, {
+  buildCliEnvironment,
   confirmationCommandFailure,
   createNotificationDelivery,
   trustedContext,
@@ -8,6 +9,37 @@ import plugin, {
 import { confirmationContextHash } from "./adapter.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
+  it("passes the configured OpenClaw profile to the standalone control plane", () => {
+    expect(
+      buildCliEnvironment(
+        {
+          cliPath: "/trusted/cli.js",
+          stateRoot: "/profiles/fixture/prime-dispatch/state",
+          hostConfigPath: "/profiles/fixture/prime-dispatch/config/host.json",
+          openclawStateDir: "/profiles/fixture",
+          openclawConfigPath: "/profiles/fixture/openclaw.json",
+          confirmationTtlMs: 300_000,
+          maxRenderedChars: 1_800,
+        },
+        {
+          PATH: "/bin",
+          OPENCLAW_STATE_DIR: "/wrong-profile",
+          OPENCLAW_CONFIG_PATH: "/wrong-profile/openclaw.json",
+          OPENCLAW_PACKAGE_JSON: "/runtime/openclaw/package.json",
+          SHOULD_NOT_LEAK: "secret",
+        },
+      ),
+    ).toEqual({
+      PATH: "/bin",
+      LANG: undefined,
+      LC_ALL: undefined,
+      TMPDIR: undefined,
+      OPENCLAW_STATE_DIR: "/profiles/fixture",
+      OPENCLAW_CONFIG_PATH: "/profiles/fixture/openclaw.json",
+      OPENCLAW_PACKAGE_JSON: "/runtime/openclaw/package.json",
+    });
+  });
+
   it("keeps preview and OpenClaw 2026.7.1 command hashes equal for the same Discord conversation", () => {
     const previewContext = trustedContext({
       requesterSenderId: "owner-1",
