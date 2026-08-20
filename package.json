@@ -5,7 +5,8 @@
   "packageManager": "pnpm@11.21.0",
   "type": "module",
   "bin": {
-    "prime-dispatch": "dist/cli.js"
+    "prime-dispatch": "dist/cli.js",
+    "prime-dispatch-openclaw": "dist/openclaw-host.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -14,6 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js",
+    "test:openclaw-lifecycle": "PRIME_DISPATCH_OPENCLAW_LIFECYCLE_ACCEPTANCE=1 node --test test/openclaw-lifecycle.integration.test.js",
     "test:live": "PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test test/live-prime.acceptance.test.js",
     "test:adapter": "corepack pnpm --dir openclaw-plugin run build && corepack pnpm --dir openclaw-plugin test"
   },
