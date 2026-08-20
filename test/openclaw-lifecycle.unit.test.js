@@ -608,14 +608,15 @@ test("rejects a symlinked install root without chmodding the foreign target", as
   }
 });
 
-test("reclaims an abandoned lifecycle lock after the owner process is gone", async () => {
+test("reclaims an abandoned lifecycle lock after PID reuse", async () => {
   const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
     await fixture();
   try {
     const layout = openClawLayout(openclawStateDir);
     await mkdir(layout.lockPath, { recursive: true });
     await writeJson(join(layout.lockPath, "owner.json"), {
-      pid: 999_999_999,
+      pid: process.pid,
+      processStartIdentity: "reused-process-identity",
       createdAtMs: 0,
       nonce: "abandoned",
     });

@@ -17,6 +17,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
+import { readProcessStartIdentity } from "./worker-identity.js";
 
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
@@ -746,6 +747,9 @@ async function acquireInstallLock(
   layout: OpenClawInstallLayout,
 ): Promise<() => Promise<void>> {
   const nonce = randomUUID();
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
+  if (!processStartIdentity)
+    throw new Error("could not identify OpenClaw lifecycle process");
   while (true) {
     try {
       await mkdir(layout.lockPath, { mode: 0o700 });
@@ -753,6 +757,7 @@ async function acquireInstallLock(
         join(layout.lockPath, "owner.json"),
         `${JSON.stringify({
           pid: process.pid,
+          processStartIdentity,
           createdAtMs: Date.now(),
           nonce,
         })}\n`,
@@ -775,6 +780,7 @@ async function acquireInstallLock(
 
 type InstallLockOwner = {
   pid: number;
+  processStartIdentity: string;
   createdAtMs: number;
   nonce: string;
 };
@@ -782,37 +788,49 @@ type InstallLockOwner = {
 async function reclaimStaleInstallLock(
   layout: OpenClawInstallLayout,
 ): Promise<boolean> {
-  const owner = await readInstallLockOwner(layout.lockPath).catch(
-    () => undefined,
-  );
-  let stale: boolean;
-  if (owner) {
-    stale =
-      Date.now() - owner.createdAtMs > INSTALL_LOCK_STALE_MS &&
-      !processExists(owner.pid);
-  } else {
-    const lockStat = await stat(layout.lockPath).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      },
-    );
-    if (!lockStat) return true;
-    stale = Date.now() - lockStat.mtimeMs > INSTALL_LOCK_STALE_MS;
-  }
-  if (!stale) return false;
-  const abandoned = join(
-    layout.installRoot,
-    `.abandoned-install-lock-${randomUUID()}`,
-  );
+  const reclaimPath = `${layout.lockPath}.reclaim`;
   try {
-    await rename(layout.lockPath, abandoned);
+    await mkdir(reclaimPath, { mode: 0o700 });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw error;
   }
-  await rm(abandoned, { recursive: true, force: true });
-  return true;
+  try {
+    const owner = await readInstallLockOwner(layout.lockPath).catch(
+      () => undefined,
+    );
+    let stale: boolean;
+    if (owner) {
+      stale =
+        Date.now() - owner.createdAtMs > INSTALL_LOCK_STALE_MS &&
+        (await readProcessStartIdentity(owner.pid)) !==
+          owner.processStartIdentity;
+    } else {
+      const lockStat = await stat(layout.lockPath).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return undefined;
+          throw error;
+        },
+      );
+      if (!lockStat) return true;
+      stale = Date.now() - lockStat.mtimeMs > INSTALL_LOCK_STALE_MS;
+    }
+    if (!stale) return false;
+    const abandoned = join(
+      layout.installRoot,
+      `.abandoned-install-lock-${randomUUID()}`,
+    );
+    try {
+      await rename(layout.lockPath, abandoned);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
+    await rm(abandoned, { recursive: true, force: true });
+    return true;
+  } finally {
+    await rm(reclaimPath, { recursive: true, force: true });
+  }
 }
 
 async function readInstallLockOwner(path: string): Promise<InstallLockOwner> {
@@ -822,6 +840,8 @@ async function readInstallLockOwner(path: string): Promise<InstallLockOwner> {
   if (
     !Number.isSafeInteger(value.pid) ||
     (value.pid ?? 0) <= 0 ||
+    typeof value.processStartIdentity !== "string" ||
+    !value.processStartIdentity ||
     typeof value.createdAtMs !== "number" ||
     !Number.isFinite(value.createdAtMs) ||
     typeof value.nonce !== "string" ||
@@ -829,15 +849,6 @@ async function readInstallLockOwner(path: string): Promise<InstallLockOwner> {
   )
     throw new Error("Prime Dispatch install lock owner is invalid");
   return value as InstallLockOwner;
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
 }
 
 async function prepareRelease(

@@ -84,7 +84,7 @@ Each job has this layout:
     prime-agent/             dedicated Prime HOME/config/session directory
 ```
 
-Snapshots are written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Per-job `mkdir` locks serialize writers across processes. The event reader tolerates only a truncated final JSONL record; corruption in an earlier complete record fails closed.
+Snapshots are written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Per-job `mkdir` locks serialize writers across processes, bind ownership to PID plus process-start identity, and serialize stale-lock reclamation before quarantining the abandoned directory. The event reader tolerates only a truncated final JSONL record; corruption in an earlier complete record fails closed.
 
 The state machine is:
 

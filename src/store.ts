@@ -29,6 +29,7 @@ import {
   type JobStatus,
 } from "./schemas.js";
 import { assertTransition } from "./state-machine.js";
+import { readProcessStartIdentity } from "./worker-identity.js";
 
 const LOCK_STALE_MS = 30_000;
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
@@ -70,16 +71,77 @@ export async function atomicWriteFile(
   await fsyncDirectory(dirname(path));
 }
 
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+type LockOwner = {
+  pid: number;
+  processStartIdentity: string;
+  createdAtMs: number;
+  nonce: string;
+};
+
+function isLockOwner(value: unknown): value is LockOwner {
+  const candidate = value as Partial<LockOwner>;
+  return (
+    Number.isSafeInteger(candidate?.pid) &&
+    (candidate.pid ?? 0) > 0 &&
+    typeof candidate.processStartIdentity === "string" &&
+    Boolean(candidate.processStartIdentity) &&
+    typeof candidate.createdAtMs === "number" &&
+    Number.isFinite(candidate.createdAtMs) &&
+    typeof candidate.nonce === "string" &&
+    Boolean(candidate.nonce)
+  );
 }
 
-type LockOwner = { pid: number; createdAtMs: number; nonce: string };
+async function readLockOwner(path: string): Promise<LockOwner> {
+  const value: unknown = JSON.parse(await readFile(path, "utf8"));
+  if (!isLockOwner(value)) throw new Error("invalid job lock owner");
+  return value;
+}
+
+async function reclaimStaleLock(
+  jobDir: string,
+  lockDir: string,
+  ownerPath: string,
+): Promise<boolean> {
+  const reclaimDir = join(jobDir, ".lock-reclaim");
+  try {
+    await mkdir(reclaimDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    let stale = false;
+    try {
+      const owner = await readLockOwner(ownerPath);
+      stale =
+        Date.now() - owner.createdAtMs > LOCK_STALE_MS &&
+        (await readProcessStartIdentity(owner.pid)) !==
+          owner.processStartIdentity;
+    } catch {
+      const info = await stat(lockDir).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return undefined;
+          throw error;
+        },
+      );
+      if (!info) return true;
+      stale = Date.now() - info.mtimeMs > LOCK_STALE_MS;
+    }
+    if (!stale) return false;
+    const abandoned = `${lockDir}.abandoned-${randomUUID()}`;
+    try {
+      await rename(lockDir, abandoned);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
+    await rm(abandoned, { recursive: true, force: true });
+    return true;
+  } finally {
+    await rm(reclaimDir, { recursive: true, force: true });
+  }
+}
 
 async function acquireLock(
   jobDir: string,
@@ -89,11 +151,15 @@ async function acquireLock(
   const ownerPath = join(lockDir, "owner.json");
   const deadline = Date.now() + timeoutMs;
   const nonce = randomUUID();
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
+  if (!processStartIdentity)
+    throw new Error("could not identify job lock owner process");
   while (true) {
     try {
       await mkdir(lockDir);
       const owner: LockOwner = {
         pid: process.pid,
+        processStartIdentity,
         createdAtMs: Date.now(),
         nonce,
       };
@@ -104,9 +170,7 @@ async function acquireLock(
       });
       return async () => {
         try {
-          const current = JSON.parse(
-            await readFile(ownerPath, "utf8"),
-          ) as LockOwner;
+          const current = await readLockOwner(ownerPath);
           if (current.nonce === nonce) await rm(lockDir, { recursive: true });
         } catch {
           // A crashed process may already have had its stale lock reclaimed.
@@ -115,30 +179,7 @@ async function acquireLock(
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
-      try {
-        const owner = JSON.parse(
-          await readFile(ownerPath, "utf8"),
-        ) as LockOwner;
-        const stale =
-          Date.now() - owner.createdAtMs > LOCK_STALE_MS &&
-          !processExists(owner.pid);
-        if (stale) {
-          await rm(lockDir, { recursive: true });
-          continue;
-        }
-      } catch {
-        let info;
-        try {
-          info = await stat(lockDir);
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw statError;
-        }
-        if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-          await rm(lockDir, { recursive: true });
-          continue;
-        }
-      }
+      if (await reclaimStaleLock(jobDir, lockDir, ownerPath)) continue;
       if (Date.now() >= deadline)
         throw new Error(`timed out acquiring job lock: ${jobDir}`);
       await new Promise((resolve) => setTimeout(resolve, 20));
