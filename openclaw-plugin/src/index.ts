@@ -427,8 +427,11 @@ export function normalizeTrustedContext(
   );
   const accountId = normalizedString(context.accountId);
   const explicitThreadId = normalizedString(context.threadId);
+  const conversationId = discordConversationIdFromTarget(channel, to);
   const threadId =
-    explicitThreadId ?? discordConversationIdFromTarget(channel, to);
+    explicitThreadId && explicitThreadId !== conversationId
+      ? explicitThreadId
+      : undefined;
   const deliveryId = normalizedString(context.deliveryId);
   return {
     ...(senderId ? { senderId } : {}),

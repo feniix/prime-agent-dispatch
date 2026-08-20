@@ -64,10 +64,39 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       sessionId: "command-session",
     } as any);
 
-    expect(commandContext).toMatchObject({
-      to: "channel:thread-1",
-      threadId: "thread-1",
-    });
+    expect(commandContext).toMatchObject({ to: "channel:thread-1" });
+    expect(commandContext).not.toHaveProperty("threadId");
+    expect(confirmationContextHash(commandContext)).toBe(
+      confirmationContextHash(previewContext),
+    );
+    expect(confirmationContextHash(commandContext)).not.toBe(
+      confirmationContextHash({ ...previewContext, threadId: "thread-2" }),
+    );
+  });
+
+  it("drops a redundant top-level Discord command thread id", () => {
+    const previewContext = trustedContext({
+      requesterSenderId: "owner-1",
+      senderIsOwner: true,
+      messageChannel: "discord",
+      deliveryContext: {
+        channel: "discord",
+        to: "channel:general-1",
+        accountId: "default",
+      },
+    } as any);
+    const commandContext = trustedCommandContext({
+      senderId: "owner-1",
+      senderIsOwner: true,
+      channel: "discord",
+      channelId: "general-1",
+      to: "slash:owner-1",
+      accountId: "default",
+      messageThreadId: "general-1",
+    } as any);
+
+    expect(previewContext).not.toHaveProperty("threadId");
+    expect(commandContext).not.toHaveProperty("threadId");
     expect(confirmationContextHash(commandContext)).toBe(
       confirmationContextHash(previewContext),
     );
@@ -90,9 +119,39 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       channel: "discord",
       to: "channel:thread-1",
       accountId: "default",
-      threadId: "thread-1",
       deliveryId: "session-1",
     });
+  });
+
+  it("preserves a nested Discord thread distinct from its delivery target", () => {
+    const previewContext = trustedContext({
+      requesterSenderId: "owner-1",
+      senderIsOwner: true,
+      messageChannel: "discord",
+      deliveryContext: {
+        channel: "discord",
+        to: "channel:parent-1",
+        accountId: "default",
+        threadId: "thread-1",
+      },
+    } as any);
+    const commandContext = trustedCommandContext({
+      senderId: "owner-1",
+      senderIsOwner: true,
+      channel: "discord",
+      channelId: "parent-1",
+      to: "channel:parent-1",
+      accountId: "default",
+      messageThreadId: "thread-1",
+    } as any);
+
+    expect(previewContext).toMatchObject({
+      to: "channel:parent-1",
+      threadId: "thread-1",
+    });
+    expect(confirmationContextHash(commandContext)).toBe(
+      confirmationContextHash(previewContext),
+    );
   });
 
   it("fails closed when a Discord command has no conversation target", () => {
