@@ -30,6 +30,10 @@ OpenClaw configuration, and changes active symlinks atomically. The shared
 state and host policy live outside releases, so upgrades and rollbacks do not
 replace job evidence.
 
+The generated plugin entry also records the exact OpenClaw state directory and
+configuration path. Detached workers therefore resolve OAuth from the same
+profile as the Gateway, including non-default OpenClaw state directories.
+
 ## Build and preview
 
 Use pnpm for both packages:

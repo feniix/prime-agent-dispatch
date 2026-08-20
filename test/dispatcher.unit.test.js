@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildWorkerEnvironment,
   PrimeDispatcher,
   workerStartupIsConfirmed,
 } from "../dist/dispatcher.js";
@@ -93,4 +94,25 @@ test("reconciliation isolates a corrupt job instead of aborting the control plan
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("worker environment preserves the explicit OpenClaw profile identity", () => {
+  assert.deepEqual(
+    buildWorkerEnvironment({
+      PATH: "/bin",
+      OPENCLAW_STATE_DIR: "/profiles/fixture",
+      OPENCLAW_CONFIG_PATH: "/profiles/fixture/openclaw.json",
+      OPENCLAW_PACKAGE_JSON: "/runtime/openclaw/package.json",
+      SHOULD_NOT_LEAK: "secret",
+    }),
+    {
+      PATH: "/bin",
+      LANG: undefined,
+      LC_ALL: undefined,
+      TMPDIR: undefined,
+      OPENCLAW_STATE_DIR: "/profiles/fixture",
+      OPENCLAW_CONFIG_PATH: "/profiles/fixture/openclaw.json",
+      OPENCLAW_PACKAGE_JSON: "/runtime/openclaw/package.json",
+    },
+  );
 });

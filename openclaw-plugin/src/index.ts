@@ -26,6 +26,8 @@ const configJsonSchema = {
     cliPath: { type: "string", minLength: 1 },
     stateRoot: { type: "string", minLength: 1 },
     hostConfigPath: { type: "string", minLength: 1 },
+    openclawStateDir: { type: "string", minLength: 1 },
+    openclawConfigPath: { type: "string", minLength: 1 },
     confirmationTtlMs: {
       type: "integer",
       minimum: 10_000,
@@ -63,12 +65,7 @@ const plugin = definePluginEntry({
             encoding: "utf8",
             timeout: 30_000,
             maxBuffer: 2 * 1024 * 1024,
-            env: {
-              PATH: process.env.PATH,
-              LANG: process.env.LANG,
-              LC_ALL: process.env.LC_ALL,
-              TMPDIR: process.env.TMPDIR,
-            },
+            env: buildCliEnvironment(config),
           },
         );
         return JSON.parse(stdout);
@@ -369,6 +366,12 @@ function parseConfig(
     cliPath: config.cliPath as string,
     stateRoot: config.stateRoot as string,
     hostConfigPath: config.hostConfigPath as string,
+    ...(typeof config.openclawStateDir === "string"
+      ? { openclawStateDir: config.openclawStateDir }
+      : {}),
+    ...(typeof config.openclawConfigPath === "string"
+      ? { openclawConfigPath: config.openclawConfigPath }
+      : {}),
     confirmationTtlMs:
       typeof config.confirmationTtlMs === "number"
         ? config.confirmationTtlMs
@@ -381,6 +384,23 @@ function parseConfig(
       typeof config.notificationPollMs === "number"
         ? config.notificationPollMs
         : 2_000,
+  };
+}
+
+export function buildCliEnvironment(
+  config: PrimeDispatchPluginConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    PATH: environment.PATH,
+    LANG: environment.LANG,
+    LC_ALL: environment.LC_ALL,
+    TMPDIR: environment.TMPDIR,
+    OPENCLAW_STATE_DIR:
+      config.openclawStateDir ?? environment.OPENCLAW_STATE_DIR,
+    OPENCLAW_CONFIG_PATH:
+      config.openclawConfigPath ?? environment.OPENCLAW_CONFIG_PATH,
+    OPENCLAW_PACKAGE_JSON: environment.OPENCLAW_PACKAGE_JSON,
   };
 }
 

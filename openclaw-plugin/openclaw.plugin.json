@@ -14,6 +14,8 @@
       "cliPath": { "type": "string", "minLength": 1 },
       "stateRoot": { "type": "string", "minLength": 1 },
       "hostConfigPath": { "type": "string", "minLength": 1 },
+      "openclawStateDir": { "type": "string", "minLength": 1 },
+      "openclawConfigPath": { "type": "string", "minLength": 1 },
       "confirmationTtlMs": {
         "type": "integer",
         "minimum": 10000,

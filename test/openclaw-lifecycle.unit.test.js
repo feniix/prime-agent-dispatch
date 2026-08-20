@@ -204,6 +204,8 @@ test("plans stable durable paths and the exact OpenClaw config delta", async () 
               ),
               stateRoot: layout.stateRoot,
               hostConfigPath: layout.hostConfigPath,
+              openclawStateDir: layout.openclawStateDir,
+              openclawConfigPath: layout.openclawConfigPath,
               confirmationTtlMs: 300_000,
               maxRenderedChars: 1_800,
               notificationPollMs: 2_000,

@@ -597,6 +597,8 @@ function installConfigEntry(
       cliPath: join(layout.currentLink, "runtime", "dist", "cli.js"),
       stateRoot: layout.stateRoot,
       hostConfigPath: layout.hostConfigPath,
+      openclawStateDir: layout.openclawStateDir,
+      openclawConfigPath: layout.openclawConfigPath,
       confirmationTtlMs: options.confirmationTtlMs ?? 300_000,
       maxRenderedChars: options.maxRenderedChars ?? 1_800,
       notificationPollMs: options.notificationPollMs ?? 2_000,
