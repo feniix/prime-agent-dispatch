@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -7,8 +7,10 @@ import {
 import type { AddressInfo } from "node:net";
 import { createParser } from "eventsource-parser";
 import {
+  InferenceRequestUsageSchema,
   TokenUsageSchema,
   type InferenceRequestUsage,
+  type InferenceUsageLedgerSnapshot,
   type TokenUsage,
 } from "./schemas.js";
 
@@ -16,6 +18,7 @@ export type InferenceLease = {
   endpoint: URL;
   opaqueToken: string;
   expiresAt: Date;
+  usage(): InferenceUsageLedgerSnapshot;
   revoke(): Promise<void>;
 };
 
@@ -24,7 +27,7 @@ type LeaseState = {
   token: string;
   expiresAt: number;
   maxTokens: number;
-  usedTokens: number;
+  ledger: InferenceUsageLedger;
   active: number;
   revoked: boolean;
   controllers: Set<AbortController>;
@@ -92,6 +95,7 @@ type ParsedTerminalUsage = Omit<InferenceRequestUsage, "finalizedAt">;
 export function parseTerminalUsageEvent(
   eventName: string | undefined,
   data: unknown,
+  fallbackRequestId?: string,
 ): ParsedTerminalUsage | undefined {
   const payload = asRecord(data);
   const type =
@@ -104,8 +108,11 @@ export function parseTerminalUsageEvent(
         : undefined;
   if (!outcome) return undefined;
   const response = asRecord(payload?.response);
-  const requestId = response?.id;
-  if (typeof requestId !== "string" || !requestId) return undefined;
+  const requestId =
+    typeof response?.id === "string" && response.id
+      ? response.id
+      : fallbackRequestId;
+  if (!requestId) return undefined;
   const usage = responseUsage(data);
   return {
     requestId,
@@ -117,6 +124,107 @@ export function parseTerminalUsageEvent(
       : "unknown",
     ...(usage ? { usage } : {}),
   };
+}
+
+function sameAccountingRecord(
+  left: InferenceRequestUsage,
+  right: InferenceRequestUsage,
+): boolean {
+  return (
+    left.outcome === right.outcome &&
+    left.completeness === right.completeness &&
+    JSON.stringify(left.usage) === JSON.stringify(right.usage)
+  );
+}
+
+function sumOptionalUsageField(
+  records: InferenceRequestUsage[],
+  field: Exclude<keyof TokenUsage, "totalTokens">,
+): number | undefined {
+  const observed = records.filter((record) => record.usage);
+  if (
+    observed.length === 0 ||
+    observed.some((record) => record.usage?.[field] === undefined)
+  )
+    return undefined;
+  return observed.reduce(
+    (total, record) => total + (record.usage?.[field] ?? 0),
+    0,
+  );
+}
+
+export class InferenceUsageLedger {
+  private readonly records = new Map<string, InferenceRequestUsage>();
+
+  constructor(private readonly tokenLimit: number) {
+    if (!Number.isSafeInteger(tokenLimit) || tokenLimit <= 0)
+      throw new Error("inference token limit must be a positive integer");
+  }
+
+  record(value: InferenceRequestUsage): "recorded" | "duplicate" {
+    const record = InferenceRequestUsageSchema.parse(value);
+    const existing = this.records.get(record.requestId);
+    if (existing) {
+      if (sameAccountingRecord(existing, record)) return "duplicate";
+      throw new Error(
+        `conflicting usage accounting for request ${record.requestId}`,
+      );
+    }
+    this.records.set(record.requestId, record);
+    return "recorded";
+  }
+
+  snapshot(): InferenceUsageLedgerSnapshot {
+    const requests = [...this.records.values()];
+    const totalTokens = requests.reduce(
+      (total, record) => total + (record.usage?.totalTokens ?? 0),
+      0,
+    );
+    const optionalUsage = Object.fromEntries(
+      (
+        [
+          "inputTokens",
+          "cachedInputTokens",
+          "outputTokens",
+          "reasoningTokens",
+        ] as const
+      ).flatMap((field) => {
+        const value = sumOptionalUsageField(requests, field);
+        return value === undefined ? [] : [[field, value]];
+      }),
+    );
+    const requestCounts = {
+      total: requests.length,
+      complete: requests.filter((record) => record.completeness === "complete")
+        .length,
+      partial: requests.filter((record) => record.completeness === "partial")
+        .length,
+      unknown: requests.filter((record) => record.completeness === "unknown")
+        .length,
+    };
+    const completeness =
+      requestCounts.unknown > 0
+        ? "unknown"
+        : requestCounts.partial > 0
+          ? "partial"
+          : requests.length > 0
+            ? "complete"
+            : "unknown";
+    return {
+      requests,
+      observedUsage: { ...optionalUsage, totalTokens },
+      requestCounts,
+      completeness,
+      budget: {
+        tokenLimit: this.tokenLimit,
+        enforcement: "observed_admission_ceiling",
+        admission: totalTokens >= this.tokenLimit ? "exhausted" : "open",
+        singleResponseMayOvershoot: true,
+        hardOutputTokenLimit: "unsupported",
+        monetaryCost: "unavailable",
+      },
+    };
+  }
 }
 
 function isEventStream(contentType: string): boolean {
@@ -214,12 +322,13 @@ export class ProductionInferenceBroker {
       budget.wallClockMs,
     );
     expiryTimer.unref();
+    const maxTokens = budget.maxTokens ?? Number.MAX_SAFE_INTEGER;
     const state: LeaseState = {
       jobId,
       token,
       expiresAt: Date.now() + budget.wallClockMs,
-      maxTokens: budget.maxTokens ?? Number.MAX_SAFE_INTEGER,
-      usedTokens: 0,
+      maxTokens,
+      ledger: new InferenceUsageLedger(maxTokens),
       active: 0,
       revoked: false,
       controllers: new Set(),
@@ -231,6 +340,7 @@ export class ProductionInferenceBroker {
       endpoint: new URL(`http://127.0.0.1:${address.port}/v1/`),
       opaqueToken: token,
       expiresAt: new Date(state.expiresAt),
+      usage: () => state.ledger.snapshot(),
       revoke: async () => this.revoke(token),
     };
   }
@@ -284,7 +394,7 @@ export class ProductionInferenceBroker {
       return;
     }
     if (
-      lease.usedTokens >= lease.maxTokens ||
+      lease.ledger.snapshot().observedUsage.totalTokens >= lease.maxTokens ||
       lease.active >= this.maxConcurrency
     ) {
       this.counters.rejectedRequests += 1;
@@ -319,6 +429,15 @@ export class ProductionInferenceBroker {
     response.once("close", () => {
       if (!response.writableEnded) controller.abort();
     });
+    const attemptId = `broker:${randomUUID()}`;
+    let accountingAttempted = false;
+    const recordUsage = (record: ParsedTerminalUsage): void => {
+      accountingAttempted = true;
+      lease.ledger.record({
+        ...record,
+        finalizedAt: new Date().toISOString(),
+      });
+    };
     try {
       const upstream = await fetch(this.options.upstream, {
         method: "POST",
@@ -336,6 +455,11 @@ export class ProductionInferenceBroker {
         body: JSON.stringify(body),
       });
       if (!upstream.body) {
+        recordUsage({
+          requestId: attemptId,
+          outcome: "transport_error",
+          completeness: "unknown",
+        });
         jsonError(response, upstream.status, "upstream returned no body");
         return;
       }
@@ -345,7 +469,7 @@ export class ProductionInferenceBroker {
       response.writeHead(upstream.status, { "content-type": contentType });
       this.counters.sawStreamingResponse ||= parseEvents;
       const reader = upstream.body.getReader();
-      let responseTokens = 0;
+      const terminalRecords: ParsedTerminalUsage[] = [];
       let parserError: Error | undefined;
       const decoder = parseEvents ? new TextDecoder() : undefined;
       const parser = parseEvents
@@ -367,10 +491,12 @@ export class ProductionInferenceBroker {
                 event.event,
                 data,
               );
-              responseTokens = Math.max(
-                responseTokens,
-                responseUsage(data)?.totalTokens ?? 0,
+              const terminal = parseTerminalUsageEvent(
+                event.event,
+                data,
+                attemptId,
               );
+              if (terminal) terminalRecords.push(terminal);
             },
           })
         : undefined;
@@ -388,9 +514,23 @@ export class ProductionInferenceBroker {
         parser.reset({ consume: true });
         if (parserError) throw parserError;
       }
-      lease.usedTokens += responseTokens;
+      if (terminalRecords.length > 0) {
+        for (const record of terminalRecords) recordUsage(record);
+      } else {
+        recordUsage({
+          requestId: attemptId,
+          outcome: upstream.ok ? "transport_error" : "failed",
+          completeness: "unknown",
+        });
+      }
       response.end();
     } catch (error) {
+      if (!accountingAttempted)
+        recordUsage({
+          requestId: attemptId,
+          outcome: controller.signal.aborted ? "cancelled" : "transport_error",
+          completeness: "unknown",
+        });
       if (!response.headersSent)
         jsonError(
           response,

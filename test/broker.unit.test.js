@@ -103,7 +103,9 @@ test("broker enforces revocation, expiry, size, concurrency, and token budget", 
     markStarted();
     await held;
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end('data: {"response":{"usage":{"total_tokens":3}}}\n\n');
+    response.end(
+      'event: response.completed\ndata: {"response":{"id":"resp_budget","usage":{"total_tokens":3}}}\n\n',
+    );
   });
   const broker = new ProductionInferenceBroker({
     upstream: fake.url,
@@ -270,9 +272,13 @@ test("lease expiry aborts an in-flight upstream request", async () => {
 });
 
 test("broker accumulates observable token usage across Responses calls", async () => {
+  let sequence = 0;
   const fake = await upstream((_request, response) => {
+    sequence += 1;
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end('data: {"response":{"usage":{"total_tokens":3}}}\n\n');
+    response.end(
+      `event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_${sequence}","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n`,
+    );
   });
   const broker = new ProductionInferenceBroker({
     upstream: fake.url,
@@ -301,6 +307,35 @@ test("broker accumulates observable token usage across Responses calls", async (
       (await fetch(new URL("responses", lease.endpoint), options)).status,
       429,
     );
+    assert.deepEqual(lease.usage(), {
+      requests: [
+        {
+          requestId: "resp_1",
+          outcome: "completed",
+          completeness: "complete",
+          usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+          finalizedAt: lease.usage().requests[0].finalizedAt,
+        },
+        {
+          requestId: "resp_2",
+          outcome: "completed",
+          completeness: "complete",
+          usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+          finalizedAt: lease.usage().requests[1].finalizedAt,
+        },
+      ],
+      observedUsage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+      requestCounts: { total: 2, complete: 2, partial: 0, unknown: 0 },
+      completeness: "complete",
+      budget: {
+        tokenLimit: 5,
+        enforcement: "observed_admission_ceiling",
+        admission: "exhausted",
+        singleResponseMayOvershoot: true,
+        hardOutputTokenLimit: "unsupported",
+        monetaryCost: "unavailable",
+      },
+    });
   } finally {
     await broker.close();
     await fake.close();

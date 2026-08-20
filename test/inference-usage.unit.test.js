@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  InferenceUsageLedger,
   InferenceRequestUsageSchema,
   parseTerminalUsageEvent,
 } from "../dist/index.js";
@@ -116,4 +117,91 @@ test("durable request usage rejects inconsistent token totals", () => {
       finalizedAt: "2026-08-20T00:00:00.000Z",
     }),
   );
+});
+
+test("usage ledger deduplicates stable response ids and exposes honest budget capabilities", () => {
+  const ledger = new InferenceUsageLedger(100);
+  const first = {
+    requestId: "resp_ledger_1",
+    outcome: "completed",
+    completeness: "complete",
+    usage: {
+      inputTokens: 60,
+      cachedInputTokens: 40,
+      outputTokens: 20,
+      reasoningTokens: 8,
+      totalTokens: 80,
+    },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  };
+  const second = {
+    requestId: "resp_ledger_2",
+    outcome: "failed",
+    completeness: "partial",
+    usage: {
+      inputTokens: 15,
+      cachedInputTokens: 10,
+      outputTokens: 10,
+      reasoningTokens: 5,
+      totalTokens: 25,
+    },
+    finalizedAt: "2026-08-20T00:01:00.000Z",
+  };
+
+  assert.equal(ledger.record(first), "recorded");
+  assert.equal(ledger.record(first), "duplicate");
+  assert.equal(ledger.record(second), "recorded");
+  assert.deepEqual(ledger.snapshot(), {
+    requests: [first, second],
+    observedUsage: {
+      inputTokens: 75,
+      cachedInputTokens: 50,
+      outputTokens: 30,
+      reasoningTokens: 13,
+      totalTokens: 105,
+    },
+    requestCounts: { total: 2, complete: 1, partial: 1, unknown: 0 },
+    completeness: "partial",
+    budget: {
+      tokenLimit: 100,
+      enforcement: "observed_admission_ceiling",
+      admission: "exhausted",
+      singleResponseMayOvershoot: true,
+      hardOutputTokenLimit: "unsupported",
+      monetaryCost: "unavailable",
+    },
+  });
+});
+
+test("usage ledger rejects conflicting replay data for one response id", () => {
+  const ledger = new InferenceUsageLedger(100);
+  const record = {
+    requestId: "resp_conflict",
+    outcome: "completed",
+    completeness: "complete",
+    usage: { totalTokens: 10 },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  };
+  ledger.record(record);
+  assert.throws(
+    () =>
+      ledger.record({
+        ...record,
+        usage: { totalTokens: 11 },
+      }),
+    /conflicting usage.*resp_conflict/,
+  );
+});
+
+test("unknown usage remains distinguishable from observed zero usage", () => {
+  const ledger = new InferenceUsageLedger(100);
+  ledger.record({
+    requestId: "broker:cancelled",
+    outcome: "cancelled",
+    completeness: "unknown",
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  });
+  assert.deepEqual(ledger.snapshot().observedUsage, { totalTokens: 0 });
+  assert.equal(ledger.snapshot().completeness, "unknown");
+  assert.equal(ledger.snapshot().requestCounts.unknown, 1);
 });

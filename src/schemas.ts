@@ -223,6 +223,29 @@ export const InferenceRequestUsageSchema = z.object({
 });
 export type InferenceRequestUsage = z.infer<typeof InferenceRequestUsageSchema>;
 
+export const InferenceUsageLedgerSchema = z.object({
+  requests: z.array(InferenceRequestUsageSchema),
+  observedUsage: TokenUsageSchema,
+  requestCounts: z.object({
+    total: TokenCountSchema,
+    complete: TokenCountSchema,
+    partial: TokenCountSchema,
+    unknown: TokenCountSchema,
+  }),
+  completeness: z.enum(["complete", "partial", "unknown"]),
+  budget: z.object({
+    tokenLimit: z.number().int().positive().safe(),
+    enforcement: z.literal("observed_admission_ceiling"),
+    admission: z.enum(["open", "exhausted"]),
+    singleResponseMayOvershoot: z.literal(true),
+    hardOutputTokenLimit: z.literal("unsupported"),
+    monetaryCost: z.literal("unavailable"),
+  }),
+});
+export type InferenceUsageLedgerSnapshot = z.infer<
+  typeof InferenceUsageLedgerSchema
+>;
+
 export const JobResultSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   jobId: z.string(),
