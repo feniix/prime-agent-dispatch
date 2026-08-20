@@ -37,7 +37,13 @@ async function fixture() {
           fixture: true,
           unsafeLocal: true,
           gates: [{ name: "test", command: "/usr/bin/true", args: [] }],
-          budget: { wallClockMs: 1000 },
+          budgets: { wallClockMs: 1000, maxTokens: 100 },
+          budgetSemantics: {
+            modelTokens: "observed_admission_ceiling",
+            singleResponseMayOvershoot: true,
+            hardOutputTokenLimit: "unsupported",
+            monetaryCost: "unavailable",
+          },
         },
         input: { fixture: true, agent: { kind: "prime-rpc" } },
       };
@@ -46,7 +52,28 @@ async function fixture() {
     return {
       status: "running",
       secretToken: "must-not-render",
+      modelTokens: "must-not-render-model-token",
+      inputTokens: 424242,
       summary: "x".repeat(5000),
+      inference: {
+        observedUsage: {
+          inputTokens: 75,
+          cachedInputTokens: 50,
+          outputTokens: 30,
+          reasoningTokens: 13,
+          totalTokens: 105,
+        },
+        requestCounts: { total: 2, complete: 1, partial: 1, unknown: 0 },
+        completeness: "partial",
+        budget: {
+          tokenLimit: 100,
+          enforcement: "observed_admission_ceiling",
+          admission: "exhausted",
+          singleResponseMayOvershoot: true,
+          hardOutputTokenLimit: "unsupported",
+          monetaryCost: "unavailable",
+        },
+      },
     };
   });
   const adapter = new PrimeDispatchAdapter(
@@ -108,6 +135,12 @@ describe("PrimeDispatchAdapter", () => {
     expect(preview.presentation.blocks.at(-1)).toMatchObject({
       type: "buttons",
     });
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Token budget: 100 observed tokens; one response may overshoot",
+    );
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Hard output-token limit: unsupported; monetary cost: unavailable",
+    );
 
     const restarted = new PrimeDispatchAdapter(adapter.config, {
       runCli: adapter.runCli,
@@ -177,7 +210,18 @@ describe("PrimeDispatchAdapter", () => {
         ),
     ).toEqual(["status", "steer", "cancel", "result"]);
     expect(JSON.stringify(status)).not.toContain("must-not-render");
+    expect(status.state.inputTokens).toBe("[redacted]");
+    expect(status.state.inference.observedUsage.inputTokens).toBe(75);
     expect(status.state.summary.length).toBeLessThanOrEqual(512);
+    expect(status.presentation.blocks[0].text).toContain(
+      "Observed tokens: 105 / 100 (partial)",
+    );
+    expect(status.presentation.blocks[0].text).toContain(
+      "Input: 75 (50 cached); output: 30 (13 reasoning)",
+    );
+    expect(status.presentation.blocks[0].text).toContain(
+      "Hard output-token limit: unsupported; monetary cost: unavailable",
+    );
   });
 
   it("rediscovers jobs, edits one durable status card, and advances delivery once", async () => {

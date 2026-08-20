@@ -151,6 +151,12 @@ test("confirmation summary is canonical, immutable, and pins model/reasoning", (
   assert.equal(first.requestHash, second.requestHash);
   assert.equal(first.model, "gpt-5.6-sol");
   assert.equal(first.reasoningEffort, "high");
+  assert.deepEqual(first.budgetSemantics, {
+    modelTokens: "observed_admission_ceiling",
+    singleResponseMayOvershoot: true,
+    hardOutputTokenLimit: "unsupported",
+    monetaryCost: "unavailable",
+  });
   assert.equal(Object.isFrozen(first), true);
 });
 

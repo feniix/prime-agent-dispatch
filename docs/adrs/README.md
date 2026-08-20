@@ -18,6 +18,7 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 - [ADR-0012: Require a self-contained checksum-pinned Prime runtime for broader rollout](0012-self-contained-pinned-prime-runtime.md)
 - [ADR-0013: Use SQLite for authoritative state and retain JSON artifacts](0013-sqlite-authority-with-json-artifacts.md)
 - [ADR-0014: Reuse maintained infrastructure primitives without outsourcing policy](0014-reuse-maintained-infrastructure-primitives.md)
+- [ADR-0015: Record observed inference usage without claiming hard token or cost enforcement](0015-observed-inference-usage-ledger.md)
 
 ## Status conventions
 

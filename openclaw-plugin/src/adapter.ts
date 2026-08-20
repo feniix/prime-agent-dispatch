@@ -263,6 +263,7 @@ export class PrimeDispatchAdapter {
       };
       const state = asRecord(pending.state);
       const status = stringField(state, "status");
+      const presentation = statusPresentation(jobId, status, state.inference);
       const last = asRecord(notifications.at(-1));
       const event = asRecord(last.event);
       const sequence = event.sequence;
@@ -270,15 +271,17 @@ export class PrimeDispatchAdapter {
         throw new Error("notification omitted sequence");
       const deliveryKey = stringField(last, "deliveryKey");
       const previousMessageId = await this.readStatusCard(jobId);
-      const text = `Prime job ${jobId}: ${status}`.slice(
-        0,
-        this.config.maxRenderedChars,
-      );
+      const text = [
+        `Prime job ${jobId}: ${status}`,
+        ...inferenceStatusLines(state.inference).slice(0, 1),
+      ]
+        .join(" · ")
+        .slice(0, this.config.maxRenderedChars);
       const messageId = await delivery.upsertStatusCard({
         jobId,
         route,
         text,
-        presentation: statusPresentation(jobId, status),
+        presentation,
         ...(previousMessageId ? { previousMessageId } : {}),
         deliveryKey,
       });
@@ -288,7 +291,7 @@ export class PrimeDispatchAdapter {
           jobId,
           route,
           text,
-          presentation: statusPresentation(jobId, status),
+          presentation,
           deliveryKey: `${deliveryKey}:terminal`,
         });
       await this.runCli([
@@ -354,6 +357,7 @@ export class PrimeDispatchAdapter {
       presentation: statusPresentation(
         jobId,
         String(state.status ?? operation),
+        state.inference,
       ),
     };
   }
@@ -540,19 +544,53 @@ function stringField(record: Record<string, any>, key: string): string {
   return value;
 }
 
-function sanitize(value: unknown, maxChars: number, key = ""): unknown {
-  if (/secret|token|password|credential|nonce|authorization/i.test(key))
+const SAFE_NUMERIC_USAGE_PATHS = new Set([
+  "budgets.maxTokens",
+  "inference.observedUsage.inputTokens",
+  "inference.observedUsage.cachedInputTokens",
+  "inference.observedUsage.outputTokens",
+  "inference.observedUsage.reasoningTokens",
+  "inference.observedUsage.totalTokens",
+  "inference.budget.tokenLimit",
+]);
+
+function isSafeUsageValue(path: string[], value: unknown): boolean {
+  const field = path.join(".");
+  if (SAFE_NUMERIC_USAGE_PATHS.has(field))
+    return (
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    );
+  if (field === "budgetSemantics.modelTokens")
+    return value === "observed_admission_ceiling";
+  if (
+    field === "budgetSemantics.hardOutputTokenLimit" ||
+    field === "inference.budget.hardOutputTokenLimit"
+  )
+    return value === "unsupported";
+  return false;
+}
+
+function sanitize(
+  value: unknown,
+  maxChars: number,
+  path: string[] = [],
+): unknown {
+  const key = path.at(-1) ?? "";
+  if (
+    !isSafeUsageValue(path, value) &&
+    /secret|token|password|credential|nonce|authorization/i.test(key)
+  )
     return "[redacted]";
   if (typeof value === "string") return value.slice(0, maxChars);
   if (Array.isArray(value))
-    return value.slice(0, 50).map((item) => sanitize(item, maxChars));
+    return value.slice(0, 50).map((item) => sanitize(item, maxChars, path));
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value)
         .slice(0, 100)
         .map(([childKey, child]) => [
           childKey,
-          sanitize(child, maxChars, childKey),
+          sanitize(child, maxChars, [...path, childKey]),
         ]),
     );
   return value;
@@ -563,13 +601,39 @@ function confirmationPresentation(
   token: string,
 ): Presentation {
   const record = asRecord(preview);
+  const budgets = asRecordOrUndefined(record.budgets);
+  const semantics = asRecordOrUndefined(record.budgetSemantics);
+  const tokenBudget =
+    typeof budgets?.maxTokens === "number"
+      ? String(budgets.maxTokens)
+      : "unknown";
+  const budgetLines =
+    semantics?.modelTokens === "observed_admission_ceiling" &&
+    semantics.singleResponseMayOvershoot === true
+      ? [
+          `Token budget: ${tokenBudget} observed tokens; one response may overshoot`,
+          ...(semantics.hardOutputTokenLimit === "unsupported" &&
+          semantics.monetaryCost === "unavailable"
+            ? [
+                "Hard output-token limit: unsupported; monetary cost: unavailable",
+              ]
+            : []),
+        ]
+      : [];
   return {
     title: "Prime Dispatch confirmation",
     tone: "warning",
     blocks: [
       {
         type: "text",
-        text: `${String(record.task ?? "Prime job")}\nRepository: ${String(record.canonicalRepoPath ?? "unknown")}\nBase: ${String(record.baseSha ?? "unknown")}\nModel: gpt-5.6-sol (high)\nUnsafe local fixture execution`,
+        text: [
+          String(record.task ?? "Prime job"),
+          `Repository: ${String(record.canonicalRepoPath ?? "unknown")}`,
+          `Base: ${String(record.baseSha ?? "unknown")}`,
+          "Model: gpt-5.6-sol (high)",
+          ...budgetLines,
+          "Unsafe local fixture execution",
+        ].join("\n"),
       },
       {
         type: "buttons",
@@ -585,7 +649,60 @@ function confirmationPresentation(
   };
 }
 
-function statusPresentation(jobId: string, status: string): Presentation {
+function inferenceStatusLines(value: unknown): string[] {
+  const inference = asRecordOrUndefined(value);
+  const observed = asRecordOrUndefined(inference?.observedUsage);
+  const counts = asRecordOrUndefined(inference?.requestCounts);
+  const budget = asRecordOrUndefined(inference?.budget);
+  if (
+    typeof observed?.totalTokens !== "number" ||
+    typeof budget?.tokenLimit !== "number" ||
+    !["complete", "partial", "unknown"].includes(
+      String(inference?.completeness),
+    )
+  )
+    return [];
+  const lines = [
+    `Observed tokens: ${observed.totalTokens} / ${budget.tokenLimit} (${String(inference?.completeness)})`,
+  ];
+  if (
+    typeof observed.inputTokens === "number" &&
+    typeof observed.outputTokens === "number"
+  )
+    lines.push(
+      `Input: ${observed.inputTokens}${typeof observed.cachedInputTokens === "number" ? ` (${observed.cachedInputTokens} cached)` : ""}; output: ${observed.outputTokens}${typeof observed.reasoningTokens === "number" ? ` (${observed.reasoningTokens} reasoning)` : ""}`,
+    );
+  if (
+    typeof counts?.total === "number" &&
+    typeof counts.complete === "number" &&
+    typeof counts.partial === "number" &&
+    typeof counts.unknown === "number"
+  )
+    lines.push(
+      `Requests: ${counts.total} (${counts.complete} complete, ${counts.partial} partial, ${counts.unknown} unknown)`,
+    );
+  if (
+    budget.enforcement === "observed_admission_ceiling" &&
+    budget.singleResponseMayOvershoot === true
+  )
+    lines.push(
+      "Budget: observed admission ceiling; one response may overshoot",
+    );
+  if (
+    budget.hardOutputTokenLimit === "unsupported" &&
+    budget.monetaryCost === "unavailable"
+  )
+    lines.push(
+      "Hard output-token limit: unsupported; monetary cost: unavailable",
+    );
+  return lines;
+}
+
+function statusPresentation(
+  jobId: string,
+  status: string,
+  inference?: unknown,
+): Presentation {
   const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(
     status,
   );
@@ -593,7 +710,12 @@ function statusPresentation(jobId: string, status: string): Presentation {
     title: `Prime job ${jobId}`,
     tone: status === "succeeded" ? "success" : terminal ? "danger" : "info",
     blocks: [
-      { type: "text", text: `Status: ${status}` },
+      {
+        type: "text",
+        text: [`Status: ${status}`, ...inferenceStatusLines(inference)].join(
+          "\n",
+        ),
+      },
       {
         type: "buttons",
         buttons: [

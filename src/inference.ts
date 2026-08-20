@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -6,11 +6,21 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createParser } from "eventsource-parser";
+import {
+  InferenceRequestUsageSchema,
+  sameInferenceAccounting,
+  summarizeInferenceUsage,
+  TokenUsageSchema,
+  type InferenceRequestUsage,
+  type InferenceUsageLedgerSnapshot,
+  type TokenUsage,
+} from "./schemas.js";
 
 export type InferenceLease = {
   endpoint: URL;
   opaqueToken: string;
   expiresAt: Date;
+  usage(): InferenceUsageLedgerSnapshot;
   revoke(): Promise<void>;
 };
 
@@ -19,10 +29,12 @@ type LeaseState = {
   token: string;
   expiresAt: number;
   maxTokens: number;
-  usedTokens: number;
+  ledger: InferenceUsageLedger;
+  persistedUsageIds: Set<string>;
   active: number;
   revoked: boolean;
   controllers: Set<AbortController>;
+  idleWaiters: Set<() => void>;
   expiryTimer: NodeJS.Timeout;
 };
 
@@ -32,6 +44,10 @@ type BrokerOptions = {
   accountId: string;
   maxRequestBytes?: number;
   maxConcurrency?: number;
+  onUsageFinalized?: (
+    record: InferenceRequestUsage,
+    snapshot: InferenceUsageLedgerSnapshot,
+  ) => Promise<void>;
 };
 
 function jsonError(
@@ -49,15 +65,103 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function responseUsageTokens(data: unknown) {
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function responseUsage(data: unknown): TokenUsage | undefined {
   const payload = asRecord(data);
   const response = asRecord(payload?.response);
   const usage = asRecord(response?.usage);
-  return typeof usage?.total_tokens === "number" &&
-    Number.isSafeInteger(usage.total_tokens) &&
-    usage.total_tokens >= 0
-    ? usage.total_tokens
-    : 0;
+  const totalTokens = nonnegativeInteger(usage?.total_tokens);
+  if (totalTokens === undefined) return undefined;
+  const inputDetails = asRecord(usage?.input_tokens_details);
+  const outputDetails = asRecord(usage?.output_tokens_details);
+  const candidate = {
+    ...(nonnegativeInteger(usage?.input_tokens) !== undefined
+      ? { inputTokens: nonnegativeInteger(usage?.input_tokens) }
+      : {}),
+    ...(nonnegativeInteger(inputDetails?.cached_tokens) !== undefined
+      ? { cachedInputTokens: nonnegativeInteger(inputDetails?.cached_tokens) }
+      : {}),
+    ...(nonnegativeInteger(usage?.output_tokens) !== undefined
+      ? { outputTokens: nonnegativeInteger(usage?.output_tokens) }
+      : {}),
+    ...(nonnegativeInteger(outputDetails?.reasoning_tokens) !== undefined
+      ? { reasoningTokens: nonnegativeInteger(outputDetails?.reasoning_tokens) }
+      : {}),
+    totalTokens,
+  };
+  const parsed = TokenUsageSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : undefined;
+}
+
+type ParsedTerminalUsage = Omit<InferenceRequestUsage, "finalizedAt">;
+
+export function parseTerminalUsageEvent(
+  eventName: string | undefined,
+  data: unknown,
+  fallbackRequestId?: string,
+): ParsedTerminalUsage | undefined {
+  const payload = asRecord(data);
+  const type =
+    eventName || (typeof payload?.type === "string" ? payload.type : undefined);
+  const outcome =
+    type === "response.completed"
+      ? "completed"
+      : type === "response.failed" || type === "response.incomplete"
+        ? "failed"
+        : undefined;
+  if (!outcome) return undefined;
+  const response = asRecord(payload?.response);
+  const requestId =
+    typeof response?.id === "string" && response.id
+      ? response.id
+      : fallbackRequestId;
+  if (!requestId) return undefined;
+  const usage = responseUsage(data);
+  return {
+    requestId,
+    outcome,
+    completeness: usage
+      ? outcome === "completed"
+        ? "complete"
+        : "partial"
+      : "unknown",
+    ...(usage ? { usage } : {}),
+  };
+}
+
+export class InferenceUsageLedger {
+  private readonly records = new Map<string, InferenceRequestUsage>();
+
+  constructor(private readonly tokenLimit: number) {
+    if (!Number.isSafeInteger(tokenLimit) || tokenLimit <= 0)
+      throw new Error("inference token limit must be a positive integer");
+  }
+
+  record(value: InferenceRequestUsage): "recorded" | "duplicate" {
+    const record = InferenceRequestUsageSchema.parse(value);
+    const existing = this.records.get(record.requestId);
+    if (existing) {
+      if (sameInferenceAccounting(existing, record)) return "duplicate";
+      throw new Error(
+        `conflicting usage accounting for request ${record.requestId}`,
+      );
+    }
+    this.records.set(record.requestId, record);
+    return "recorded";
+  }
+
+  snapshot(): InferenceUsageLedgerSnapshot {
+    const requests = [...this.records.values()];
+    return {
+      requests,
+      ...summarizeInferenceUsage(requests, this.tokenLimit),
+    };
+  }
 }
 
 function isEventStream(contentType: string): boolean {
@@ -129,6 +233,7 @@ export class ProductionInferenceBroker {
     authorizedRequests: 0,
     rejectedRequests: 0,
     abortedUpstreams: 0,
+    usagePersistenceFailures: 0,
     sawStreamingResponse: false,
     sawToolCallEvent: false,
     sawHighReasoning: false,
@@ -155,15 +260,18 @@ export class ProductionInferenceBroker {
       budget.wallClockMs,
     );
     expiryTimer.unref();
+    const maxTokens = budget.maxTokens ?? Number.MAX_SAFE_INTEGER;
     const state: LeaseState = {
       jobId,
       token,
       expiresAt: Date.now() + budget.wallClockMs,
-      maxTokens: budget.maxTokens ?? Number.MAX_SAFE_INTEGER,
-      usedTokens: 0,
+      maxTokens,
+      ledger: new InferenceUsageLedger(maxTokens),
+      persistedUsageIds: new Set(),
       active: 0,
       revoked: false,
       controllers: new Set(),
+      idleWaiters: new Set(),
       expiryTimer,
     };
     this.leases.set(token, state);
@@ -172,6 +280,7 @@ export class ProductionInferenceBroker {
       endpoint: new URL(`http://127.0.0.1:${address.port}/v1/`),
       opaqueToken: token,
       expiresAt: new Date(state.expiresAt),
+      usage: () => state.ledger.snapshot(),
       revoke: async () => this.revoke(token),
     };
   }
@@ -197,13 +306,23 @@ export class ProductionInferenceBroker {
   private async revoke(token: string): Promise<void> {
     const lease = this.leases.get(token);
     if (!lease) return;
+    if (lease.revoked) {
+      await this.waitForIdle(lease);
+      return;
+    }
     clearTimeout(lease.expiryTimer);
     lease.revoked = true;
-    this.leases.delete(token);
     for (const controller of lease.controllers) {
       this.counters.abortedUpstreams += 1;
       controller.abort();
     }
+    await this.waitForIdle(lease);
+    if (this.leases.get(token) === lease) this.leases.delete(token);
+  }
+
+  private async waitForIdle(lease: LeaseState): Promise<void> {
+    if (lease.active === 0) return;
+    await new Promise<void>((resolve) => lease.idleWaiters.add(resolve));
   }
 
   private async handle(
@@ -224,14 +343,6 @@ export class ProductionInferenceBroker {
       jsonError(response, 401, "invalid, expired, or revoked job token");
       return;
     }
-    if (
-      lease.usedTokens >= lease.maxTokens ||
-      lease.active >= this.maxConcurrency
-    ) {
-      this.counters.rejectedRequests += 1;
-      jsonError(response, 429, "job inference budget or concurrency exceeded");
-      return;
-    }
     let raw: Buffer;
     try {
       raw = await readBounded(request, this.maxRequestBytes);
@@ -250,6 +361,19 @@ export class ProductionInferenceBroker {
       jsonError(response, 400, "invalid JSON request body");
       return;
     }
+    if (lease.revoked || Date.now() >= lease.expiresAt) {
+      this.counters.rejectedRequests += 1;
+      jsonError(response, 401, "invalid, expired, or revoked job token");
+      return;
+    }
+    if (
+      lease.ledger.snapshot().observedUsage.totalTokens >= lease.maxTokens ||
+      lease.active >= this.maxConcurrency
+    ) {
+      this.counters.rejectedRequests += 1;
+      jsonError(response, 429, "job inference budget or concurrency exceeded");
+      return;
+    }
     this.counters.sawHighReasoning ||=
       (body.reasoning as { effort?: unknown }).effort === "high";
     const controller = new AbortController();
@@ -260,6 +384,39 @@ export class ProductionInferenceBroker {
     response.once("close", () => {
       if (!response.writableEnded) controller.abort();
     });
+    const attemptId = `broker:${randomUUID()}`;
+    let accountingAttempted = false;
+    const recordUsage = async (record: ParsedTerminalUsage): Promise<void> => {
+      accountingAttempted = true;
+      const finalized = InferenceRequestUsageSchema.parse({
+        ...record,
+        finalizedAt: new Date().toISOString(),
+      });
+      lease.ledger.record(finalized);
+      if (
+        this.options.onUsageFinalized &&
+        !lease.persistedUsageIds.has(finalized.requestId)
+      ) {
+        try {
+          await this.options.onUsageFinalized(
+            finalized,
+            lease.ledger.snapshot(),
+          );
+          lease.persistedUsageIds.add(finalized.requestId);
+        } catch (error) {
+          this.counters.usagePersistenceFailures += 1;
+          throw error;
+        }
+      }
+    };
+    const terminalRecords: ParsedTerminalUsage[] = [];
+    let nextTerminalRecord = 0;
+    const flushTerminalRecords = async (): Promise<void> => {
+      while (nextTerminalRecord < terminalRecords.length) {
+        await recordUsage(terminalRecords[nextTerminalRecord]!);
+        nextTerminalRecord += 1;
+      }
+    };
     try {
       const upstream = await fetch(this.options.upstream, {
         method: "POST",
@@ -277,6 +434,11 @@ export class ProductionInferenceBroker {
         body: JSON.stringify(body),
       });
       if (!upstream.body) {
+        await recordUsage({
+          requestId: attemptId,
+          outcome: "transport_error",
+          completeness: "unknown",
+        });
         jsonError(response, upstream.status, "upstream returned no body");
         return;
       }
@@ -286,7 +448,6 @@ export class ProductionInferenceBroker {
       response.writeHead(upstream.status, { "content-type": contentType });
       this.counters.sawStreamingResponse ||= parseEvents;
       const reader = upstream.body.getReader();
-      let responseTokens = 0;
       let parserError: Error | undefined;
       const decoder = parseEvents ? new TextDecoder() : undefined;
       const parser = parseEvents
@@ -308,10 +469,12 @@ export class ProductionInferenceBroker {
                 event.event,
                 data,
               );
-              responseTokens = Math.max(
-                responseTokens,
-                responseUsageTokens(data),
+              const terminal = parseTerminalUsageEvent(
+                event.event,
+                data,
+                attemptId,
               );
+              if (terminal) terminalRecords.push(terminal);
             },
           })
         : undefined;
@@ -322,16 +485,44 @@ export class ProductionInferenceBroker {
         if (parser && decoder) {
           parser.feed(decoder.decode(value, { stream: true }));
           if (parserError) throw parserError;
+          await flushTerminalRecords();
         }
       }
       if (parser && decoder) {
         parser.feed(decoder.decode());
         parser.reset({ consume: true });
         if (parserError) throw parserError;
+        await flushTerminalRecords();
       }
-      lease.usedTokens += responseTokens;
+      if (terminalRecords.length === 0) {
+        await recordUsage({
+          requestId: attemptId,
+          outcome: upstream.ok ? "transport_error" : "failed",
+          completeness: "unknown",
+        });
+      }
       response.end();
     } catch (error) {
+      if (!accountingAttempted && terminalRecords.length > nextTerminalRecord) {
+        try {
+          await flushTerminalRecords();
+        } catch {
+          // recordUsage already counted persistence failures.
+        }
+      }
+      if (!accountingAttempted) {
+        try {
+          await recordUsage({
+            requestId: attemptId,
+            outcome: controller.signal.aborted
+              ? "cancelled"
+              : "transport_error",
+            completeness: "unknown",
+          });
+        } catch {
+          // recordUsage already counted persistence failures.
+        }
+      }
       if (!response.headersSent)
         jsonError(
           response,
@@ -342,6 +533,10 @@ export class ProductionInferenceBroker {
     } finally {
       lease.active -= 1;
       lease.controllers.delete(controller);
+      if (lease.active === 0) {
+        for (const resolve of lease.idleWaiters) resolve();
+        lease.idleWaiters.clear();
+      }
     }
   }
 }

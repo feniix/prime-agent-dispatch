@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { ProductionInferenceBroker } from "../dist/index.js";
 
 async function upstream(handler) {
@@ -34,6 +34,33 @@ async function settleWithin(promise, description, timeoutMs = 2_000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function brokerPost(url, token) {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      url,
+      {
+        method: "POST",
+        agent: false,
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => (body += chunk));
+        response.once("end", () =>
+          resolve({ status: response.statusCode, body }),
+        );
+        response.once("error", reject);
+      },
+    );
+    request.once("error", reject);
+    request.end("{}");
+  });
 }
 
 test("broker authorizes scoped token and pins normalized Responses body", async () => {
@@ -103,7 +130,9 @@ test("broker enforces revocation, expiry, size, concurrency, and token budget", 
     markStarted();
     await held;
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end('data: {"response":{"usage":{"total_tokens":3}}}\n\n');
+    response.end(
+      'event: response.completed\ndata: {"response":{"id":"resp_budget","usage":{"total_tokens":3}}}\n\n',
+    );
   });
   const broker = new ProductionInferenceBroker({
     upstream: fake.url,
@@ -179,6 +208,7 @@ test("broker enforces revocation, expiry, size, concurrency, and token budget", 
 
 test("revocation aborts an in-flight upstream without disclosing secrets", async () => {
   let upstreamClosed = false;
+  const finalized = [];
   const started = deferred();
   const closed = deferred();
   const fake = await upstream((_request, response) => {
@@ -192,6 +222,9 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
     upstream: fake.url,
     accessToken: "never-log-token",
     accountId: "never-log-account",
+    onUsageFinalized: async (record, snapshot) => {
+      finalized.push({ record, snapshot });
+    },
   });
   const lease = await broker.createLease("cancel", {
     wallClockMs: 5_000,
@@ -206,6 +239,10 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
     }).catch(() => undefined);
     await settleWithin(started.promise, "the upstream request to start");
     await lease.revoke();
+    assert.equal(finalized.length, 1);
+    assert.equal(finalized[0].record.outcome, "cancelled");
+    assert.equal(finalized[0].record.completeness, "unknown");
+    assert.equal(finalized[0].snapshot.completeness, "unknown");
     await pending;
     await settleWithin(
       closed.promise,
@@ -219,6 +256,94 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
   } finally {
     await lease.revoke().catch(() => undefined);
     await pending?.catch(() => undefined);
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("revocation preserves a parsed terminal usage event before upstream EOF", async () => {
+  const terminalSent = deferred();
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_before_eof","usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n',
+    );
+    terminalSent.resolve();
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("terminal-before-eof", {
+    wallClockMs: 5_000,
+    maxTokens: 100,
+  });
+  let reader;
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    });
+    reader = response.body.getReader();
+    await settleWithin(terminalSent.promise, "the terminal event to be sent");
+    await settleWithin(reader.read(), "the terminal event to be forwarded");
+    await lease.revoke();
+    assert.deepEqual(lease.usage().requests, [
+      {
+        requestId: "resp_before_eof",
+        outcome: "completed",
+        completeness: "complete",
+        usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+        finalizedAt: lease.usage().requests[0].finalizedAt,
+      },
+    ]);
+    assert.equal(lease.usage().observedUsage.totalTokens, 10);
+  } finally {
+    await reader?.cancel().catch(() => undefined);
+    await lease.revoke().catch(() => undefined);
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("a replay retries usage persistence after a transient callback failure", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_persistence_retry","usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n',
+    );
+  });
+  let persistenceAttempts = 0;
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+    onUsageFinalized: async () => {
+      persistenceAttempts += 1;
+      if (persistenceAttempts === 1)
+        throw new Error("transient persistence failure");
+    },
+  });
+  const lease = await broker.createLease("persistence-retry", {
+    wallClockMs: 5_000,
+    maxTokens: 100,
+  });
+  try {
+    await assert.rejects(() =>
+      brokerPost(new URL("responses", lease.endpoint), lease.opaqueToken),
+    );
+    const replay = await brokerPost(
+      new URL("responses", lease.endpoint),
+      lease.opaqueToken,
+    );
+    assert.equal(replay.status, 200);
+    assert.equal(persistenceAttempts, 2);
+    assert.equal(broker.stats().usagePersistenceFailures, 1);
+    assert.equal(lease.usage().requests.length, 1);
+  } finally {
+    await lease.revoke().catch(() => undefined);
     await broker.close();
     await fake.close();
   }
@@ -270,9 +395,13 @@ test("lease expiry aborts an in-flight upstream request", async () => {
 });
 
 test("broker accumulates observable token usage across Responses calls", async () => {
+  let sequence = 0;
   const fake = await upstream((_request, response) => {
+    sequence += 1;
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end('data: {"response":{"usage":{"total_tokens":3}}}\n\n');
+    response.end(
+      `event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_${sequence}","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n`,
+    );
   });
   const broker = new ProductionInferenceBroker({
     upstream: fake.url,
@@ -301,6 +430,35 @@ test("broker accumulates observable token usage across Responses calls", async (
       (await fetch(new URL("responses", lease.endpoint), options)).status,
       429,
     );
+    assert.deepEqual(lease.usage(), {
+      requests: [
+        {
+          requestId: "resp_1",
+          outcome: "completed",
+          completeness: "complete",
+          usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+          finalizedAt: lease.usage().requests[0].finalizedAt,
+        },
+        {
+          requestId: "resp_2",
+          outcome: "completed",
+          completeness: "complete",
+          usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+          finalizedAt: lease.usage().requests[1].finalizedAt,
+        },
+      ],
+      observedUsage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+      requestCounts: { total: 2, complete: 2, partial: 0, unknown: 0 },
+      completeness: "complete",
+      budget: {
+        tokenLimit: 5,
+        enforcement: "observed_admission_ceiling",
+        admission: "exhausted",
+        singleResponseMayOvershoot: true,
+        hardOutputTokenLimit: "unsupported",
+        monetaryCost: "unavailable",
+      },
+    });
   } finally {
     await broker.close();
     await fake.close();
@@ -349,6 +507,49 @@ test("broker accounts only structured response usage events", async () => {
       (await fetch(new URL("responses", lease.endpoint), options)).status,
       429,
     );
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("replayed terminal response ids are accounted exactly once", async () => {
+  let finalized = 0;
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_replayed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n',
+    );
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+    onUsageFinalized: async () => {
+      finalized += 1;
+    },
+  });
+  const lease = await broker.createLease("replay", {
+    wallClockMs: 1000,
+    maxTokens: 100,
+  });
+  const options = {
+    method: "POST",
+    headers: { authorization: `Bearer ${lease.opaqueToken}` },
+    body: "{}",
+  };
+  try {
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(finalized, 1);
+    assert.equal(lease.usage().requests.length, 1);
+    assert.equal(lease.usage().observedUsage.totalTokens, 5);
   } finally {
     await broker.close();
     await fake.close();
@@ -488,6 +689,8 @@ test("broker forwards non-SSE upstream errors without parsing them as events", a
       error: { message: "bad request" },
     });
     assert.equal(broker.stats().sawStreamingResponse, false);
+    assert.equal(lease.usage().requests[0].outcome, "failed");
+    assert.equal(lease.usage().requests[0].completeness, "unknown");
   } finally {
     await broker.close();
     await fake.close();
