@@ -239,3 +239,62 @@ test("inference usage is authoritative, idempotent, and redacted in durable evid
   assert.doesNotMatch(evidence, /must-not-persist|authorization/i);
   assert.deepEqual(JSON.parse(evidence), ledger.snapshot());
 });
+
+test("reconnected inference accounting preserves prior records and tolerates replay timestamps", async () => {
+  const { store, request } = await storeFixture();
+  await store.updateState(request.jobId, "provisioning");
+  await store.updateState(request.jobId, "running");
+  const beforeRestart = new InferenceUsageLedger(100);
+  const first = {
+    requestId: "resp_before_restart",
+    outcome: "completed",
+    completeness: "complete",
+    usage: { totalTokens: 10 },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  };
+  beforeRestart.record(first);
+  const persisted = await store.recordInferenceUsage(
+    request.jobId,
+    first,
+    beforeRestart.snapshot(),
+  );
+
+  const replay = {
+    ...first,
+    finalizedAt: "2026-08-20T00:05:00.000Z",
+  };
+  const replayOnly = new InferenceUsageLedger(100);
+  replayOnly.record(replay);
+  const replayed = await store.recordInferenceUsage(
+    request.jobId,
+    replay,
+    replayOnly.snapshot(),
+  );
+  assert.equal(replayed.revision, persisted.revision);
+
+  const afterRestart = new InferenceUsageLedger(100);
+  const second = {
+    requestId: "resp_after_restart",
+    outcome: "completed",
+    completeness: "complete",
+    usage: { totalTokens: 5 },
+    finalizedAt: "2026-08-20T00:06:00.000Z",
+  };
+  afterRestart.record(second);
+  const merged = await store.recordInferenceUsage(
+    request.jobId,
+    second,
+    afterRestart.snapshot(),
+  );
+  assert.deepEqual(
+    merged.inference.requests.map((record) => record.requestId),
+    ["resp_before_restart", "resp_after_restart"],
+  );
+  assert.equal(merged.inference.observedUsage.totalTokens, 15);
+  assert.equal(
+    (await store.readEvents(request.jobId)).filter(
+      (event) => event.type === "inference_usage_recorded",
+    ).length,
+    2,
+  );
+});

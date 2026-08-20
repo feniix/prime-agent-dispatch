@@ -18,6 +18,8 @@ import {
   JobResultSchema,
   JobStateSchema,
   SCHEMA_VERSION,
+  sameInferenceAccounting,
+  summarizeInferenceUsage,
   type JobEvent,
   type InferenceRequestUsage,
   type InferenceUsageLedgerSnapshot,
@@ -26,7 +28,6 @@ import {
   type JobState,
   type JobStatus,
 } from "./schemas.js";
-import { InferenceUsageLedger } from "./inference.js";
 import { assertTransition } from "./state-machine.js";
 
 const LOCK_STALE_MS = 30_000;
@@ -268,17 +269,10 @@ export class JobStore {
   ): Promise<JobState> {
     const record = InferenceRequestUsageSchema.parse(value);
     const ledger = InferenceUsageLedgerSchema.parse(ledgerValue);
-    const rebuilt = new InferenceUsageLedger(ledger.budget.tokenLimit);
-    for (const request of ledger.requests) rebuilt.record(request);
-    if (JSON.stringify(rebuilt.snapshot()) !== JSON.stringify(ledger))
-      throw new Error("inference usage ledger summary is inconsistent");
     const ledgerRecord = ledger.requests.find(
       (request) => request.requestId === record.requestId,
     );
-    if (
-      !ledgerRecord ||
-      JSON.stringify(ledgerRecord) !== JSON.stringify(record)
-    )
+    if (!ledgerRecord || !sameInferenceAccounting(ledgerRecord, record))
       throw new Error("inference usage ledger omitted finalized request");
 
     const dir = this.jobDir(jobId);
@@ -288,60 +282,74 @@ export class JobStore {
       const existing = current.inference;
       if (existing && existing.budget.tokenLimit !== ledger.budget.tokenLimit)
         throw new Error("inference usage token limit changed");
-      const currentRecord = existing?.requests.find(
-        (request) => request.requestId === record.requestId,
+      const mergedRequests = [...(existing?.requests ?? [])];
+      const known = new Map(
+        mergedRequests.map((request) => [request.requestId, request]),
       );
-      if (
-        currentRecord &&
-        JSON.stringify(currentRecord) !== JSON.stringify(record)
-      )
-        throw new Error(
-          `conflicting usage accounting for request ${record.requestId}`,
-        );
-      for (const prior of existing?.requests ?? []) {
-        const replacement = ledger.requests.find(
-          (request) => request.requestId === prior.requestId,
-        );
-        if (!replacement) {
-          if (currentRecord) {
-            await atomicWriteFile(
-              join(dir, "artifacts", "inference-usage.json"),
-              `${JSON.stringify(existing, null, 2)}\n`,
-            );
-            return current;
-          }
-          throw new Error("inference usage ledger cannot discard requests");
-        }
-        if (JSON.stringify(replacement) !== JSON.stringify(prior))
+      for (const incoming of ledger.requests) {
+        const prior = known.get(incoming.requestId);
+        if (prior && !sameInferenceAccounting(prior, incoming))
           throw new Error(
-            `conflicting usage accounting for request ${prior.requestId}`,
+            `conflicting usage accounting for request ${incoming.requestId}`,
           );
+        if (!prior) {
+          mergedRequests.push(incoming);
+          known.set(incoming.requestId, incoming);
+        }
       }
-      if (JSON.stringify(existing) === JSON.stringify(ledger)) {
+      const merged = InferenceUsageLedgerSchema.parse({
+        requests: mergedRequests,
+        ...summarizeInferenceUsage(mergedRequests, ledger.budget.tokenLimit),
+      });
+      let next = current;
+      if (JSON.stringify(existing) !== JSON.stringify(merged)) {
+        next = JobStateSchema.parse({
+          ...current,
+          inference: merged,
+          revision: current.revision + 1,
+          updatedAt: new Date().toISOString(),
+        });
         await atomicWriteFile(
-          join(dir, "artifacts", "inference-usage.json"),
-          `${JSON.stringify(ledger, null, 2)}\n`,
+          join(dir, "state.json"),
+          `${JSON.stringify(next, null, 2)}\n`,
         );
-        return current;
       }
-      const next = JobStateSchema.parse({
-        ...current,
-        inference: ledger,
-        revision: current.revision + 1,
-        updatedAt: new Date().toISOString(),
-      });
-      await atomicWriteFile(
-        join(dir, "state.json"),
-        `${JSON.stringify(next, null, 2)}\n`,
-      );
-      await this.appendEventUnlocked(jobId, "inference_usage_recorded", {
-        request: record,
-        observedTotalTokens: ledger.observedUsage.totalTokens,
-        completeness: ledger.completeness,
-      });
+      const events = await this.readEvents(jobId);
+      const recorded = new Map<string, InferenceRequestUsage>();
+      for (const event of events) {
+        if (event.type !== "inference_usage_recorded") continue;
+        const parsed = InferenceRequestUsageSchema.safeParse(
+          event.data.request,
+        );
+        if (!parsed.success)
+          throw new Error("invalid inference usage event record");
+        const prior = recorded.get(parsed.data.requestId);
+        if (prior && !sameInferenceAccounting(prior, parsed.data))
+          throw new Error(
+            `conflicting usage accounting for request ${parsed.data.requestId}`,
+          );
+        recorded.set(parsed.data.requestId, parsed.data);
+      }
+      for (const [index, request] of merged.requests.entries()) {
+        const prior = recorded.get(request.requestId);
+        if (prior && !sameInferenceAccounting(prior, request))
+          throw new Error(
+            `conflicting usage accounting for request ${request.requestId}`,
+          );
+        if (prior) continue;
+        const summary = summarizeInferenceUsage(
+          merged.requests.slice(0, index + 1),
+          merged.budget.tokenLimit,
+        );
+        await this.appendEventUnlocked(jobId, "inference_usage_recorded", {
+          request,
+          observedTotalTokens: summary.observedUsage.totalTokens,
+          completeness: summary.completeness,
+        });
+      }
       await atomicWriteFile(
         join(dir, "artifacts", "inference-usage.json"),
-        `${JSON.stringify(ledger, null, 2)}\n`,
+        `${JSON.stringify(merged, null, 2)}\n`,
       );
       return next;
     } finally {

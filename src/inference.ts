@@ -8,6 +8,8 @@ import type { AddressInfo } from "node:net";
 import { createParser } from "eventsource-parser";
 import {
   InferenceRequestUsageSchema,
+  sameInferenceAccounting,
+  summarizeInferenceUsage,
   TokenUsageSchema,
   type InferenceRequestUsage,
   type InferenceUsageLedgerSnapshot,
@@ -131,33 +133,6 @@ export function parseTerminalUsageEvent(
   };
 }
 
-function sameAccountingRecord(
-  left: InferenceRequestUsage,
-  right: InferenceRequestUsage,
-): boolean {
-  return (
-    left.outcome === right.outcome &&
-    left.completeness === right.completeness &&
-    JSON.stringify(left.usage) === JSON.stringify(right.usage)
-  );
-}
-
-function sumOptionalUsageField(
-  records: InferenceRequestUsage[],
-  field: Exclude<keyof TokenUsage, "totalTokens">,
-): number | undefined {
-  const observed = records.filter((record) => record.usage);
-  if (
-    observed.length === 0 ||
-    observed.some((record) => record.usage?.[field] === undefined)
-  )
-    return undefined;
-  return observed.reduce(
-    (total, record) => total + (record.usage?.[field] ?? 0),
-    0,
-  );
-}
-
 export class InferenceUsageLedger {
   private readonly records = new Map<string, InferenceRequestUsage>();
 
@@ -170,7 +145,7 @@ export class InferenceUsageLedger {
     const record = InferenceRequestUsageSchema.parse(value);
     const existing = this.records.get(record.requestId);
     if (existing) {
-      if (sameAccountingRecord(existing, record)) return "duplicate";
+      if (sameInferenceAccounting(existing, record)) return "duplicate";
       throw new Error(
         `conflicting usage accounting for request ${record.requestId}`,
       );
@@ -181,53 +156,9 @@ export class InferenceUsageLedger {
 
   snapshot(): InferenceUsageLedgerSnapshot {
     const requests = [...this.records.values()];
-    const totalTokens = requests.reduce(
-      (total, record) => total + (record.usage?.totalTokens ?? 0),
-      0,
-    );
-    const optionalUsage = Object.fromEntries(
-      (
-        [
-          "inputTokens",
-          "cachedInputTokens",
-          "outputTokens",
-          "reasoningTokens",
-        ] as const
-      ).flatMap((field) => {
-        const value = sumOptionalUsageField(requests, field);
-        return value === undefined ? [] : [[field, value]];
-      }),
-    );
-    const requestCounts = {
-      total: requests.length,
-      complete: requests.filter((record) => record.completeness === "complete")
-        .length,
-      partial: requests.filter((record) => record.completeness === "partial")
-        .length,
-      unknown: requests.filter((record) => record.completeness === "unknown")
-        .length,
-    };
-    const completeness =
-      requestCounts.unknown > 0
-        ? "unknown"
-        : requestCounts.partial > 0
-          ? "partial"
-          : requests.length > 0
-            ? "complete"
-            : "unknown";
     return {
       requests,
-      observedUsage: { ...optionalUsage, totalTokens },
-      requestCounts,
-      completeness,
-      budget: {
-        tokenLimit: this.tokenLimit,
-        enforcement: "observed_admission_ceiling",
-        admission: totalTokens >= this.tokenLimit ? "exhausted" : "open",
-        singleResponseMayOvershoot: true,
-        hardOutputTokenLimit: "unsupported",
-        monetaryCost: "unavailable",
-      },
+      ...summarizeInferenceUsage(requests, this.tokenLimit),
     };
   }
 }
@@ -410,14 +341,6 @@ export class ProductionInferenceBroker {
       jsonError(response, 401, "invalid, expired, or revoked job token");
       return;
     }
-    if (
-      lease.ledger.snapshot().observedUsage.totalTokens >= lease.maxTokens ||
-      lease.active >= this.maxConcurrency
-    ) {
-      this.counters.rejectedRequests += 1;
-      jsonError(response, 429, "job inference budget or concurrency exceeded");
-      return;
-    }
     let raw: Buffer;
     try {
       raw = await readBounded(request, this.maxRequestBytes);
@@ -434,6 +357,19 @@ export class ProductionInferenceBroker {
       body = normalizeCodexResponsesBody(JSON.parse(raw.toString("utf8")));
     } catch {
       jsonError(response, 400, "invalid JSON request body");
+      return;
+    }
+    if (lease.revoked || Date.now() >= lease.expiresAt) {
+      this.counters.rejectedRequests += 1;
+      jsonError(response, 401, "invalid, expired, or revoked job token");
+      return;
+    }
+    if (
+      lease.ledger.snapshot().observedUsage.totalTokens >= lease.maxTokens ||
+      lease.active >= this.maxConcurrency
+    ) {
+      this.counters.rejectedRequests += 1;
+      jsonError(response, 429, "job inference budget or concurrency exceeded");
       return;
     }
     this.counters.sawHighReasoning ||=

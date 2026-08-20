@@ -52,6 +52,8 @@ async function fixture() {
     return {
       status: "running",
       secretToken: "must-not-render",
+      modelTokens: "must-not-render-model-token",
+      inputTokens: 424242,
       summary: "x".repeat(5000),
       inference: {
         observedUsage: {
@@ -208,6 +210,8 @@ describe("PrimeDispatchAdapter", () => {
         ),
     ).toEqual(["status", "steer", "cancel", "result"]);
     expect(JSON.stringify(status)).not.toContain("must-not-render");
+    expect(status.state.inputTokens).toBe("[redacted]");
+    expect(status.state.inference.observedUsage.inputTokens).toBe(75);
     expect(status.state.summary.length).toBeLessThanOrEqual(512);
     expect(status.presentation.blocks[0].text).toContain(
       "Observed tokens: 105 / 100 (partial)",

@@ -180,25 +180,134 @@ export const InferenceRequestUsageSchema = z.object({
 });
 export type InferenceRequestUsage = z.infer<typeof InferenceRequestUsageSchema>;
 
-export const InferenceUsageLedgerSchema = z.object({
-  requests: z.array(InferenceRequestUsageSchema),
-  observedUsage: TokenUsageSchema,
-  requestCounts: z.object({
-    total: TokenCountSchema,
-    complete: TokenCountSchema,
-    partial: TokenCountSchema,
-    unknown: TokenCountSchema,
-  }),
-  completeness: z.enum(["complete", "partial", "unknown"]),
-  budget: z.object({
-    tokenLimit: z.number().int().positive().safe(),
-    enforcement: z.literal("observed_admission_ceiling"),
-    admission: z.enum(["open", "exhausted"]),
-    singleResponseMayOvershoot: z.literal(true),
-    hardOutputTokenLimit: z.literal("unsupported"),
-    monetaryCost: z.literal("unavailable"),
-  }),
-});
+export function sameInferenceAccounting(
+  left: InferenceRequestUsage,
+  right: InferenceRequestUsage,
+): boolean {
+  return (
+    left.requestId === right.requestId &&
+    left.outcome === right.outcome &&
+    left.completeness === right.completeness &&
+    JSON.stringify(left.usage) === JSON.stringify(right.usage)
+  );
+}
+
+function sumOptionalUsageField(
+  records: InferenceRequestUsage[],
+  field: Exclude<keyof TokenUsage, "totalTokens">,
+): number | undefined {
+  const observed = records.filter((record) => record.usage);
+  if (
+    observed.length === 0 ||
+    observed.some((record) => record.usage?.[field] === undefined)
+  )
+    return undefined;
+  return observed.reduce(
+    (total, record) => total + (record.usage?.[field] ?? 0),
+    0,
+  );
+}
+
+export function summarizeInferenceUsage(
+  requests: InferenceRequestUsage[],
+  tokenLimit: number,
+) {
+  const totalTokens = requests.reduce(
+    (total, record) => total + (record.usage?.totalTokens ?? 0),
+    0,
+  );
+  const optionalUsage = Object.fromEntries(
+    (
+      [
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningTokens",
+      ] as const
+    ).flatMap((field) => {
+      const value = sumOptionalUsageField(requests, field);
+      return value === undefined ? [] : [[field, value]];
+    }),
+  );
+  const requestCounts = {
+    total: requests.length,
+    complete: requests.filter((record) => record.completeness === "complete")
+      .length,
+    partial: requests.filter((record) => record.completeness === "partial")
+      .length,
+    unknown: requests.filter((record) => record.completeness === "unknown")
+      .length,
+  };
+  const completeness =
+    requestCounts.unknown > 0
+      ? ("unknown" as const)
+      : requestCounts.partial > 0
+        ? ("partial" as const)
+        : requests.length > 0
+          ? ("complete" as const)
+          : ("unknown" as const);
+  return {
+    observedUsage: { ...optionalUsage, totalTokens },
+    requestCounts,
+    completeness,
+    budget: {
+      tokenLimit,
+      enforcement: "observed_admission_ceiling" as const,
+      admission:
+        totalTokens >= tokenLimit ? ("exhausted" as const) : ("open" as const),
+      singleResponseMayOvershoot: true as const,
+      hardOutputTokenLimit: "unsupported" as const,
+      monetaryCost: "unavailable" as const,
+    },
+  };
+}
+
+export const InferenceUsageLedgerSchema = z
+  .object({
+    requests: z.array(InferenceRequestUsageSchema),
+    observedUsage: TokenUsageSchema,
+    requestCounts: z.object({
+      total: TokenCountSchema,
+      complete: TokenCountSchema,
+      partial: TokenCountSchema,
+      unknown: TokenCountSchema,
+    }),
+    completeness: z.enum(["complete", "partial", "unknown"]),
+    budget: z.object({
+      tokenLimit: z.number().int().positive().safe(),
+      enforcement: z.literal("observed_admission_ceiling"),
+      admission: z.enum(["open", "exhausted"]),
+      singleResponseMayOvershoot: z.literal(true),
+      hardOutputTokenLimit: z.literal("unsupported"),
+      monetaryCost: z.literal("unavailable"),
+    }),
+  })
+  .superRefine((ledger, context) => {
+    if (
+      new Set(ledger.requests.map((request) => request.requestId)).size !==
+      ledger.requests.length
+    )
+      context.addIssue({
+        code: "custom",
+        message: "inference usage request ids must be unique",
+      });
+    const expected = summarizeInferenceUsage(
+      ledger.requests,
+      ledger.budget.tokenLimit,
+    );
+    if (
+      JSON.stringify({
+        observedUsage: ledger.observedUsage,
+        requestCounts: ledger.requestCounts,
+        completeness: ledger.completeness,
+        budget: ledger.budget,
+      }) !== JSON.stringify(expected)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "inference usage ledger summary is inconsistent",
+      });
+  });
 export type InferenceUsageLedgerSnapshot = z.infer<
   typeof InferenceUsageLedgerSchema
 >;

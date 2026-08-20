@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  InferenceUsageLedgerSchema,
   JobStateSchema,
   PrimeStartInputSchema,
   WorkerCommandSchema,
@@ -80,6 +81,45 @@ test("state snapshots reject unknown schema versions and invalid revisions", () 
   assert.doesNotThrow(() => JobStateSchema.parse(base));
   assert.throws(() => JobStateSchema.parse({ ...base, schemaVersion: 2 }));
   assert.throws(() => JobStateSchema.parse({ ...base, revision: -1 }));
+});
+
+test("inference ledgers reject inconsistent summaries and duplicate request ids", () => {
+  const request = {
+    requestId: "resp_schema",
+    outcome: "completed",
+    completeness: "complete",
+    usage: { totalTokens: 10 },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  };
+  const valid = {
+    requests: [request],
+    observedUsage: { totalTokens: 10 },
+    requestCounts: { total: 1, complete: 1, partial: 0, unknown: 0 },
+    completeness: "complete",
+    budget: {
+      tokenLimit: 100,
+      enforcement: "observed_admission_ceiling",
+      admission: "open",
+      singleResponseMayOvershoot: true,
+      hardOutputTokenLimit: "unsupported",
+      monetaryCost: "unavailable",
+    },
+  };
+  assert.doesNotThrow(() => InferenceUsageLedgerSchema.parse(valid));
+  assert.throws(() =>
+    InferenceUsageLedgerSchema.parse({
+      ...valid,
+      observedUsage: { totalTokens: 9 },
+    }),
+  );
+  assert.throws(() =>
+    InferenceUsageLedgerSchema.parse({
+      ...valid,
+      requests: [request, request],
+      requestCounts: { ...valid.requestCounts, total: 2, complete: 2 },
+      observedUsage: { totalTokens: 20 },
+    }),
+  );
 });
 
 test("worker IPC accepts only status, steer, and cancel operations", () => {

@@ -544,34 +544,53 @@ function stringField(record: Record<string, any>, key: string): string {
   return value;
 }
 
-const SAFE_USAGE_KEYS = new Set([
-  "inputTokens",
-  "cachedInputTokens",
-  "outputTokens",
-  "reasoningTokens",
-  "totalTokens",
-  "maxTokens",
-  "modelTokens",
-  "tokenLimit",
-  "hardOutputTokenLimit",
+const SAFE_NUMERIC_USAGE_PATHS = new Set([
+  "budgets.maxTokens",
+  "inference.observedUsage.inputTokens",
+  "inference.observedUsage.cachedInputTokens",
+  "inference.observedUsage.outputTokens",
+  "inference.observedUsage.reasoningTokens",
+  "inference.observedUsage.totalTokens",
+  "inference.budget.tokenLimit",
 ]);
 
-function sanitize(value: unknown, maxChars: number, key = ""): unknown {
+function isSafeUsageValue(path: string[], value: unknown): boolean {
+  const field = path.join(".");
+  if (SAFE_NUMERIC_USAGE_PATHS.has(field))
+    return (
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    );
+  if (field === "budgetSemantics.modelTokens")
+    return value === "observed_admission_ceiling";
   if (
-    !SAFE_USAGE_KEYS.has(key) &&
+    field === "budgetSemantics.hardOutputTokenLimit" ||
+    field === "inference.budget.hardOutputTokenLimit"
+  )
+    return value === "unsupported";
+  return false;
+}
+
+function sanitize(
+  value: unknown,
+  maxChars: number,
+  path: string[] = [],
+): unknown {
+  const key = path.at(-1) ?? "";
+  if (
+    !isSafeUsageValue(path, value) &&
     /secret|token|password|credential|nonce|authorization/i.test(key)
   )
     return "[redacted]";
   if (typeof value === "string") return value.slice(0, maxChars);
   if (Array.isArray(value))
-    return value.slice(0, 50).map((item) => sanitize(item, maxChars));
+    return value.slice(0, 50).map((item) => sanitize(item, maxChars, path));
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value)
         .slice(0, 100)
         .map(([childKey, child]) => [
           childKey,
-          sanitize(child, maxChars, childKey),
+          sanitize(child, maxChars, [...path, childKey]),
         ]),
     );
   return value;
