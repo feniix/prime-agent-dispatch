@@ -39,6 +39,13 @@ test("output ceilings never split a UTF-8 character or exceed the byte limit", a
   );
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, /�/);
   assert.equal(truncateUtf8("😀😀", 5), "😀");
+
+  const partial = await runCommand(
+    process.execPath,
+    ["-e", "process.stdout.write('😀')"],
+    { maxOutputBytes: 3 },
+  );
+  assert.equal(partial.stdout, "");
 });
 
 test("spawn errors reject instead of producing a false command result", async () => {

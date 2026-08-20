@@ -30,6 +30,7 @@ import {
 } from "./schemas.js";
 import { assertTransition } from "./state-machine.js";
 import { readProcessStartIdentity } from "./worker-identity.js";
+import { acquireProcessReclaimGuard } from "./process-lock.js";
 
 const LOCK_STALE_MS = 30_000;
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
@@ -104,12 +105,11 @@ async function reclaimStaleLock(
   ownerPath: string,
 ): Promise<boolean> {
   const reclaimDir = join(jobDir, ".lock-reclaim");
-  try {
-    await mkdir(reclaimDir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw error;
-  }
+  const releaseReclaim = await acquireProcessReclaimGuard(
+    reclaimDir,
+    LOCK_STALE_MS,
+  );
+  if (!releaseReclaim) return false;
   try {
     let stale = false;
     try {
@@ -137,7 +137,7 @@ async function reclaimStaleLock(
     await rm(abandoned, { recursive: true, force: true });
     return true;
   } finally {
-    await rm(reclaimDir, { recursive: true, force: true });
+    await releaseReclaim();
   }
 }
 

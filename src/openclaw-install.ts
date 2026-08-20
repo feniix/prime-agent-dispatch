@@ -18,6 +18,7 @@ import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
 import { readProcessStartIdentity } from "./worker-identity.js";
+import { acquireProcessReclaimGuard } from "./process-lock.js";
 
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
@@ -789,12 +790,11 @@ async function reclaimStaleInstallLock(
   layout: OpenClawInstallLayout,
 ): Promise<boolean> {
   const reclaimPath = `${layout.lockPath}.reclaim`;
-  try {
-    await mkdir(reclaimPath, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw error;
-  }
+  const releaseReclaim = await acquireProcessReclaimGuard(
+    reclaimPath,
+    INSTALL_LOCK_STALE_MS,
+  );
+  if (!releaseReclaim) return false;
   try {
     const owner = await readInstallLockOwner(layout.lockPath).catch(
       () => undefined,
@@ -829,7 +829,7 @@ async function reclaimStaleInstallLock(
     await rm(abandoned, { recursive: true, force: true });
     return true;
   } finally {
-    await rm(reclaimPath, { recursive: true, force: true });
+    await releaseReclaim();
   }
 }
 
@@ -952,16 +952,17 @@ async function digestPreparedReleaseSource(
 
 async function digestPublishedRelease(releaseRoot: string): Promise<string> {
   const hash = createHash("sha256");
+  const canonicalReleaseRoot = await realpath(releaseRoot);
   await digestPublishedPath(
     join(releaseRoot, "runtime"),
     "runtime",
-    releaseRoot,
+    canonicalReleaseRoot,
     hash,
   );
   await digestPublishedPath(
     join(releaseRoot, "plugin"),
     "plugin",
-    releaseRoot,
+    canonicalReleaseRoot,
     hash,
   );
   return hash.digest("hex");
@@ -976,8 +977,8 @@ async function digestPublishedPath(
   const value = await lstat(path);
   if (value.isSymbolicLink()) {
     const target = await readlink(path);
-    const resolvedTarget = resolve(dirname(path), target);
-    if (!isWithin(releaseRoot, resolvedTarget))
+    const canonicalTarget = await realpath(path).catch(() => undefined);
+    if (!canonicalTarget || !isWithin(releaseRoot, canonicalTarget))
       throw new Error(`release symlink escapes ${releaseRoot}: ${path}`);
     hash.update(`l:${relativePath}\0${target}\0`);
     return;

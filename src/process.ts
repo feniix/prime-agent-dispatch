@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 type CommandResult = {
   exitCode: number | null;
@@ -24,7 +25,7 @@ export function truncateUtf8(value: string, maxBytes: number): string {
 }
 
 function decodeCapturedOutput(value: Buffer<ArrayBufferLike>): string {
-  return truncateUtf8(value.toString("utf8"), value.length);
+  return new StringDecoder("utf8").write(value);
 }
 
 export async function runCommand(

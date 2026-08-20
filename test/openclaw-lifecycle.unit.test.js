@@ -636,6 +636,79 @@ test("reclaims an abandoned lifecycle lock after PID reuse", async () => {
   }
 });
 
+test("reclaims an abandoned lifecycle reclaim guard after PID reuse", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    const layout = openClawLayout(openclawStateDir);
+    for (const [path, nonce] of [
+      [layout.lockPath, "abandoned-lock"],
+      [`${layout.lockPath}.reclaim`, "abandoned-reclaimer"],
+    ]) {
+      await mkdir(path, { recursive: true });
+      await writeJson(join(path, "owner.json"), {
+        pid: process.pid,
+        processStartIdentity: "reused-process-identity",
+        createdAtMs: 0,
+        nonce,
+      });
+    }
+
+    const result = await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    assert.equal(result.currentRelease, "release-1");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects published symlinks that escape through another release symlink", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    const outside = join(root, "outside");
+    await writeFile(outside, "foreign\n");
+    const installDependencies = dependencies.installProductionDependencies;
+    dependencies.installProductionDependencies = async (path) => {
+      await installDependencies(path);
+      if (path.endsWith(`${path.includes("\\") ? "\\" : "/"}runtime`)) {
+        await symlink(outside, join(dirname(path), "escape"));
+        await symlink(
+          "../../escape",
+          join(path, "node_modules", "chained-escape"),
+        );
+      }
+    };
+
+    await assert.rejects(
+      () =>
+        installOpenClaw(
+          {
+            openclawStateDir,
+            sourceRoot,
+            hostConfigSource,
+            releaseId: "release-1",
+          },
+          dependencies,
+        ),
+      /release symlink escapes/,
+    );
+    assert.equal(
+      await pathExists(openClawLayout(openclawStateDir).currentLink),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("uninstalls the integration while preserving durable evidence and audits permissions", async () => {
   const {
     root,
