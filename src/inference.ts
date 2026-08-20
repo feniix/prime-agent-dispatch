@@ -30,6 +30,7 @@ type LeaseState = {
   expiresAt: number;
   maxTokens: number;
   ledger: InferenceUsageLedger;
+  persistedUsageIds: Set<string>;
   active: number;
   revoked: boolean;
   controllers: Set<AbortController>;
@@ -266,6 +267,7 @@ export class ProductionInferenceBroker {
       expiresAt: Date.now() + budget.wallClockMs,
       maxTokens,
       ledger: new InferenceUsageLedger(maxTokens),
+      persistedUsageIds: new Set(),
       active: 0,
       revoked: false,
       controllers: new Set(),
@@ -390,16 +392,29 @@ export class ProductionInferenceBroker {
         ...record,
         finalizedAt: new Date().toISOString(),
       });
-      if (lease.ledger.record(finalized) === "recorded") {
+      lease.ledger.record(finalized);
+      if (
+        this.options.onUsageFinalized &&
+        !lease.persistedUsageIds.has(finalized.requestId)
+      ) {
         try {
-          await this.options.onUsageFinalized?.(
+          await this.options.onUsageFinalized(
             finalized,
             lease.ledger.snapshot(),
           );
+          lease.persistedUsageIds.add(finalized.requestId);
         } catch (error) {
           this.counters.usagePersistenceFailures += 1;
           throw error;
         }
+      }
+    };
+    const terminalRecords: ParsedTerminalUsage[] = [];
+    let nextTerminalRecord = 0;
+    const flushTerminalRecords = async (): Promise<void> => {
+      while (nextTerminalRecord < terminalRecords.length) {
+        await recordUsage(terminalRecords[nextTerminalRecord]!);
+        nextTerminalRecord += 1;
       }
     };
     try {
@@ -433,7 +448,6 @@ export class ProductionInferenceBroker {
       response.writeHead(upstream.status, { "content-type": contentType });
       this.counters.sawStreamingResponse ||= parseEvents;
       const reader = upstream.body.getReader();
-      const terminalRecords: ParsedTerminalUsage[] = [];
       let parserError: Error | undefined;
       const decoder = parseEvents ? new TextDecoder() : undefined;
       const parser = parseEvents
@@ -471,16 +485,16 @@ export class ProductionInferenceBroker {
         if (parser && decoder) {
           parser.feed(decoder.decode(value, { stream: true }));
           if (parserError) throw parserError;
+          await flushTerminalRecords();
         }
       }
       if (parser && decoder) {
         parser.feed(decoder.decode());
         parser.reset({ consume: true });
         if (parserError) throw parserError;
+        await flushTerminalRecords();
       }
-      if (terminalRecords.length > 0) {
-        for (const record of terminalRecords) await recordUsage(record);
-      } else {
+      if (terminalRecords.length === 0) {
         await recordUsage({
           requestId: attemptId,
           outcome: upstream.ok ? "transport_error" : "failed",
@@ -489,6 +503,13 @@ export class ProductionInferenceBroker {
       }
       response.end();
     } catch (error) {
+      if (!accountingAttempted && terminalRecords.length > nextTerminalRecord) {
+        try {
+          await flushTerminalRecords();
+        } catch {
+          // recordUsage already counted persistence failures.
+        }
+      }
       if (!accountingAttempted) {
         try {
           await recordUsage({

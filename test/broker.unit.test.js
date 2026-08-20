@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { ProductionInferenceBroker } from "../dist/index.js";
 
 async function upstream(handler) {
@@ -34,6 +34,33 @@ async function settleWithin(promise, description, timeoutMs = 2_000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function brokerPost(url, token) {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      url,
+      {
+        method: "POST",
+        agent: false,
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => (body += chunk));
+        response.once("end", () =>
+          resolve({ status: response.statusCode, body }),
+        );
+        response.once("error", reject);
+      },
+    );
+    request.once("error", reject);
+    request.end("{}");
+  });
 }
 
 test("broker authorizes scoped token and pins normalized Responses body", async () => {
@@ -229,6 +256,94 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
   } finally {
     await lease.revoke().catch(() => undefined);
     await pending?.catch(() => undefined);
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("revocation preserves a parsed terminal usage event before upstream EOF", async () => {
+  const terminalSent = deferred();
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_before_eof","usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n',
+    );
+    terminalSent.resolve();
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+  });
+  const lease = await broker.createLease("terminal-before-eof", {
+    wallClockMs: 5_000,
+    maxTokens: 100,
+  });
+  let reader;
+  try {
+    const response = await fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    });
+    reader = response.body.getReader();
+    await settleWithin(terminalSent.promise, "the terminal event to be sent");
+    await settleWithin(reader.read(), "the terminal event to be forwarded");
+    await lease.revoke();
+    assert.deepEqual(lease.usage().requests, [
+      {
+        requestId: "resp_before_eof",
+        outcome: "completed",
+        completeness: "complete",
+        usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+        finalizedAt: lease.usage().requests[0].finalizedAt,
+      },
+    ]);
+    assert.equal(lease.usage().observedUsage.totalTokens, 10);
+  } finally {
+    await reader?.cancel().catch(() => undefined);
+    await lease.revoke().catch(() => undefined);
+    await broker.close();
+    await fake.close();
+  }
+});
+
+test("a replay retries usage persistence after a transient callback failure", async () => {
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_persistence_retry","usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n',
+    );
+  });
+  let persistenceAttempts = 0;
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+    onUsageFinalized: async () => {
+      persistenceAttempts += 1;
+      if (persistenceAttempts === 1)
+        throw new Error("transient persistence failure");
+    },
+  });
+  const lease = await broker.createLease("persistence-retry", {
+    wallClockMs: 5_000,
+    maxTokens: 100,
+  });
+  try {
+    await assert.rejects(() =>
+      brokerPost(new URL("responses", lease.endpoint), lease.opaqueToken),
+    );
+    const replay = await brokerPost(
+      new URL("responses", lease.endpoint),
+      lease.opaqueToken,
+    );
+    assert.equal(replay.status, 200);
+    assert.equal(persistenceAttempts, 2);
+    assert.equal(broker.stats().usagePersistenceFailures, 1);
+    assert.equal(lease.usage().requests.length, 1);
+  } finally {
+    await lease.revoke().catch(() => undefined);
     await broker.close();
     await fake.close();
   }
