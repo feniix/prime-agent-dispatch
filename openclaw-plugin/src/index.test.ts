@@ -8,12 +8,12 @@ import plugin, {
 import { confirmationContextHash } from "./adapter.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
-  it("keeps preview and command context equal for the same Discord conversation", () => {
+  it("keeps preview and OpenClaw 2026.7.1 command hashes equal for the same Discord conversation", () => {
     const previewContext = trustedContext({
       requesterSenderId: "owner-1",
       senderIsOwner: true,
       messageChannel: "discord",
-      sessionId: "session-1",
+      sessionId: "preview-session",
       deliveryContext: {
         channel: "discord",
         to: "channel:thread-1",
@@ -25,13 +25,17 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       senderId: "owner-1",
       senderIsOwner: true,
       channel: "discord",
-      channelId: "discord",
-      to: "channel:thread-1",
+      channelId: "thread-1",
+      to: "slash:owner-1",
       accountId: "default",
-      sessionId: "session-1",
+      messageThreadId: "thread-1",
+      sessionId: "command-session",
     } as any);
 
-    expect(commandContext).toEqual(previewContext);
+    expect(commandContext).toMatchObject({
+      to: "channel:thread-1",
+      threadId: "thread-1",
+    });
     expect(confirmationContextHash(commandContext)).toBe(
       confirmationContextHash(previewContext),
     );
@@ -59,13 +63,13 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     });
   });
 
-  it("does not synthesize a delivery target from channelId", () => {
+  it("fails closed when a Discord command has no conversation target", () => {
     expect(
       trustedCommandContext({
         senderId: "owner-1",
         senderIsOwner: true,
         channel: "discord",
-        channelId: "discord",
+        to: "slash:owner-1",
       } as any),
     ).not.toHaveProperty("to");
   });

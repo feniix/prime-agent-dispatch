@@ -389,6 +389,7 @@ type TrustedContextProjection = {
   senderIsOwner?: boolean | undefined;
   channel?: string | undefined;
   to?: string | undefined;
+  channelId?: string | number | undefined;
   accountId?: string | undefined;
   threadId?: string | number | undefined;
   deliveryId?: string | undefined;
@@ -399,7 +400,11 @@ export function normalizeTrustedContext(
 ): TrustedToolContext {
   const senderId = normalizedString(context.senderId);
   const channel = normalizedString(context.channel);
-  const to = normalizedString(context.to);
+  const to = trustedDeliveryTarget(
+    channel,
+    normalizedString(context.to),
+    normalizedString(context.channelId),
+  );
   const accountId = normalizedString(context.accountId);
   const explicitThreadId = normalizedString(context.threadId);
   const threadId =
@@ -424,6 +429,17 @@ function normalizedString(
   if (value === undefined) return undefined;
   const normalized = String(value).trim();
   return normalized || undefined;
+}
+
+function trustedDeliveryTarget(
+  channel: string | undefined,
+  to: string | undefined,
+  channelId: string | undefined,
+): string | undefined {
+  if (channel !== "discord") return to ?? channelId;
+  if (to && !to.startsWith("slash:")) return to;
+  if (!channelId) return undefined;
+  return channelId.startsWith("channel:") ? channelId : `channel:${channelId}`;
 }
 
 function discordConversationIdFromTarget(
@@ -457,6 +473,7 @@ export function trustedCommandContext(
     senderIsOwner: context.senderIsOwner,
     channel: context.channel,
     to: context.to,
+    channelId: context.channelId,
     accountId: context.accountId,
     threadId: context.messageThreadId,
     deliveryId: context.sessionId,
