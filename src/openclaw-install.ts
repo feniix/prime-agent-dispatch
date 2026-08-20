@@ -242,7 +242,11 @@ export async function installOpenClaw(
       )) &&
       isDeepStrictEqual(snapshot.entry, desiredEntry) &&
       snapshot.allow.includes(PLUGIN_ID) &&
-      (await hostConfigMatches(options.hostConfigSource, layout.hostConfigPath))
+      (await hostConfigMatches(
+        options.hostConfigSource,
+        layout.hostConfigPath,
+      )) &&
+      rollbackReferenceIsVerified(existingManifest)
     ) {
       return {
         changed: false,
@@ -293,16 +297,15 @@ export async function installOpenClaw(
       await dependencies.validateConfig();
 
       const now = dependencies.now().toISOString();
+      const previousRelease = selectVerifiedRollbackRelease(
+        existingManifest,
+        releaseId,
+      );
       manifest = {
         schemaVersion: INSTALL_SCHEMA_VERSION,
         active: true,
         currentRelease: releaseId,
-        ...(existingManifest?.currentRelease &&
-        existingManifest.currentRelease !== releaseId
-          ? { previousRelease: existingManifest.currentRelease }
-          : existingManifest?.previousRelease
-            ? { previousRelease: existingManifest.previousRelease }
-            : {}),
+        ...(previousRelease ? { previousRelease } : {}),
         installedAt: existingManifest?.installedAt ?? now,
         updatedAt: now,
         releases: upsertRelease(
@@ -580,12 +583,20 @@ export async function auditOpenClawInstall(
         return undefined;
       },
     );
-    if (!release.publishedDigest || !metadata?.publishedDigest)
+    const rollbackEligible =
+      release.id === manifest.currentRelease ||
+      release.id === manifest.previousRelease;
+    if (
+      rollbackEligible &&
+      (!release.publishedDigest || !metadata?.publishedDigest)
+    )
       violations.push(
         `published content digest is missing from release metadata: ${releaseRoot}`,
       );
     else if (
       publishedDigest &&
+      release.publishedDigest &&
+      metadata?.publishedDigest &&
       (publishedDigest !== release.publishedDigest ||
         publishedDigest !== metadata.publishedDigest)
     )
@@ -1298,6 +1309,40 @@ function upsertRelease(
     );
   }
   return [...releases, { id, sourceDigest, publishedDigest, installedAt }];
+}
+
+function selectVerifiedRollbackRelease(
+  manifest: InstallManifest | undefined,
+  nextRelease: string,
+): string | undefined {
+  if (!manifest) return undefined;
+  for (const candidate of [manifest.currentRelease, manifest.previousRelease]) {
+    if (
+      candidate &&
+      candidate !== nextRelease &&
+      releaseHasPublishedDigest(manifest, candidate)
+    )
+      return candidate;
+  }
+  return undefined;
+}
+
+function rollbackReferenceIsVerified(
+  manifest: InstallManifest | undefined,
+): boolean {
+  return (
+    !manifest?.previousRelease ||
+    releaseHasPublishedDigest(manifest, manifest.previousRelease)
+  );
+}
+
+function releaseHasPublishedDigest(
+  manifest: InstallManifest,
+  releaseId: string,
+): boolean {
+  return manifest.releases.some(
+    (release) => release.id === releaseId && Boolean(release.publishedDigest),
+  );
 }
 
 function validateReleaseId(value: string): void {

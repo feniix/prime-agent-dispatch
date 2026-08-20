@@ -83,6 +83,12 @@ Rerunning an identical install is a no-op. Reusing a release id for different
 source content is rejected. A changed plugin setting or host policy is applied
 without rebuilding an unchanged release.
 
+An upgrade preserves releases created before published-tree digests were
+recorded, but does not retain them as rollback targets. Their source remains
+inspectable evidence; only releases with a previously recorded published digest
+are eligible for activation by rollback. Rerunning install also repairs a stale
+legacy rollback pointer left by an interrupted or older upgrade.
+
 ## Verify, roll back, and uninstall
 
 ```bash

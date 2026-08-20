@@ -887,6 +887,88 @@ test("refuses to roll back to a release whose published content changed", async 
   }
 });
 
+test("retires an unverified legacy release during upgrade", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    const manifest = JSON.parse(
+      await readFile(layout.installManifestPath, "utf8"),
+    );
+    const metadataPath = join(layout.releasesRoot, "release-1", "release.json");
+    const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+    delete manifest.releases[0].publishedDigest;
+    delete metadata.publishedDigest;
+    await writeJson(layout.installManifestPath, manifest);
+    await writeJson(metadataPath, metadata);
+    assert.match(
+      (await auditOpenClawInstall(openclawStateDir)).join("\n"),
+      /published content digest is missing from release metadata/,
+    );
+
+    await writeSource(sourceRoot, "two");
+    const upgraded = await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-2",
+      },
+      dependencies,
+    );
+
+    assert.equal(upgraded.currentRelease, "release-2");
+    assert.equal(upgraded.previousRelease, undefined);
+    const upgradedManifest = JSON.parse(
+      await readFile(layout.installManifestPath, "utf8"),
+    );
+    assert.equal(upgradedManifest.previousRelease, undefined);
+    assert.equal(
+      upgradedManifest.releases.find(({ id }) => id === "release-1")
+        .publishedDigest,
+      undefined,
+    );
+    assert.equal((await auditOpenClawInstall(openclawStateDir)).length, 0);
+
+    upgradedManifest.previousRelease = "release-1";
+    await writeJson(layout.installManifestPath, upgradedManifest);
+    const dependencyInstalls = dependencies.calls.dependencies.length;
+    const repaired = await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-2",
+      },
+      dependencies,
+    );
+    assert.equal(repaired.changed, true);
+    assert.equal(repaired.previousRelease, undefined);
+    assert.equal(dependencies.calls.dependencies.length, dependencyInstalls);
+    assert.equal(
+      JSON.parse(await readFile(layout.installManifestPath, "utf8"))
+        .previousRelease,
+      undefined,
+    );
+    assert.equal((await auditOpenClawInstall(openclawStateDir)).length, 0);
+    await assert.rejects(
+      () => rollbackOpenClaw({ openclawStateDir }, dependencies),
+      /no previous Prime Dispatch release is available/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("audits installed production dependency content", async () => {
   const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
     await fixture();
