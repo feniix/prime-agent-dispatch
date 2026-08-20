@@ -20,7 +20,25 @@ import type { ResolvedRepository } from "./repository.js";
 import {
   verifyWorkerIdentity,
   workerIdentityFromState,
+  type WorkerVerification,
 } from "./worker-identity.js";
+
+type VerifyWorkerIdentity = (
+  identity: NonNullable<ReturnType<typeof workerIdentityFromState>>,
+) => Promise<WorkerVerification>;
+
+export async function workerStartupIsConfirmed(
+  state: JobState,
+  expectedPid: number,
+  expectedNonce: string,
+  verify: VerifyWorkerIdentity = verifyWorkerIdentity,
+): Promise<boolean> {
+  const identity = workerIdentityFromState(state);
+  if (identity?.pid !== expectedPid || identity.nonce !== expectedNonce)
+    return false;
+  if (terminalStatuses.has(state.status)) return true;
+  return (await verify(identity)).status === "verified";
+}
 
 function createJobId(): string {
   return `${new Date()
@@ -125,13 +143,12 @@ export class PrimeDispatcher {
       if (!child.pid)
         throw new Error("job worker did not receive a process id");
       const startupDeadline = Date.now() + 5_000;
+      let startupConfirmed = false;
       while (Date.now() < startupDeadline) {
         const current = await this.store.readState(jobId);
-        const identity = workerIdentityFromState(current);
-        if (identity?.pid === child.pid && identity.nonce === workerNonce) {
-          if (terminalStatuses.has(current.status)) break;
-          if ((await verifyWorkerIdentity(identity)).status === "verified")
-            break;
+        if (await workerStartupIsConfirmed(current, child.pid, workerNonce)) {
+          startupConfirmed = true;
+          break;
         }
         if (spawnError) throw spawnError;
         if (child.exitCode !== null)
@@ -140,16 +157,7 @@ export class PrimeDispatcher {
           );
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      const started = await this.store.readState(jobId);
-      const startedIdentity = workerIdentityFromState(started);
-      const startedIdentityMatches =
-        startedIdentity?.pid === child.pid &&
-        startedIdentity.nonce === workerNonce;
-      if (
-        !startedIdentityMatches ||
-        (!terminalStatuses.has(started.status) &&
-          (await verifyWorkerIdentity(startedIdentity)).status !== "verified")
-      ) {
+      if (!startupConfirmed) {
         try {
           if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
           else child.kill("SIGKILL");
