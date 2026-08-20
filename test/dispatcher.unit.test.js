@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { workerStartupIsConfirmed } from "../dist/dispatcher.js";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  PrimeDispatcher,
+  workerStartupIsConfirmed,
+} from "../dist/dispatcher.js";
 
 const identity = {
   jobId: "job-1",
@@ -68,4 +74,23 @@ test("startup rejects state written by a different worker", async () => {
     ),
     false,
   );
+});
+
+test("reconciliation isolates a corrupt job instead of aborting the control plane", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-dispatch-reconcile-"));
+  try {
+    const jobId = "000-corrupt";
+    await mkdir(join(root, "jobs", jobId), { recursive: true });
+    await writeFile(join(root, "jobs", jobId, "state.json"), "{broken\n");
+
+    const dispatcher = new PrimeDispatcher(root);
+    const results = await dispatcher.reconcileNonterminalJobs();
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].jobId, jobId);
+    assert.match(results[0].error, /JSON|position|property/i);
+    assert.deepEqual(await dispatcher.store.listJobIds(), [jobId]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

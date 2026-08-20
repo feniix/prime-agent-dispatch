@@ -313,9 +313,9 @@ export class PrimeDispatcher {
       error?: string;
     }> = [];
     for (const jobId of await this.store.listJobIds()) {
-      const current = await this.store.readState(jobId);
-      if (terminalStatuses.has(current.status)) continue;
       try {
+        const current = await this.store.readState(jobId);
+        if (terminalStatuses.has(current.status)) continue;
         results.push({ jobId, state: (await this.status(jobId)) as JobState });
       } catch (error) {
         results.push({
