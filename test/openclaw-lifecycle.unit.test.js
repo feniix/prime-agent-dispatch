@@ -771,6 +771,88 @@ test("audits released source content instead of trusting release metadata", asyn
   }
 });
 
+test("refuses to roll back to a release whose published content changed", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    await writeSource(sourceRoot, "two");
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-2",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    await writeFile(
+      join(
+        layout.releasesRoot,
+        "release-1",
+        "plugin",
+        "dist",
+        "index.js",
+      ),
+      "// tampered\n",
+    );
+
+    await assert.rejects(
+      () => rollbackOpenClaw({ openclawStateDir }, dependencies),
+      /release release-1 failed published-content verification/,
+    );
+    assert.equal(
+      await readlink(layout.currentLink),
+      join("releases", "release-2"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audits installed production dependency content", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    await writeFile(
+      join(
+        layout.releasesRoot,
+        "release-1",
+        "runtime",
+        "node_modules",
+        ".installed",
+      ),
+      "tampered\n",
+    );
+
+    assert.match(
+      (await auditOpenClawInstall(openclawStateDir)).join("\n"),
+      /published content digest does not match release metadata/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects traversal release ids in a tampered install manifest", async () => {
   const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
     await fixture();
