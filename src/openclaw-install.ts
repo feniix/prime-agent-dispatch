@@ -10,15 +10,13 @@ import {
   realpath,
   rename,
   rm,
-  stat,
   symlink,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
-import { readProcessStartIdentity } from "./worker-identity.js";
-import { acquireProcessReclaimGuard } from "./process-lock.js";
+import { acquireProcessDirectoryLock } from "./process-lock.js";
 
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
@@ -744,111 +742,15 @@ async function ensureRealDirectory(
   if (owned) await chmod(path, 0o700);
 }
 
-async function acquireInstallLock(
+function acquireInstallLock(
   layout: OpenClawInstallLayout,
 ): Promise<() => Promise<void>> {
-  const nonce = randomUUID();
-  const processStartIdentity = await readProcessStartIdentity(process.pid);
-  if (!processStartIdentity)
-    throw new Error("could not identify OpenClaw lifecycle process");
-  while (true) {
-    try {
-      await mkdir(layout.lockPath, { mode: 0o700 });
-      await atomicWriteFile(
-        join(layout.lockPath, "owner.json"),
-        `${JSON.stringify({
-          pid: process.pid,
-          processStartIdentity,
-          createdAtMs: Date.now(),
-          nonce,
-        })}\n`,
-      );
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (!(await reclaimStaleInstallLock(layout)))
-        throw new Error("Prime Dispatch OpenClaw lifecycle is already running");
-    }
-  }
-  return async () => {
-    const owner = await readInstallLockOwner(layout.lockPath).catch(
-      () => undefined,
-    );
-    if (owner?.nonce === nonce)
-      await rm(layout.lockPath, { recursive: true, force: true });
-  };
-}
-
-type InstallLockOwner = {
-  pid: number;
-  processStartIdentity: string;
-  createdAtMs: number;
-  nonce: string;
-};
-
-async function reclaimStaleInstallLock(
-  layout: OpenClawInstallLayout,
-): Promise<boolean> {
-  const reclaimPath = `${layout.lockPath}.reclaim`;
-  const releaseReclaim = await acquireProcessReclaimGuard(
-    reclaimPath,
-    INSTALL_LOCK_STALE_MS,
-  );
-  if (!releaseReclaim) return false;
-  try {
-    const owner = await readInstallLockOwner(layout.lockPath).catch(
-      () => undefined,
-    );
-    let stale: boolean;
-    if (owner) {
-      stale =
-        Date.now() - owner.createdAtMs > INSTALL_LOCK_STALE_MS &&
-        (await readProcessStartIdentity(owner.pid)) !==
-          owner.processStartIdentity;
-    } else {
-      const lockStat = await stat(layout.lockPath).catch(
-        (error: NodeJS.ErrnoException) => {
-          if (error.code === "ENOENT") return undefined;
-          throw error;
-        },
-      );
-      if (!lockStat) return true;
-      stale = Date.now() - lockStat.mtimeMs > INSTALL_LOCK_STALE_MS;
-    }
-    if (!stale) return false;
-    const abandoned = join(
-      layout.installRoot,
-      `.abandoned-install-lock-${randomUUID()}`,
-    );
-    try {
-      await rename(layout.lockPath, abandoned);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-      throw error;
-    }
-    await rm(abandoned, { recursive: true, force: true });
-    return true;
-  } finally {
-    await releaseReclaim();
-  }
-}
-
-async function readInstallLockOwner(path: string): Promise<InstallLockOwner> {
-  const value = JSON.parse(
-    await readFile(join(path, "owner.json"), "utf8"),
-  ) as Partial<InstallLockOwner>;
-  if (
-    !Number.isSafeInteger(value.pid) ||
-    (value.pid ?? 0) <= 0 ||
-    typeof value.processStartIdentity !== "string" ||
-    !value.processStartIdentity ||
-    typeof value.createdAtMs !== "number" ||
-    !Number.isFinite(value.createdAtMs) ||
-    typeof value.nonce !== "string" ||
-    !value.nonce
-  )
-    throw new Error("Prime Dispatch install lock owner is invalid");
-  return value as InstallLockOwner;
+  return acquireProcessDirectoryLock(layout.lockPath, {
+    staleMs: INSTALL_LOCK_STALE_MS,
+    timeoutMs: 0,
+    busyError: "Prime Dispatch OpenClaw lifecycle is already running",
+    identityError: "could not identify OpenClaw lifecycle process",
+  });
 }
 
 async function prepareRelease(

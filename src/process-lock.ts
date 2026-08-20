@@ -10,6 +10,14 @@ type ProcessLockOwner = {
   nonce: string;
 };
 
+type ProcessDirectoryLockOptions = {
+  staleMs: number;
+  timeoutMs: number;
+  reclaimPath?: string;
+  busyError: string;
+  identityError: string;
+};
+
 function isProcessLockOwner(value: unknown): value is ProcessLockOwner {
   const candidate = value as Partial<ProcessLockOwner>;
   return (
@@ -32,22 +40,64 @@ async function readOwner(path: string): Promise<ProcessLockOwner> {
   return value;
 }
 
+async function statIfPresent(path: string) {
+  return stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+}
+
+function createOwner(processStartIdentity: string): ProcessLockOwner {
+  return {
+    pid: process.pid,
+    processStartIdentity,
+    createdAtMs: Date.now(),
+    nonce: randomUUID(),
+  };
+}
+
+async function writeOwner(
+  path: string,
+  owner: ProcessLockOwner,
+): Promise<() => Promise<void>> {
+  try {
+    await writeFile(join(path, "owner.json"), JSON.stringify(owner), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch (error) {
+    await rm(path, { recursive: true, force: true });
+    throw error;
+  }
+  return async () => {
+    const current = await readOwner(path).catch(() => undefined);
+    if (current?.nonce === owner.nonce)
+      await rm(path, { recursive: true, force: true });
+  };
+}
+
+async function ownerIsStale(
+  owner: ProcessLockOwner | undefined,
+  fallbackMtimeMs: number,
+  staleMs: number,
+): Promise<boolean> {
+  if (!owner) return Date.now() - fallbackMtimeMs > staleMs;
+  return (
+    Date.now() - owner.createdAtMs > staleMs &&
+    (await readProcessStartIdentity(owner.pid)) !== owner.processStartIdentity
+  );
+}
+
 async function quarantineStaleGuard(
   path: string,
   staleMs: number,
 ): Promise<boolean> {
-  const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined;
-    throw error;
-  });
+  const info = await statIfPresent(path);
   if (!info) return true;
 
   const owner = await readOwner(path).catch(() => undefined);
-  const stale = owner
-    ? Date.now() - owner.createdAtMs > staleMs &&
-      (await readProcessStartIdentity(owner.pid)) !== owner.processStartIdentity
-    : Date.now() - info.mtimeMs > staleMs;
-  if (!stale) return false;
+  if (!(await ownerIsStale(owner, info.mtimeMs, staleMs))) return false;
 
   const identity = createHash("sha256")
     .update(
@@ -71,15 +121,11 @@ async function quarantineStaleGuard(
   }
 }
 
-export async function acquireProcessReclaimGuard(
+async function acquireProcessReclaimGuard(
   path: string,
   staleMs: number,
+  processStartIdentity: string,
 ): Promise<(() => Promise<void>) | undefined> {
-  const processStartIdentity = await readProcessStartIdentity(process.pid);
-  if (!processStartIdentity)
-    throw new Error("could not identify filesystem reclaim process");
-  const nonce = randomUUID();
-
   while (true) {
     try {
       await mkdir(path, { mode: 0o700 });
@@ -88,27 +134,63 @@ export async function acquireProcessReclaimGuard(
       if (!(await quarantineStaleGuard(path, staleMs))) return undefined;
       continue;
     }
+    return writeOwner(path, createOwner(processStartIdentity));
+  }
+}
 
+async function reclaimStaleDirectoryLock(
+  path: string,
+  options: ProcessDirectoryLockOptions,
+  processStartIdentity: string,
+): Promise<boolean> {
+  const releaseReclaim = await acquireProcessReclaimGuard(
+    options.reclaimPath ?? `${path}.reclaim`,
+    options.staleMs,
+    processStartIdentity,
+  );
+  if (!releaseReclaim) return false;
+  try {
+    const info = await statIfPresent(path);
+    if (!info) return true;
+    const owner = await readOwner(path).catch(() => undefined);
+    if (!(await ownerIsStale(owner, info.mtimeMs, options.staleMs)))
+      return false;
+
+    const abandoned = `${path}.abandoned-${randomUUID()}`;
     try {
-      await writeFile(
-        join(path, "owner.json"),
-        JSON.stringify({
-          pid: process.pid,
-          processStartIdentity,
-          createdAtMs: Date.now(),
-          nonce,
-        }),
-        { encoding: "utf8", mode: 0o600, flag: "wx" },
-      );
+      await rename(path, abandoned);
     } catch (error) {
-      await rm(path, { recursive: true, force: true });
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
       throw error;
     }
+    await rm(abandoned, { recursive: true, force: true });
+    return true;
+  } finally {
+    await releaseReclaim();
+  }
+}
 
-    return async () => {
-      const owner = await readOwner(path).catch(() => undefined);
-      if (owner?.nonce === nonce)
-        await rm(path, { recursive: true, force: true });
-    };
+export async function acquireProcessDirectoryLock(
+  path: string,
+  options: ProcessDirectoryLockOptions,
+): Promise<() => Promise<void>> {
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
+  if (!processStartIdentity) throw new Error(options.identityError);
+  const deadline = Date.now() + options.timeoutMs;
+
+  while (true) {
+    try {
+      await mkdir(path, { mode: 0o700 });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      if (await reclaimStaleDirectoryLock(path, options, processStartIdentity))
+        continue;
+      if (Date.now() >= deadline) throw new Error(options.busyError);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      continue;
+    }
+
+    return writeOwner(path, createOwner(processStartIdentity));
   }
 }

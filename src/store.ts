@@ -1,13 +1,4 @@
-import {
-  mkdir,
-  open,
-  readdir,
-  readFile,
-  rename,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -29,8 +20,7 @@ import {
   type JobStatus,
 } from "./schemas.js";
 import { assertTransition } from "./state-machine.js";
-import { readProcessStartIdentity } from "./worker-identity.js";
-import { acquireProcessReclaimGuard } from "./process-lock.js";
+import { acquireProcessDirectoryLock } from "./process-lock.js";
 
 const LOCK_STALE_MS = 30_000;
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
@@ -72,117 +62,17 @@ export async function atomicWriteFile(
   await fsyncDirectory(dirname(path));
 }
 
-type LockOwner = {
-  pid: number;
-  processStartIdentity: string;
-  createdAtMs: number;
-  nonce: string;
-};
-
-function isLockOwner(value: unknown): value is LockOwner {
-  const candidate = value as Partial<LockOwner>;
-  return (
-    Number.isSafeInteger(candidate?.pid) &&
-    (candidate.pid ?? 0) > 0 &&
-    typeof candidate.processStartIdentity === "string" &&
-    Boolean(candidate.processStartIdentity) &&
-    typeof candidate.createdAtMs === "number" &&
-    Number.isFinite(candidate.createdAtMs) &&
-    typeof candidate.nonce === "string" &&
-    Boolean(candidate.nonce)
-  );
-}
-
-async function readLockOwner(path: string): Promise<LockOwner> {
-  const value: unknown = JSON.parse(await readFile(path, "utf8"));
-  if (!isLockOwner(value)) throw new Error("invalid job lock owner");
-  return value;
-}
-
-async function reclaimStaleLock(
-  jobDir: string,
-  lockDir: string,
-  ownerPath: string,
-): Promise<boolean> {
-  const reclaimDir = join(jobDir, ".lock-reclaim");
-  const releaseReclaim = await acquireProcessReclaimGuard(
-    reclaimDir,
-    LOCK_STALE_MS,
-  );
-  if (!releaseReclaim) return false;
-  try {
-    let stale = false;
-    try {
-      const owner = await readLockOwner(ownerPath);
-      stale =
-        Date.now() - owner.createdAtMs > LOCK_STALE_MS &&
-        (await readProcessStartIdentity(owner.pid)) !==
-          owner.processStartIdentity;
-    } catch {
-      const info = await stat(lockDir).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      });
-      if (!info) return true;
-      stale = Date.now() - info.mtimeMs > LOCK_STALE_MS;
-    }
-    if (!stale) return false;
-    const abandoned = `${lockDir}.abandoned-${randomUUID()}`;
-    try {
-      await rename(lockDir, abandoned);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-      throw error;
-    }
-    await rm(abandoned, { recursive: true, force: true });
-    return true;
-  } finally {
-    await releaseReclaim();
-  }
-}
-
-async function acquireLock(
+function acquireLock(
   jobDir: string,
   timeoutMs = 5_000,
 ): Promise<() => Promise<void>> {
-  const lockDir = join(jobDir, ".lock");
-  const ownerPath = join(lockDir, "owner.json");
-  const deadline = Date.now() + timeoutMs;
-  const nonce = randomUUID();
-  const processStartIdentity = await readProcessStartIdentity(process.pid);
-  if (!processStartIdentity)
-    throw new Error("could not identify job lock owner process");
-  while (true) {
-    try {
-      await mkdir(lockDir);
-      const owner: LockOwner = {
-        pid: process.pid,
-        processStartIdentity,
-        createdAtMs: Date.now(),
-        nonce,
-      };
-      await writeFile(ownerPath, JSON.stringify(owner), {
-        encoding: "utf8",
-        mode: 0o600,
-        flag: "wx",
-      });
-      return async () => {
-        try {
-          const current = await readLockOwner(ownerPath);
-          if (current.nonce === nonce) await rm(lockDir, { recursive: true });
-        } catch {
-          // A crashed process may already have had its stale lock reclaimed.
-        }
-      };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
-      if (await reclaimStaleLock(jobDir, lockDir, ownerPath)) continue;
-      if (Date.now() >= deadline)
-        throw new Error(`timed out acquiring job lock: ${jobDir}`);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-  }
+  return acquireProcessDirectoryLock(join(jobDir, ".lock"), {
+    staleMs: LOCK_STALE_MS,
+    timeoutMs,
+    reclaimPath: join(jobDir, ".lock-reclaim"),
+    busyError: `timed out acquiring job lock: ${jobDir}`,
+    identityError: "could not identify job lock owner process",
+  });
 }
 
 export class JobStore {
