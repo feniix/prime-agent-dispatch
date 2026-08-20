@@ -8,6 +8,25 @@ type CommandResult = {
   aborted: boolean;
 };
 
+export function truncateUtf8(value: string, maxBytes: number): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0)
+    throw new Error("UTF-8 byte limit must be a nonnegative integer");
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let bytes = 0;
+  let result = "";
+  for (const character of value) {
+    const width = Buffer.byteLength(character, "utf8");
+    if (bytes + width > maxBytes) break;
+    result += character;
+    bytes += width;
+  }
+  return result;
+}
+
+function decodeCapturedOutput(value: Buffer<ArrayBufferLike>): string {
+  return truncateUtf8(value.toString("utf8"), value.length);
+}
+
 export async function runCommand(
   command: string,
   args: string[],
@@ -33,14 +52,17 @@ export async function runCommand(
     let aborted = false;
     let killTimer: NodeJS.Timeout | undefined;
     const max = options.maxOutputBytes ?? 1_000_000;
+    let capturedBytes = 0;
     const collect = (
       current: Buffer<ArrayBufferLike>,
       chunk: Buffer<ArrayBufferLike>,
     ): Buffer<ArrayBufferLike> => {
-      if (current.length >= max) return current;
+      if (capturedBytes >= max) return current;
+      const accepted = chunk.subarray(0, Math.max(0, max - capturedBytes));
+      capturedBytes += accepted.length;
       return Buffer.concat([
         current,
-        chunk.subarray(0, Math.max(0, max - current.length)),
+        accepted,
       ]);
     };
     child.stdout.on("data", (chunk: Buffer) => {
@@ -87,8 +109,8 @@ export async function runCommand(
       options.signal?.removeEventListener("abort", onAbort);
       resolve({
         exitCode,
-        stdout: stdout.toString("utf8"),
-        stderr: stderr.toString("utf8"),
+        stdout: decodeCapturedOutput(stdout),
+        stderr: decodeCapturedOutput(stderr),
         timedOut,
         aborted,
       });

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { JobRequest } from "./schemas.js";
 import { buildPrimeEnvironment } from "./policy.js";
 import { primeRpcLaunchArguments } from "./prime-runtime.js";
+import { truncateUtf8 } from "./process.js";
 
 export type AgentRunResult = {
   summary: string;
@@ -208,7 +209,10 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
               ? envelope.data.summary
               : (extractLastAssistantText(envelope.messages) ??
                 "Prime RPC run ended");
-        const summary = boundUtf8(unboundedSummary, this.maxTerminalFieldBytes);
+        const summary = truncateUtf8(
+          unboundedSummary,
+          this.maxTerminalFieldBytes,
+        );
         const metadata = boundMetadata(
           { ...(envelope.data ?? {}), turnsUsed: this.turnsUsed },
           this.maxTerminalFieldBytes,
@@ -293,13 +297,6 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
   }
-}
-
-function boundUtf8(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value, "utf8");
-  return bytes.length <= maxBytes
-    ? value
-    : bytes.subarray(0, maxBytes).toString("utf8");
 }
 
 function boundMetadata(

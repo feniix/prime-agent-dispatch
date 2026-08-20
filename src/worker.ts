@@ -15,7 +15,7 @@ import {
   type WorkerIdentity,
 } from "./schemas.js";
 import { terminalStatuses } from "./state-machine.js";
-import { git, runCommand } from "./process.js";
+import { git, runCommand, truncateUtf8 } from "./process.js";
 import { GlobalJobLease, type LeaseToken } from "./lease.js";
 import { ProductionInferenceBroker, type InferenceLease } from "./inference.js";
 import { resolveCodexSubscriptionAuth } from "./openclaw-auth.js";
@@ -239,7 +239,7 @@ async function capturePartialEvidence(
     await store.writeArtifact(
       jobId,
       "final.diff",
-      diff.slice(0, request.budget.maxOutputBytes),
+      truncateUtf8(diff, request.budget.maxOutputBytes),
     );
     return { noChanges: diff.length === 0 };
   } finally {
@@ -409,8 +409,8 @@ async function main(): Promise<void> {
         ok: command.exitCode === 0 && !command.timedOut && !command.aborted,
         exitCode: command.exitCode,
         timedOut: command.timedOut,
-        output: `${command.stdout}${command.stderr}`.slice(
-          0,
+        output: truncateUtf8(
+          `${command.stdout}${command.stderr}`,
           request.budget.maxOutputBytes,
         ),
       };
@@ -471,7 +471,7 @@ async function main(): Promise<void> {
     const diffArtifact = await store.writeArtifact(
       jobId,
       "final.diff",
-      diff.slice(0, request.budget.maxOutputBytes),
+      truncateUtf8(diff, request.budget.maxOutputBytes),
     );
     const report = [
       `# Prime dispatch result ${jobId}`,
