@@ -797,13 +797,7 @@ test("refuses to roll back to a release whose published content changed", async 
     );
     const layout = openClawLayout(openclawStateDir);
     await writeFile(
-      join(
-        layout.releasesRoot,
-        "release-1",
-        "plugin",
-        "dist",
-        "index.js",
-      ),
+      join(layout.releasesRoot, "release-1", "plugin", "dist", "index.js"),
       "// tampered\n",
     );
 

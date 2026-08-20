@@ -119,12 +119,10 @@ async function reclaimStaleLock(
         (await readProcessStartIdentity(owner.pid)) !==
           owner.processStartIdentity;
     } catch {
-      const info = await stat(lockDir).catch(
-        (error: NodeJS.ErrnoException) => {
-          if (error.code === "ENOENT") return undefined;
-          throw error;
-        },
-      );
+      const info = await stat(lockDir).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
       if (!info) return true;
       stale = Date.now() - info.mtimeMs > LOCK_STALE_MS;
     }

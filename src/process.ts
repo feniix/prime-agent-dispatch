@@ -60,10 +60,7 @@ export async function runCommand(
       if (capturedBytes >= max) return current;
       const accepted = chunk.subarray(0, Math.max(0, max - capturedBytes));
       capturedBytes += accepted.length;
-      return Buffer.concat([
-        current,
-        accepted,
-      ]);
+      return Buffer.concat([current, accepted]);
     };
     child.stdout.on("data", (chunk: Buffer) => {
       stdout = collect(stdout, chunk);

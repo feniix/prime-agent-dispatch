@@ -31,10 +31,7 @@ test("stdout and stderr capture obey the shared output ceiling", async () => {
 test("output ceilings never split a UTF-8 character or exceed the byte limit", async () => {
   const result = await runCommand(
     process.execPath,
-    [
-      "-e",
-      "process.stdout.write('😀😀'); process.stderr.write('😀😀')",
-    ],
+    ["-e", "process.stdout.write('😀😀'); process.stderr.write('😀😀')"],
     { maxOutputBytes: 5 },
   );
   assert.ok(
