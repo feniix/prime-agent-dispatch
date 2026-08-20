@@ -522,7 +522,7 @@ test("rejects symlinks in imported or existing durable state", async () => {
           },
           dependencies,
         ),
-      /state source cannot contain symlinks/,
+      /state source symlink escapes imported state/,
     );
 
     await rm(join(stateSource, "escape"));
@@ -542,6 +542,38 @@ test("rejects symlinks in imported or existing durable state", async () => {
         ),
       /durable state must be a real directory/,
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("migrates internal state symlinks and rewrites absolute targets", async () => {
+  const {
+    root,
+    openclawStateDir,
+    sourceRoot,
+    hostConfigSource,
+    stateSource,
+    dependencies,
+  } = await fixture();
+  try {
+    const target = join(stateSource, "internal-target");
+    await writeFile(target, "preserved\n");
+    await symlink(target, join(stateSource, "internal-link"));
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        stateSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    const migratedLink = join(layout.stateRoot, "internal-link");
+    assert.equal((await readlink(migratedLink)).startsWith("/"), false);
+    assert.equal(await readFile(migratedLink, "utf8"), "preserved\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

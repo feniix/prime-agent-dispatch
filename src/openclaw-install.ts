@@ -13,7 +13,7 @@ import {
   stat,
   symlink,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
@@ -1038,7 +1038,10 @@ async function initializeState(
   const sourceStat = await lstat(canonicalSource);
   if (!sourceStat.isDirectory())
     throw new Error("state source must be a directory");
-  await assertNoSymlinks(canonicalSource, "state source");
+  const absoluteSymlinks = await validateStateSymlinks(
+    canonicalSource,
+    canonicalSource,
+  );
   const staging = `${layout.stateRoot}.staging-${randomUUID()}`;
   try {
     await cp(canonicalSource, staging, {
@@ -1047,6 +1050,15 @@ async function initializeState(
       errorOnExist: true,
       verbatimSymlinks: true,
     });
+    for (const link of absoluteSymlinks) {
+      const installedLink = join(staging, link.path);
+      const installedTarget = join(staging, link.target);
+      await rm(installedLink);
+      await symlink(
+        relative(dirname(installedLink), installedTarget),
+        installedLink,
+      );
+    }
     await secureTree(staging);
     await rename(staging, layout.stateRoot);
   } catch (error) {
@@ -1055,13 +1067,26 @@ async function initializeState(
   }
 }
 
-async function assertNoSymlinks(path: string, label: string): Promise<void> {
+type StateSymlinkRewrite = { path: string; target: string };
+
+async function validateStateSymlinks(
+  path: string,
+  root: string,
+): Promise<StateSymlinkRewrite[]> {
   const value = await lstat(path);
-  if (value.isSymbolicLink())
-    throw new Error(`${label} cannot contain symlinks: ${path}`);
-  if (value.isDirectory())
-    for (const child of await readdir(path))
-      await assertNoSymlinks(join(path, child), label);
+  if (value.isSymbolicLink()) {
+    const target = await realpath(path).catch(() => undefined);
+    if (!target || !isWithin(root, target))
+      throw new Error(`state source symlink escapes imported state: ${path}`);
+    return isAbsolute(await readlink(path))
+      ? [{ path: relative(root, path), target: relative(root, target) }]
+      : [];
+  }
+  if (!value.isDirectory()) return [];
+  const links: StateSymlinkRewrite[] = [];
+  for (const child of await readdir(path))
+    links.push(...(await validateStateSymlinks(join(path, child), root)));
+  return links;
 }
 
 async function switchDirectoryLink(
