@@ -38,9 +38,10 @@ Chosen option: **standalone core and CLI with a thin optional OpenClaw adapter**
 
 ### Confirmation
 
-The repository builds and tests without OpenClaw packages. `PrimeDispatcher` and the CLI own orchestration. No placeholder adapter is retained: the production tool, policy, auth, and Discord component boundary is tracked by [issue #5](https://github.com/feniix/prime-dispatch-prototype/issues/5).
+The repository builds and tests without OpenClaw packages. `PrimeDispatcher` and the CLI own orchestration. The installed plugin remains thin: it translates trusted OpenClaw context, typed operations, confirmation, and Discord delivery into standalone CLI calls. Its versioned host lifecycle is governed by [ADR-0016](0016-versioned-openclaw-host-lifecycle.md).
 
 ## More Information
 
 - [ADR-0002](0002-explicit-detached-single-root-jobs.md)
 - [ADR-0009](0009-trusted-policy-and-hash-bound-confirmation.md)
+- [ADR-0016](0016-versioned-openclaw-host-lifecycle.md)

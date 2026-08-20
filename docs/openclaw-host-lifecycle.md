@@ -1,5 +1,7 @@
 # Durable OpenClaw host lifecycle
 
+This lifecycle implements [ADR-0016](adrs/0016-versioned-openclaw-host-lifecycle.md).
+
 `prime-dispatch-openclaw` installs the standalone runtime and OpenClaw adapter
 as a versioned, host-local release. OpenClaw configuration points only at stable
 paths beneath its state directory, never at a checkout or temporary directory.
