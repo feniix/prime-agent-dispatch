@@ -11,14 +11,20 @@ runtime paths, model, reasoning level, and hard ceilings come from the host
 configuration passed to the standalone CLI.
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm test
-pnpm run build
-pnpm run plugin:validate
-openclaw plugins install . --link
+corepack pnpm install --frozen-lockfile
+corepack pnpm test
+corepack pnpm run build
+corepack pnpm run plugin:validate
 ```
 
-Example OpenClaw configuration:
+Do not install this package by linking its checkout into OpenClaw. Build both
+packages and use the repository's
+[`prime-dispatch-openclaw` lifecycle](../docs/openclaw-host-lifecycle.md), which
+copies a versioned release beneath the OpenClaw state directory, uses stable
+runtime/config/state paths, validates the config delta, and supports audit,
+upgrade, rollback, and state-preserving uninstall.
+
+The lifecycle manages an OpenClaw entry equivalent to:
 
 ```json
 {
@@ -27,15 +33,12 @@ Example OpenClaw configuration:
       "prime-dispatch": {
         "enabled": true,
         "config": {
-          "cliPath": "/absolute/path/to/prime-dispatch/dist/cli.js",
-          "stateRoot": "/absolute/path/to/prime-dispatch-state",
-          "hostConfigPath": "/absolute/path/to/host-config.json"
+          "cliPath": "$OPENCLAW_STATE_DIR/prime-dispatch/current/runtime/dist/cli.js",
+          "stateRoot": "$OPENCLAW_STATE_DIR/prime-dispatch/state",
+          "hostConfigPath": "$OPENCLAW_STATE_DIR/prime-dispatch/config/host.json"
         }
       }
     }
-  },
-  "tools": {
-    "allow": ["prime-dispatch"]
   }
 }
 ```

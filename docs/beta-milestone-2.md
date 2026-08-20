@@ -57,10 +57,13 @@ remains deterministic and credential-free.
 
 ## Installation
 
-Build the standalone CLI and plugin, install the package through OpenClaw, then
-configure the three required host-owned paths documented in
-[`openclaw-plugin/README.md`](../openclaw-plugin/README.md). Allowlist the plugin
-tools explicitly; all five are optional and owner-only.
+Build the standalone CLI and plugin, preview the exact configuration delta, and
+deploy a versioned copy with the
+[`prime-dispatch-openclaw` lifecycle](openclaw-host-lifecycle.md). The lifecycle
+owns stable runtime, host-policy, and state paths beneath the OpenClaw state
+directory and supports idempotent upgrades, audit, rollback, and a
+state-preserving uninstall. All five plugin tools remain optional and
+owner-only.
 
 Installation changes the active OpenClaw configuration and may reload the
 Gateway. It is therefore an operator deployment step, separate from package
