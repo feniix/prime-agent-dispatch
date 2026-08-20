@@ -171,13 +171,26 @@ export const TokenUsageSchema = z
   });
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 
-export const InferenceRequestUsageSchema = z.object({
-  requestId: z.string().min(1).max(256),
-  outcome: z.enum(["completed", "failed", "cancelled", "transport_error"]),
-  completeness: z.enum(["complete", "partial", "unknown"]),
-  usage: TokenUsageSchema.optional(),
-  finalizedAt: z.string().datetime(),
-});
+export const InferenceRequestUsageSchema = z
+  .object({
+    requestId: z.string().min(1).max(256),
+    outcome: z.enum(["completed", "failed", "cancelled", "transport_error"]),
+    completeness: z.enum(["complete", "partial", "unknown"]),
+    usage: TokenUsageSchema.optional(),
+    finalizedAt: z.string().datetime(),
+  })
+  .superRefine((record, context) => {
+    if (record.completeness === "unknown" && record.usage !== undefined)
+      context.addIssue({
+        code: "custom",
+        message: "unknown inference usage cannot include observed token usage",
+      });
+    if (record.completeness !== "unknown" && record.usage === undefined)
+      context.addIssue({
+        code: "custom",
+        message: `${record.completeness} inference usage requires observed token usage`,
+      });
+  });
 export type InferenceRequestUsage = z.infer<typeof InferenceRequestUsageSchema>;
 
 export function sameInferenceAccounting(

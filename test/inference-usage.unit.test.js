@@ -119,6 +119,33 @@ test("durable request usage rejects inconsistent token totals", () => {
   );
 });
 
+test("durable request usage rejects contradictory completeness claims", () => {
+  const base = {
+    requestId: "resp_completeness",
+    outcome: "completed",
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  };
+  assert.throws(() =>
+    InferenceRequestUsageSchema.parse({
+      ...base,
+      completeness: "complete",
+    }),
+  );
+  assert.throws(() =>
+    InferenceRequestUsageSchema.parse({
+      ...base,
+      completeness: "partial",
+    }),
+  );
+  assert.throws(() =>
+    InferenceRequestUsageSchema.parse({
+      ...base,
+      completeness: "unknown",
+      usage: { totalTokens: 10 },
+    }),
+  );
+});
+
 test("usage ledger deduplicates stable response ids and exposes honest budget capabilities", () => {
   const ledger = new InferenceUsageLedger(100);
   const first = {
