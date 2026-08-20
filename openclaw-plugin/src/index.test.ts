@@ -2,20 +2,54 @@ import { describe, expect, it, vi } from "vitest";
 import plugin, {
   confirmationCommandFailure,
   createNotificationDelivery,
+  trustedContext,
   trustedCommandContext,
 } from "./index.js";
+import { confirmationContextHash } from "./adapter.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
-  it("normalizes a native Discord thread command to the typed-tool delivery route", () => {
+  it("keeps preview and OpenClaw 2026.7.1 command hashes equal for the same Discord conversation", () => {
+    const previewContext = trustedContext({
+      requesterSenderId: "owner-1",
+      senderIsOwner: true,
+      messageChannel: "discord",
+      sessionId: "preview-session",
+      deliveryContext: {
+        channel: "discord",
+        to: "channel:thread-1",
+        accountId: "default",
+        threadId: "thread-1",
+      },
+    } as any);
+    const commandContext = trustedCommandContext({
+      senderId: "owner-1",
+      senderIsOwner: true,
+      channel: "discord",
+      channelId: "thread-1",
+      to: "slash:owner-1",
+      accountId: "default",
+      messageThreadId: "thread-1",
+      sessionId: "command-session",
+    } as any);
+
+    expect(commandContext).toMatchObject({
+      to: "channel:thread-1",
+      threadId: "thread-1",
+    });
+    expect(confirmationContextHash(commandContext)).toBe(
+      confirmationContextHash(previewContext),
+    );
+  });
+
+  it("uses the trusted raw To value rather than the transport channel id", () => {
     expect(
       trustedCommandContext({
         senderId: "owner-1",
         senderIsOwner: true,
         channel: "discord",
-        channelId: "thread-1",
-        to: "slash:owner-1",
+        channelId: "discord",
+        to: "channel:thread-1",
         accountId: "default",
-        messageThreadId: "thread-1",
         sessionId: "session-1",
       } as any),
     ).toEqual({
@@ -29,18 +63,15 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     });
   });
 
-  it("normalizes non-string native Discord channel ids defensively", () => {
+  it("fails closed when a Discord command has no conversation target", () => {
     expect(
       trustedCommandContext({
         senderId: "owner-1",
         senderIsOwner: true,
         channel: "discord",
-        channelId: 12345,
         to: "slash:owner-1",
       } as any),
-    ).toMatchObject({
-      to: "channel:12345",
-    });
+    ).not.toHaveProperty("to");
   });
 
   it("returns an actionable owner-visible diagnostic for command context mismatches", () => {

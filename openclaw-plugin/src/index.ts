@@ -384,61 +384,100 @@ function parseConfig(
   };
 }
 
-function trustedContext(
-  context: OpenClawPluginToolContext,
+type TrustedContextProjection = {
+  senderId?: string | undefined;
+  senderIsOwner?: boolean | undefined;
+  channel?: string | undefined;
+  to?: string | undefined;
+  channelId?: string | number | undefined;
+  accountId?: string | undefined;
+  threadId?: string | number | undefined;
+  deliveryId?: string | undefined;
+};
+
+export function normalizeTrustedContext(
+  context: TrustedContextProjection,
 ): TrustedToolContext {
+  const senderId = normalizedString(context.senderId);
+  const channel = normalizedString(context.channel);
+  const to = trustedDeliveryTarget(
+    channel,
+    normalizedString(context.to),
+    normalizedString(context.channelId),
+  );
+  const accountId = normalizedString(context.accountId);
+  const explicitThreadId = normalizedString(context.threadId);
+  const threadId =
+    explicitThreadId ?? discordConversationIdFromTarget(channel, to);
+  const deliveryId = normalizedString(context.deliveryId);
   return {
-    ...(context.requesterSenderId
-      ? { senderId: context.requesterSenderId }
-      : {}),
+    ...(senderId ? { senderId } : {}),
     ...(context.senderIsOwner === undefined
       ? {}
       : { senderIsOwner: context.senderIsOwner }),
-    ...((context.deliveryContext?.channel ?? context.messageChannel)
-      ? { channel: context.deliveryContext?.channel ?? context.messageChannel }
-      : {}),
-    ...(context.deliveryContext?.to ? { to: context.deliveryContext.to } : {}),
-    ...(context.deliveryContext?.accountId
-      ? { accountId: context.deliveryContext.accountId }
-      : {}),
-    ...(context.deliveryContext?.threadId === undefined
-      ? {}
-      : { threadId: String(context.deliveryContext.threadId) }),
-    ...((context.deliveryContext?.deliveryIntent?.id ?? context.sessionId)
-      ? {
-          deliveryId:
-            context.deliveryContext?.deliveryIntent?.id ?? context.sessionId,
-        }
-      : {}),
+    ...(channel ? { channel } : {}),
+    ...(to ? { to } : {}),
+    ...(accountId ? { accountId } : {}),
+    ...(threadId ? { threadId } : {}),
+    ...(deliveryId ? { deliveryId } : {}),
   };
+}
+
+function normalizedString(
+  value: string | number | undefined,
+): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = String(value).trim();
+  return normalized || undefined;
+}
+
+function trustedDeliveryTarget(
+  channel: string | undefined,
+  to: string | undefined,
+  channelId: string | undefined,
+): string | undefined {
+  if (channel !== "discord") return to ?? channelId;
+  if (to && !to.startsWith("slash:")) return to;
+  if (!channelId) return undefined;
+  return channelId.startsWith("channel:") ? channelId : `channel:${channelId}`;
+}
+
+function discordConversationIdFromTarget(
+  channel: string | undefined,
+  to: string | undefined,
+): string | undefined {
+  if (channel !== "discord" || !to?.startsWith("channel:")) return undefined;
+  return normalizedString(to.slice("channel:".length));
+}
+
+export function trustedContext(
+  context: OpenClawPluginToolContext,
+): TrustedToolContext {
+  return normalizeTrustedContext({
+    senderId: context.requesterSenderId,
+    senderIsOwner: context.senderIsOwner,
+    channel: context.deliveryContext?.channel ?? context.messageChannel,
+    to: context.deliveryContext?.to,
+    accountId: context.deliveryContext?.accountId,
+    threadId: context.deliveryContext?.threadId,
+    deliveryId:
+      context.deliveryContext?.deliveryIntent?.id ?? context.sessionId,
+  });
 }
 
 export function trustedCommandContext(
   context: PluginCommandContext,
 ): TrustedToolContext {
-  const channelId =
-    context.channelId === undefined
-      ? undefined
-      : String(context.channelId).trim();
-  const deliveryTarget =
-    context.channel === "discord" && channelId
-      ? channelId.startsWith("channel:")
-        ? channelId
-        : `channel:${channelId}`
-      : (context.to ?? channelId);
-  return {
-    ...(context.senderId ? { senderId: context.senderId } : {}),
-    ...(context.senderIsOwner === undefined
-      ? {}
-      : { senderIsOwner: context.senderIsOwner }),
-    ...(context.channel ? { channel: context.channel } : {}),
-    ...(deliveryTarget ? { to: deliveryTarget } : {}),
-    ...(context.accountId ? { accountId: context.accountId } : {}),
-    ...(context.messageThreadId === undefined
-      ? {}
-      : { threadId: String(context.messageThreadId) }),
-    ...(context.sessionId ? { deliveryId: context.sessionId } : {}),
-  };
+  return normalizeTrustedContext({
+    senderId: context.senderId,
+    senderIsOwner: context.senderIsOwner,
+    channel: context.channel,
+    to: context.to,
+    channelId: context.channelId,
+    accountId: context.accountId,
+    threadId: context.messageThreadId,
+    deliveryId: context.sessionId,
+  });
 }
 
 export function confirmationCommandFailure(
