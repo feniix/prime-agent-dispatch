@@ -13,6 +13,29 @@ async function upstream(handler) {
   };
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => (resolve = settle));
+  return { promise, resolve };
+}
+
+async function settleWithin(promise, description, timeoutMs = 2_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out waiting for ${description}`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 test("broker authorizes scoped token and pins normalized Responses body", async () => {
   let observed;
   const fake = await upstream(async (request, response) => {
@@ -156,8 +179,14 @@ test("broker enforces revocation, expiry, size, concurrency, and token budget", 
 
 test("revocation aborts an in-flight upstream without disclosing secrets", async () => {
   let upstreamClosed = false;
-  const fake = await upstream((request, _response) => {
-    request.on("close", () => (upstreamClosed = true));
+  const started = deferred();
+  const closed = deferred();
+  const fake = await upstream((_request, response) => {
+    started.resolve();
+    response.once("close", () => {
+      upstreamClosed = true;
+      closed.resolve();
+    });
   });
   const broker = new ProductionInferenceBroker({
     upstream: fake.url,
@@ -165,31 +194,46 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
     accountId: "never-log-account",
   });
   const lease = await broker.createLease("cancel", {
-    wallClockMs: 1000,
+    wallClockMs: 5_000,
     maxTokens: 10,
   });
-  const pending = fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers: { authorization: `Bearer ${lease.opaqueToken}` },
-    body: "{}",
-  }).catch(() => undefined);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  await lease.revoke();
-  await pending;
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(upstreamClosed, true);
-  assert.doesNotMatch(
-    JSON.stringify(broker.stats()),
-    /never-log-token|never-log-account/,
-  );
-  await broker.close();
-  await fake.close();
+  let pending;
+  try {
+    pending = fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    }).catch(() => undefined);
+    await settleWithin(started.promise, "the upstream request to start");
+    await lease.revoke();
+    await pending;
+    await settleWithin(
+      closed.promise,
+      "the revoked upstream response to close",
+    );
+    assert.equal(upstreamClosed, true);
+    assert.doesNotMatch(
+      JSON.stringify(broker.stats()),
+      /never-log-token|never-log-account/,
+    );
+  } finally {
+    await lease.revoke().catch(() => undefined);
+    await pending?.catch(() => undefined);
+    await broker.close();
+    await fake.close();
+  }
 });
 
 test("lease expiry aborts an in-flight upstream request", async () => {
   let upstreamClosed = false;
-  const fake = await upstream((request, _response) => {
-    request.on("close", () => (upstreamClosed = true));
+  const started = deferred();
+  const closed = deferred();
+  const fake = await upstream((_request, response) => {
+    started.resolve();
+    response.once("close", () => {
+      upstreamClosed = true;
+      closed.resolve();
+    });
   });
   const broker = new ProductionInferenceBroker({
     upstream: fake.url,
@@ -197,20 +241,29 @@ test("lease expiry aborts an in-flight upstream request", async () => {
     accountId: "account",
   });
   const lease = await broker.createLease("expires-active", {
-    wallClockMs: 30,
+    wallClockMs: 1_000,
     maxTokens: 10,
   });
-  const pending = fetch(new URL("responses", lease.endpoint), {
-    method: "POST",
-    headers: { authorization: `Bearer ${lease.opaqueToken}` },
-    body: "{}",
-  }).catch(() => undefined);
+  let pending;
   try {
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    pending = fetch(new URL("responses", lease.endpoint), {
+      method: "POST",
+      headers: { authorization: `Bearer ${lease.opaqueToken}` },
+      body: "{}",
+    }).catch(() => undefined);
+    await settleWithin(
+      started.promise,
+      "the expiring upstream request to start",
+    );
+    await settleWithin(
+      closed.promise,
+      "the expired upstream response to close",
+      2_000,
+    );
     assert.equal(upstreamClosed, true);
   } finally {
-    await lease.revoke();
-    await pending;
+    await lease.revoke().catch(() => undefined);
+    await pending?.catch(() => undefined);
     await broker.close();
     await fake.close();
   }
