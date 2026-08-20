@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { appendFile, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStore, PrimeStartInputSchema } from "../dist/index.js";
+import {
+  InferenceUsageLedger,
+  JobStore,
+  PrimeStartInputSchema,
+} from "../dist/index.js";
 
 async function storeFixture() {
   const root = await mkdtemp(join(tmpdir(), "prime-dispatch-store-unit-"));
@@ -187,4 +191,51 @@ test("appendEventOnce deduplicates concurrent reconciliation decisions", async (
     events.filter((event) => event.type === "worker_reconnected").length,
     1,
   );
+});
+
+test("inference usage is authoritative, idempotent, and redacted in durable evidence", async () => {
+  const { store, request } = await storeFixture();
+  await store.updateState(request.jobId, "provisioning");
+  await store.updateState(request.jobId, "running");
+  const ledger = new InferenceUsageLedger(100);
+  const record = {
+    requestId: "resp_durable",
+    outcome: "completed",
+    completeness: "complete",
+    usage: {
+      inputTokens: 8,
+      cachedInputTokens: 5,
+      outputTokens: 2,
+      reasoningTokens: 1,
+      totalTokens: 10,
+    },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+    authorization: "must-not-persist",
+  };
+  ledger.record(record);
+
+  const first = await store.recordInferenceUsage(
+    request.jobId,
+    record,
+    ledger.snapshot(),
+  );
+  const duplicate = await store.recordInferenceUsage(
+    request.jobId,
+    record,
+    ledger.snapshot(),
+  );
+
+  assert.deepEqual(first.inference, ledger.snapshot());
+  assert.equal(duplicate.revision, first.revision);
+  const events = await store.readEvents(request.jobId);
+  assert.equal(
+    events.filter((event) => event.type === "inference_usage_recorded").length,
+    1,
+  );
+  const evidence = await readFile(
+    join(store.jobDir(request.jobId), "artifacts", "inference-usage.json"),
+    "utf8",
+  );
+  assert.doesNotMatch(evidence, /must-not-persist|authorization/i);
+  assert.deepEqual(JSON.parse(evidence), ledger.snapshot());
 });

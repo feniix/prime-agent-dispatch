@@ -12,16 +12,21 @@ import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
   EventSchema,
+  InferenceRequestUsageSchema,
+  InferenceUsageLedgerSchema,
   JobRequestSchema,
   JobResultSchema,
   JobStateSchema,
   SCHEMA_VERSION,
   type JobEvent,
+  type InferenceRequestUsage,
+  type InferenceUsageLedgerSnapshot,
   type JobRequest,
   type JobResult,
   type JobState,
   type JobStatus,
 } from "./schemas.js";
+import { InferenceUsageLedger } from "./inference.js";
 import { assertTransition } from "./state-machine.js";
 
 const LOCK_STALE_MS = 30_000;
@@ -250,6 +255,94 @@ export class JobStore {
         to: status,
         revision: next.revision,
       });
+      return next;
+    } finally {
+      await release();
+    }
+  }
+
+  async recordInferenceUsage(
+    jobId: string,
+    value: InferenceRequestUsage,
+    ledgerValue: InferenceUsageLedgerSnapshot,
+  ): Promise<JobState> {
+    const record = InferenceRequestUsageSchema.parse(value);
+    const ledger = InferenceUsageLedgerSchema.parse(ledgerValue);
+    const rebuilt = new InferenceUsageLedger(ledger.budget.tokenLimit);
+    for (const request of ledger.requests) rebuilt.record(request);
+    if (JSON.stringify(rebuilt.snapshot()) !== JSON.stringify(ledger))
+      throw new Error("inference usage ledger summary is inconsistent");
+    const ledgerRecord = ledger.requests.find(
+      (request) => request.requestId === record.requestId,
+    );
+    if (
+      !ledgerRecord ||
+      JSON.stringify(ledgerRecord) !== JSON.stringify(record)
+    )
+      throw new Error("inference usage ledger omitted finalized request");
+
+    const dir = this.jobDir(jobId);
+    const release = await acquireLock(dir);
+    try {
+      const current = await this.readState(jobId);
+      const existing = current.inference;
+      if (existing && existing.budget.tokenLimit !== ledger.budget.tokenLimit)
+        throw new Error("inference usage token limit changed");
+      const currentRecord = existing?.requests.find(
+        (request) => request.requestId === record.requestId,
+      );
+      if (
+        currentRecord &&
+        JSON.stringify(currentRecord) !== JSON.stringify(record)
+      )
+        throw new Error(
+          `conflicting usage accounting for request ${record.requestId}`,
+        );
+      for (const prior of existing?.requests ?? []) {
+        const replacement = ledger.requests.find(
+          (request) => request.requestId === prior.requestId,
+        );
+        if (!replacement) {
+          if (currentRecord) {
+            await atomicWriteFile(
+              join(dir, "artifacts", "inference-usage.json"),
+              `${JSON.stringify(existing, null, 2)}\n`,
+            );
+            return current;
+          }
+          throw new Error("inference usage ledger cannot discard requests");
+        }
+        if (JSON.stringify(replacement) !== JSON.stringify(prior))
+          throw new Error(
+            `conflicting usage accounting for request ${prior.requestId}`,
+          );
+      }
+      if (JSON.stringify(existing) === JSON.stringify(ledger)) {
+        await atomicWriteFile(
+          join(dir, "artifacts", "inference-usage.json"),
+          `${JSON.stringify(ledger, null, 2)}\n`,
+        );
+        return current;
+      }
+      const next = JobStateSchema.parse({
+        ...current,
+        inference: ledger,
+        revision: current.revision + 1,
+        updatedAt: new Date().toISOString(),
+      });
+      await atomicWriteFile(
+        join(dir, "state.json"),
+        `${JSON.stringify(next, null, 2)}\n`,
+      );
+      await this.appendEventUnlocked(jobId, "inference_usage_recorded", {
+        request: record,
+        observedTotalTokens: ledger.observedUsage.totalTokens,
+        completeness: ledger.completeness,
+      });
+      await atomicWriteFile(
+        join(dir, "artifacts", "inference-usage.json"),
+        `${JSON.stringify(ledger, null, 2)}\n`,
+      );
       return next;
     } finally {
       await release();

@@ -185,6 +185,7 @@ async function writeTerminalResult(
     diffArtifact: join(store.jobDir(jobId), "artifacts", "final.diff"),
     reportArtifact: join(store.jobDir(jobId), "artifacts", "report.md"),
     gateResults,
+    ...(state.inference ? { inference: state.inference } : {}),
     completedAt: new Date().toISOString(),
   };
   await store.writeResult(result);
@@ -198,6 +199,7 @@ async function finalizeTerminalOutcome(
   gateResults: GateResult[],
   patch: Pick<JobState, "commitSha" | "noChanges" | "summary" | "error">,
 ): Promise<JobState> {
+  current = await syncInferenceUsage(current);
   const intent = await store.updateState(jobId, current.status, {
     ...patch,
     terminalIntentStatus: status,
@@ -208,6 +210,20 @@ async function finalizeTerminalOutcome(
     ...patch,
     terminalIntentStatus: undefined,
   });
+}
+
+async function syncInferenceUsage(current: JobState): Promise<JobState> {
+  if (!inferenceLease) return current;
+  const inference = inferenceLease.usage();
+  if (JSON.stringify(current.inference) === JSON.stringify(inference))
+    return current;
+  const next = await store.updateState(jobId, current.status, { inference });
+  await store.writeArtifact(
+    jobId,
+    "inference-usage.json",
+    `${JSON.stringify(inference, null, 2)}\n`,
+  );
+  return next;
 }
 
 async function capturePartialEvidence(
@@ -319,6 +335,9 @@ async function main(): Promise<void> {
         accountId: auth.accountId,
         maxConcurrency: 1,
         maxRequestBytes: 4 * 1024 * 1024,
+        onUsageFinalized: async (record, inference) => {
+          state = await store.recordInferenceUsage(jobId, record, inference);
+        },
       });
       inferenceLease = await inferenceBroker.createLease(jobId, {
         wallClockMs: request.budget.wallClockMs,
@@ -369,6 +388,8 @@ async function main(): Promise<void> {
       controller.signal,
     );
     assertJobActive();
+    await inferenceLease?.revoke();
+    state = await syncInferenceUsage(state);
     await store.appendEvent(jobId, "agent_completed", {
       summary: agentResult.summary,
       metadata: agentResult.metadata,
@@ -376,6 +397,7 @@ async function main(): Promise<void> {
     if (inferenceBroker)
       await store.appendEvent(jobId, "inference_completed", {
         ...inferenceBroker.stats(),
+        usage: inferenceLease?.usage(),
       });
     state = await store.updateState(jobId, "verifying", {
       summary: agentResult.summary,
@@ -485,6 +507,7 @@ async function main(): Promise<void> {
     );
   } catch (error) {
     await cancellationPromise?.catch(() => undefined);
+    await inferenceLease?.revoke().catch(() => undefined);
     const message = cancellationRequested
       ? "cancelled by request"
       : deadlineExceeded
@@ -541,6 +564,7 @@ async function main(): Promise<void> {
       await store
         .appendEvent(jobId, "inference_final", {
           ...inferenceBroker.stats(),
+          usage: inferenceLease?.usage(),
         })
         .catch(() => undefined);
     await inferenceBroker?.close();

@@ -181,6 +181,7 @@ test("broker enforces revocation, expiry, size, concurrency, and token budget", 
 
 test("revocation aborts an in-flight upstream without disclosing secrets", async () => {
   let upstreamClosed = false;
+  const finalized = [];
   const started = deferred();
   const closed = deferred();
   const fake = await upstream((_request, response) => {
@@ -194,6 +195,9 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
     upstream: fake.url,
     accessToken: "never-log-token",
     accountId: "never-log-account",
+    onUsageFinalized: async (record, snapshot) => {
+      finalized.push({ record, snapshot });
+    },
   });
   const lease = await broker.createLease("cancel", {
     wallClockMs: 5_000,
@@ -208,6 +212,10 @@ test("revocation aborts an in-flight upstream without disclosing secrets", async
     }).catch(() => undefined);
     await settleWithin(started.promise, "the upstream request to start");
     await lease.revoke();
+    assert.equal(finalized.length, 1);
+    assert.equal(finalized[0].record.outcome, "cancelled");
+    assert.equal(finalized[0].record.completeness, "unknown");
+    assert.equal(finalized[0].snapshot.completeness, "unknown");
     await pending;
     await settleWithin(
       closed.promise,

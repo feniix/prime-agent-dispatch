@@ -31,6 +31,7 @@ type LeaseState = {
   active: number;
   revoked: boolean;
   controllers: Set<AbortController>;
+  idleWaiters: Set<() => void>;
   expiryTimer: NodeJS.Timeout;
 };
 
@@ -40,6 +41,10 @@ type BrokerOptions = {
   accountId: string;
   maxRequestBytes?: number;
   maxConcurrency?: number;
+  onUsageFinalized?: (
+    record: InferenceRequestUsage,
+    snapshot: InferenceUsageLedgerSnapshot,
+  ) => Promise<void>;
 };
 
 function jsonError(
@@ -296,6 +301,7 @@ export class ProductionInferenceBroker {
     authorizedRequests: 0,
     rejectedRequests: 0,
     abortedUpstreams: 0,
+    usagePersistenceFailures: 0,
     sawStreamingResponse: false,
     sawToolCallEvent: false,
     sawHighReasoning: false,
@@ -332,6 +338,7 @@ export class ProductionInferenceBroker {
       active: 0,
       revoked: false,
       controllers: new Set(),
+      idleWaiters: new Set(),
       expiryTimer,
     };
     this.leases.set(token, state);
@@ -366,13 +373,23 @@ export class ProductionInferenceBroker {
   private async revoke(token: string): Promise<void> {
     const lease = this.leases.get(token);
     if (!lease) return;
+    if (lease.revoked) {
+      await this.waitForIdle(lease);
+      return;
+    }
     clearTimeout(lease.expiryTimer);
     lease.revoked = true;
-    this.leases.delete(token);
     for (const controller of lease.controllers) {
       this.counters.abortedUpstreams += 1;
       controller.abort();
     }
+    await this.waitForIdle(lease);
+    if (this.leases.get(token) === lease) this.leases.delete(token);
+  }
+
+  private async waitForIdle(lease: LeaseState): Promise<void> {
+    if (lease.active === 0) return;
+    await new Promise<void>((resolve) => lease.idleWaiters.add(resolve));
   }
 
   private async handle(
@@ -431,12 +448,23 @@ export class ProductionInferenceBroker {
     });
     const attemptId = `broker:${randomUUID()}`;
     let accountingAttempted = false;
-    const recordUsage = (record: ParsedTerminalUsage): void => {
+    const recordUsage = async (record: ParsedTerminalUsage): Promise<void> => {
       accountingAttempted = true;
-      lease.ledger.record({
+      const finalized = InferenceRequestUsageSchema.parse({
         ...record,
         finalizedAt: new Date().toISOString(),
       });
+      if (lease.ledger.record(finalized) === "recorded") {
+        try {
+          await this.options.onUsageFinalized?.(
+            finalized,
+            lease.ledger.snapshot(),
+          );
+        } catch (error) {
+          this.counters.usagePersistenceFailures += 1;
+          throw error;
+        }
+      }
     };
     try {
       const upstream = await fetch(this.options.upstream, {
@@ -455,7 +483,7 @@ export class ProductionInferenceBroker {
         body: JSON.stringify(body),
       });
       if (!upstream.body) {
-        recordUsage({
+        await recordUsage({
           requestId: attemptId,
           outcome: "transport_error",
           completeness: "unknown",
@@ -515,9 +543,9 @@ export class ProductionInferenceBroker {
         if (parserError) throw parserError;
       }
       if (terminalRecords.length > 0) {
-        for (const record of terminalRecords) recordUsage(record);
+        for (const record of terminalRecords) await recordUsage(record);
       } else {
-        recordUsage({
+        await recordUsage({
           requestId: attemptId,
           outcome: upstream.ok ? "transport_error" : "failed",
           completeness: "unknown",
@@ -525,12 +553,19 @@ export class ProductionInferenceBroker {
       }
       response.end();
     } catch (error) {
-      if (!accountingAttempted)
-        recordUsage({
-          requestId: attemptId,
-          outcome: controller.signal.aborted ? "cancelled" : "transport_error",
-          completeness: "unknown",
-        });
+      if (!accountingAttempted) {
+        try {
+          await recordUsage({
+            requestId: attemptId,
+            outcome: controller.signal.aborted
+              ? "cancelled"
+              : "transport_error",
+            completeness: "unknown",
+          });
+        } catch {
+          // recordUsage already counted persistence failures.
+        }
+      }
       if (!response.headersSent)
         jsonError(
           response,
@@ -541,6 +576,10 @@ export class ProductionInferenceBroker {
     } finally {
       lease.active -= 1;
       lease.controllers.delete(controller);
+      if (lease.active === 0) {
+        for (const resolve of lease.idleWaiters) resolve();
+        lease.idleWaiters.clear();
+      }
     }
   }
 }

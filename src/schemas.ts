@@ -130,49 +130,6 @@ export const WorkerIdentitySchema = z.object({
 });
 export type WorkerIdentity = z.infer<typeof WorkerIdentitySchema>;
 
-export const JobStateSchema = z.object({
-  schemaVersion: z.literal(SCHEMA_VERSION),
-  revision: z.number().int().nonnegative(),
-  jobId: z.string().min(1),
-  status: JobStatusSchema,
-  createdAt: z.string().datetime(),
-  updatedAt: z.string().datetime(),
-  workerPid: z.number().int().positive().optional(),
-  workerStartIdentity: z.string().min(1).optional(),
-  workerNonce: z.string().uuid().optional(),
-  workerProtocolVersion: z.literal(WORKER_PROTOCOL_VERSION).optional(),
-  socketPath: z.string().optional(),
-  worktreePath: z.string().optional(),
-  branchName: z.string().optional(),
-  commitSha: z.string().optional(),
-  noChanges: z.boolean().optional(),
-  summary: z.string().optional(),
-  error: z.string().optional(),
-  terminalIntentStatus: z
-    .enum(["succeeded", "failed", "cancelled", "interrupted"])
-    .optional(),
-});
-export type JobState = z.infer<typeof JobStateSchema>;
-
-export const EventSchema = z.object({
-  schemaVersion: z.literal(SCHEMA_VERSION),
-  sequence: z.number().int().positive(),
-  at: z.string().datetime(),
-  jobId: z.string(),
-  type: z.string().min(1),
-  data: z.record(z.string(), z.unknown()).default({}),
-});
-export type JobEvent = z.infer<typeof EventSchema>;
-
-export const GateResultSchema = z.object({
-  name: z.string(),
-  ok: z.boolean(),
-  exitCode: z.number().int().nullable(),
-  timedOut: z.boolean(),
-  output: z.string(),
-});
-export type GateResult = z.infer<typeof GateResultSchema>;
-
 const TokenCountSchema = z.number().int().nonnegative().safe();
 
 export const TokenUsageSchema = z
@@ -246,6 +203,50 @@ export type InferenceUsageLedgerSnapshot = z.infer<
   typeof InferenceUsageLedgerSchema
 >;
 
+export const JobStateSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  revision: z.number().int().nonnegative(),
+  jobId: z.string().min(1),
+  status: JobStatusSchema,
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  workerPid: z.number().int().positive().optional(),
+  workerStartIdentity: z.string().min(1).optional(),
+  workerNonce: z.string().uuid().optional(),
+  workerProtocolVersion: z.literal(WORKER_PROTOCOL_VERSION).optional(),
+  socketPath: z.string().optional(),
+  worktreePath: z.string().optional(),
+  branchName: z.string().optional(),
+  commitSha: z.string().optional(),
+  noChanges: z.boolean().optional(),
+  summary: z.string().optional(),
+  error: z.string().optional(),
+  inference: InferenceUsageLedgerSchema.optional(),
+  terminalIntentStatus: z
+    .enum(["succeeded", "failed", "cancelled", "interrupted"])
+    .optional(),
+});
+export type JobState = z.infer<typeof JobStateSchema>;
+
+export const EventSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  sequence: z.number().int().positive(),
+  at: z.string().datetime(),
+  jobId: z.string(),
+  type: z.string().min(1),
+  data: z.record(z.string(), z.unknown()).default({}),
+});
+export type JobEvent = z.infer<typeof EventSchema>;
+
+export const GateResultSchema = z.object({
+  name: z.string(),
+  ok: z.boolean(),
+  exitCode: z.number().int().nullable(),
+  timedOut: z.boolean(),
+  output: z.string(),
+});
+export type GateResult = z.infer<typeof GateResultSchema>;
+
 export const JobResultSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   jobId: z.string(),
@@ -258,6 +259,7 @@ export const JobResultSchema = z.object({
   diffArtifact: z.string().optional(),
   reportArtifact: z.string().optional(),
   gateResults: z.array(GateResultSchema),
+  inference: InferenceUsageLedgerSchema.optional(),
   completedAt: z.string().datetime(),
 });
 export type JobResult = z.infer<typeof JobResultSchema>;

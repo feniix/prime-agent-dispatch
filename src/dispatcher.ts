@@ -290,6 +290,7 @@ export class PrimeDispatcher {
             ...(result.commitSha ? { commitSha: result.commitSha } : {}),
             noChanges: result.noChanges,
             summary: result.summary,
+            ...(result.inference ? { inference: result.inference } : {}),
             ...(result.status === "failed" || result.status === "cancelled"
               ? { error: result.summary }
               : {}),
