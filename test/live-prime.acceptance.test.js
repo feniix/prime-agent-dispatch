@@ -148,6 +148,24 @@ test(
     );
     const result = await dispatcher.result(jobId);
     assert.equal(result.gateResults[0].ok, true);
+    assert.ok(result.inference);
+    assert.ok(result.inference.requestCounts.total >= 2);
+    assert.ok(result.inference.observedUsage.totalTokens > 0);
+    assert.equal(
+      result.inference.budget.enforcement,
+      "observed_admission_ceiling",
+    );
+    assert.equal(result.inference.budget.hardOutputTokenLimit, "unsupported");
+    assert.equal(result.inference.budget.monetaryCost, "unavailable");
+    assert.deepEqual(state.inference, result.inference);
+    const usageEvidence = await readFile(
+      join(stateRoot, "jobs", jobId, "artifacts", "inference-usage.json"),
+      "utf8",
+    );
+    assert.doesNotMatch(
+      usageEvidence,
+      /authorization|access.token|account.id|prompt/i,
+    );
     assert.match(
       await readFile(result.reportArtifact, "utf8"),
       /Status: succeeded/,

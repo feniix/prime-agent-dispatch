@@ -398,6 +398,49 @@ test("broker accounts only structured response usage events", async () => {
   }
 });
 
+test("replayed terminal response ids are accounted exactly once", async () => {
+  let finalized = 0;
+  const fake = await upstream((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_replayed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n',
+    );
+  });
+  const broker = new ProductionInferenceBroker({
+    upstream: fake.url,
+    accessToken: "secret",
+    accountId: "account",
+    onUsageFinalized: async () => {
+      finalized += 1;
+    },
+  });
+  const lease = await broker.createLease("replay", {
+    wallClockMs: 1000,
+    maxTokens: 100,
+  });
+  const options = {
+    method: "POST",
+    headers: { authorization: `Bearer ${lease.opaqueToken}` },
+    body: "{}",
+  };
+  try {
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(
+      (await fetch(new URL("responses", lease.endpoint), options)).status,
+      200,
+    );
+    assert.equal(finalized, 1);
+    assert.equal(lease.usage().requests.length, 1);
+    assert.equal(lease.usage().observedUsage.totalTokens, 5);
+  } finally {
+    await broker.close();
+    await fake.close();
+  }
+});
+
 test("broker tolerates SSE extension fields and data-only tool events", async () => {
   const body = [
     "x-extension: ignored by EventSource clients",
@@ -531,6 +574,8 @@ test("broker forwards non-SSE upstream errors without parsing them as events", a
       error: { message: "bad request" },
     });
     assert.equal(broker.stats().sawStreamingResponse, false);
+    assert.equal(lease.usage().requests[0].outcome, "failed");
+    assert.equal(lease.usage().requests[0].completeness, "unknown");
   } finally {
     await broker.close();
     await fake.close();

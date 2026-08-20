@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   GlobalJobLease,
+  InferenceUsageLedger,
   JobStore,
   PrimeDispatcher,
   PrimeStartInputSchema,
@@ -167,6 +168,15 @@ test("terminal intent reconciles a durable result after a worker crash window", 
     authorization: { channelId: "test", senderId: "test" },
   });
   const jobId = "terminal-intent";
+  const usageLedger = new InferenceUsageLedger(100);
+  usageLedger.record({
+    requestId: "resp_terminal",
+    outcome: "completed",
+    completeness: "complete",
+    usage: { totalTokens: 10 },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  });
+  const inference = usageLedger.snapshot();
   await store.initialize({
     ...request,
     jobId,
@@ -182,6 +192,7 @@ test("terminal intent reconciles a durable result after a worker crash window", 
     terminalIntentStatus: "succeeded",
     noChanges: true,
     summary: "durable result",
+    inference,
   });
   await store.writeResult({
     schemaVersion: 1,
@@ -191,6 +202,7 @@ test("terminal intent reconciles a durable result after a worker crash window", 
     baseSha: "a".repeat(40),
     noChanges: true,
     gateResults: [],
+    inference,
     completedAt: new Date().toISOString(),
   });
   const dispatcher = new PrimeDispatcher(root);
@@ -199,4 +211,6 @@ test("terminal intent reconciles a durable result after a worker crash window", 
   const state = await dispatcher.store.readState(jobId);
   assert.equal(state.status, "succeeded");
   assert.equal(state.terminalIntentStatus, undefined);
+  assert.deepEqual(state.inference, inference);
+  assert.deepEqual(result.inference, inference);
 });

@@ -113,6 +113,12 @@ export function buildConfirmationSummary(input: ConfirmationInput) {
     model: PRIME_MODEL,
     reasoningEffort: PRIME_REASONING_EFFORT,
     budgets: input.budget,
+    budgetSemantics: {
+      modelTokens: "observed_admission_ceiling" as const,
+      singleResponseMayOvershoot: true as const,
+      hardOutputTokenLimit: "unsupported" as const,
+      monetaryCost: "unavailable" as const,
+    },
     gates: input.gates,
     executionWarning:
       "unsafe-local: current-user execution is not sandboxed and has normal host networking",

@@ -238,24 +238,24 @@ The code assumes Discord text, model output, repository contents and Git refs ar
 
 The `unsafe-local` backend is **not a sandbox**. A model-driven process can read any host file available to its OS user and can access the network. A minimal environment does not change filesystem permissions. Therefore live repositories are rejected unless `--unsafe-allow-live-repo` is explicitly supplied, and this spike intentionally performs no real-repository smoke test.
 
-The trusted job worker resolves Codex subscription OAuth through OpenClaw's public provider-auth runtime and hosts the inference broker. The broker fixes the upstream/model/reasoning server-side, issues revocable per-job tokens, enforces expiry/request/concurrency/observable-token limits, and never exposes or logs provider credentials or bodies. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority. Moving auth and broker ownership into the installed OpenClaw adapter is deferred.
+The trusted job worker resolves Codex subscription OAuth through OpenClaw's public provider-auth runtime and hosts the inference broker. The broker fixes the upstream/model/reasoning server-side, issues revocable per-job tokens, enforces expiry/request/concurrency/observed-token admission limits, and never exposes or logs provider credentials or bodies. Structured terminal Responses events feed an idempotent per-response ledger in job state, terminal results, and `artifacts/inference-usage.json`; OpenClaw status cards show only bounded aggregate usage. Do **not** point Prime at OpenClaw's existing `/v1/chat/completions`; that endpoint runs another agent loop and uses broad Gateway authority.
 
 ## Known limitations
 
 - A surviving job worker is authenticated by process-start identity and a nonce-bound socket handshake. A dead or disproven worker is reconciled to `interrupted`; checkpoint recovery and explicit safe resume remain deferred to issue #11.
 - The dispatcher is not a resident scheduler. Nonterminal jobs are scanned whenever the CLI or future adapter starts, but no reconciliation occurs while no client is running.
 - Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`, but crash injection around every transition has not been exhaustively tested.
-- Token usage is observable only after an upstream response, so a single response can overshoot the remaining token budget and an aborted response may not report usage. The token limit is a soft observable admission ceiling; wall-clock, turn, gate, output, and concurrency limits are externally enforced.
+- Token usage is observable only from structured terminal upstream events. The durable ledger labels completed, partial, and unknown usage explicitly; a single response can overshoot the observed admission ceiling, the transport rejects a hard `max_output_tokens` control, and monetary cost is unavailable. Wall-clock, turn, gate, output, and concurrency limits remain externally enforced.
 - The official Prime archive omits runtime dependencies. The archive and configured entrypoint are checked, but the complete loaded dependency tree is not yet represented by a self-contained pinned artifact.
 - Remote Git prevention and single-process/root enforcement are not hard security boundaries under `unsafe-local`; Prime has IPython and normal host networking. Current controls are defense in depth for trusted repositories.
 - Event sequencing scans the journal and is suitable only for a small spike ledger.
 - Concurrent writers in separate worktrees of the same repository are not serialized; repository-local build services can still conflict.
 - Worktrees and branches are intentionally preserved. There is no cleanup command yet.
-- Container execution and Discord status components are not implemented.
+- Container execution is not implemented. The installed OpenClaw adapter provides Discord confirmation and status components, but clean Gateway restart acceptance remains host-service-manager dependent.
 - Ordinary tests use no real Prime binary, provider credential, or job network call. The opt-in acceptance test exercises the production real-Prime/broker path only against a disposable fixture; it makes no EVP change or real-repository write.
 
 ## Production exit criteria
 
-Before adopting this design, add checkpoint recovery and explicit safe resume, authoritative cost accounting, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
+Before adopting this design, add transactional persistence, checkpoint recovery and explicit safe resume, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 See the [deep-review catalog](docs/beta-milestone-1-review.md) for resolved findings and issue-ready deferred work.
