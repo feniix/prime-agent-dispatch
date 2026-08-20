@@ -215,15 +215,7 @@ async function finalizeTerminalOutcome(
 async function syncInferenceUsage(current: JobState): Promise<JobState> {
   if (!inferenceLease) return current;
   const inference = inferenceLease.usage();
-  if (JSON.stringify(current.inference) === JSON.stringify(inference))
-    return current;
-  const next = await store.updateState(jobId, current.status, { inference });
-  await store.writeArtifact(
-    jobId,
-    "inference-usage.json",
-    `${JSON.stringify(inference, null, 2)}\n`,
-  );
-  return next;
+  return await store.reconcileInferenceUsage(jobId, inference);
 }
 
 async function capturePartialEvidence(

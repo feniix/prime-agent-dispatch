@@ -298,3 +298,47 @@ test("reconnected inference accounting preserves prior records and tolerates rep
     2,
   );
 });
+
+test("inference reconciliation repairs missing events from authoritative state", async () => {
+  const { store, request } = await storeFixture();
+  await store.updateState(request.jobId, "provisioning");
+  await store.updateState(request.jobId, "running");
+  const ledger = new InferenceUsageLedger(100);
+  const record = {
+    requestId: "resp_repair",
+    outcome: "completed",
+    completeness: "complete",
+    usage: { totalTokens: 10 },
+    finalizedAt: "2026-08-20T00:00:00.000Z",
+  };
+  ledger.record(record);
+  const snapshot = ledger.snapshot();
+  const stateOnly = await store.updateState(request.jobId, "running", {
+    inference: snapshot,
+  });
+  assert.equal(
+    (await store.readEvents(request.jobId)).filter(
+      (event) => event.type === "inference_usage_recorded",
+    ).length,
+    0,
+  );
+
+  const repaired = await store.reconcileInferenceUsage(request.jobId, snapshot);
+
+  assert.equal(repaired.revision, stateOnly.revision);
+  assert.equal(
+    (await store.readEvents(request.jobId)).filter(
+      (event) => event.type === "inference_usage_recorded",
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(
+        join(store.jobDir(request.jobId), "artifacts", "inference-usage.json"),
+        "utf8",
+      ),
+    ),
+    snapshot,
+  );
+});

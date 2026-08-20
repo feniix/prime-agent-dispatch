@@ -274,7 +274,14 @@ export class JobStore {
     );
     if (!ledgerRecord || !sameInferenceAccounting(ledgerRecord, record))
       throw new Error("inference usage ledger omitted finalized request");
+    return await this.reconcileInferenceUsage(jobId, ledger);
+  }
 
+  async reconcileInferenceUsage(
+    jobId: string,
+    value: InferenceUsageLedgerSnapshot,
+  ): Promise<JobState> {
+    const ledger = InferenceUsageLedgerSchema.parse(value);
     const dir = this.jobDir(jobId);
     const release = await acquireLock(dir);
     try {
