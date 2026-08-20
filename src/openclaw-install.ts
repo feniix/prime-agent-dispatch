@@ -10,6 +10,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   symlink,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -20,10 +21,54 @@ import { atomicWriteFile } from "./store.js";
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
 const RELEASE_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
+const INSTALL_LOCK_STALE_MS = 30_000;
 const CONFIG_REPLACE_PATHS = [
   "plugins.allow",
   'plugins.entries["prime-dispatch"]',
 ];
+const RELEASE_SOURCE_PATHS = [
+  { source: "dist", prepared: "runtime/dist", label: "dist" },
+  {
+    source: "package.json",
+    prepared: "runtime/package.json",
+    label: "package.json",
+  },
+  {
+    source: "pnpm-lock.yaml",
+    prepared: "runtime/pnpm-lock.yaml",
+    label: "pnpm-lock.yaml",
+  },
+  {
+    source: "openclaw-plugin/dist",
+    prepared: "plugin/dist",
+    label: "openclaw-plugin/dist",
+  },
+  {
+    source: "openclaw-plugin/openclaw.plugin.json",
+    prepared: "plugin/openclaw.plugin.json",
+    label: "openclaw-plugin/openclaw.plugin.json",
+  },
+  {
+    source: "openclaw-plugin/package.json",
+    prepared: "plugin/package.json",
+    label: "openclaw-plugin/package.json",
+  },
+  {
+    source: "openclaw-plugin/pnpm-lock.yaml",
+    prepared: "plugin/pnpm-lock.yaml",
+    label: "openclaw-plugin/pnpm-lock.yaml",
+  },
+  {
+    source: "openclaw-plugin/pnpm-workspace.yaml",
+    prepared: "plugin/pnpm-workspace.yaml",
+    label: "openclaw-plugin/pnpm-workspace.yaml",
+  },
+  {
+    source: "openclaw-plugin/README.md",
+    prepared: "plugin/README.md",
+    label: "openclaw-plugin/README.md",
+  },
+] as const;
 
 export type OpenClawInstallLayout = {
   openclawStateDir: string;
@@ -53,7 +98,6 @@ export type OpenClawLifecycleDependencies = {
     patch: Record<string, unknown>,
     replacePaths?: string[],
   ): Promise<void>;
-  replaceConfigValue(path: string, value: unknown): Promise<void>;
   validateConfig(): Promise<void>;
   restartGateway(): Promise<void>;
   now(): Date;
@@ -98,9 +142,7 @@ type ReleaseMetadata = {
 };
 
 type ConfigSnapshot = {
-  plugins: Record<string, unknown>;
   allow: string[];
-  entries: Record<string, unknown>;
   entry: unknown;
 };
 
@@ -145,18 +187,13 @@ export async function planOpenClawInstall(
     | "extensionPath"
   >;
 }> {
+  validatePluginConfig(options);
   if (options.releaseId) validateReleaseId(options.releaseId);
   const layout = openClawLayout(options.openclawStateDir);
   const snapshot = await readConfigSnapshot(dependencies);
   return {
     ...(options.releaseId ? { releaseId: options.releaseId } : {}),
-    configPatch: installConfigPatch(
-      layout,
-      snapshot.plugins,
-      snapshot.allow,
-      snapshot.entries,
-      options,
-    ),
+    configPatch: installConfigPatch(layout, snapshot.allow, options),
     paths: {
       installRoot: layout.installRoot,
       releasesRoot: layout.releasesRoot,
@@ -177,6 +214,7 @@ export async function installOpenClaw(
   previousRelease?: string;
   configPatch: Record<string, unknown>;
 }> {
+  validatePluginConfig(options);
   const layout = openClawLayout(options.openclawStateDir);
   await ensureInstallDirectories(layout);
   const releaseLock = await acquireInstallLock(layout);
@@ -188,13 +226,7 @@ export async function installOpenClaw(
     const releaseRoot = join(layout.releasesRoot, releaseId);
     const existingManifest = await readInstallManifest(layout);
     const snapshot = await readConfigSnapshot(dependencies);
-    const configPatch = installConfigPatch(
-      layout,
-      snapshot.plugins,
-      snapshot.allow,
-      snapshot.entries,
-      options,
-    );
+    const configPatch = installConfigPatch(layout, snapshot.allow, options);
     const desiredEntry = installConfigEntry(layout, options);
 
     if (
@@ -280,11 +312,11 @@ export async function installOpenClaw(
       };
       await writeInstallManifest(layout, manifest);
     } catch (error) {
-      await restoreConfigSnapshot(snapshot, dependencies).catch(
-        () => undefined,
-      );
       await extensionRestore?.restore().catch(() => undefined);
       await currentRestore.restore().catch(() => undefined);
+      await restoreConfigSnapshot(snapshot, dependencies, desiredEntry).catch(
+        () => undefined,
+      );
       await hostConfigRestore().catch(() => undefined);
       throw error;
     }
@@ -319,6 +351,7 @@ export async function rollbackOpenClaw(
   previousRelease: string;
   configPatch: Record<string, unknown>;
 }> {
+  validatePluginConfig(options);
   const layout = openClawLayout(options.openclawStateDir);
   await ensureInstallDirectories(layout);
   const releaseLock = await acquireInstallLock(layout);
@@ -330,13 +363,7 @@ export async function rollbackOpenClaw(
     const targetRoot = join(layout.releasesRoot, targetRelease);
     await readReleaseMetadata(targetRoot);
     const snapshot = await readConfigSnapshot(dependencies);
-    const configPatch = installConfigPatch(
-      layout,
-      snapshot.plugins,
-      snapshot.allow,
-      snapshot.entries,
-      options,
-    );
+    const configPatch = installConfigPatch(layout, snapshot.allow, options);
     const currentRestore = await switchDirectoryLink(
       layout.currentLink,
       join("releases", targetRelease),
@@ -363,11 +390,11 @@ export async function rollbackOpenClaw(
       };
       await writeInstallManifest(layout, next);
     } catch (error) {
+      await extensionRestore?.restore().catch(() => undefined);
+      await currentRestore.restore().catch(() => undefined);
       await restoreConfigSnapshot(snapshot, dependencies).catch(
         () => undefined,
       );
-      await extensionRestore?.restore().catch(() => undefined);
-      await currentRestore.restore().catch(() => undefined);
       throw error;
     }
     if (options.restartGateway) {
@@ -399,16 +426,13 @@ export async function uninstallOpenClaw(
   preservedHostConfigPath: string;
   configPatch: Record<string, unknown>;
 }> {
+  validatePluginConfig(options);
   const layout = openClawLayout(options.openclawStateDir);
   await ensureInstallDirectories(layout);
   const releaseLock = await acquireInstallLock(layout);
   try {
     const snapshot = await readConfigSnapshot(dependencies);
-    const configPatch = uninstallConfigPatch(
-      snapshot.plugins,
-      snapshot.allow,
-      snapshot.entries,
-    );
+    const configPatch = uninstallConfigPatch(snapshot.allow, snapshot.entry);
     const manifest = await readInstallManifest(layout);
     let currentRestore: PathRestore | undefined;
     let extensionRestore: PathRestore | undefined;
@@ -472,12 +496,18 @@ export async function auditOpenClawInstall(
   for (const [path, mode] of [
     [layout.installRoot, 0o700],
     [layout.releasesRoot, 0o700],
+    [layout.backupsRoot, 0o700],
     [layout.configRoot, 0o700],
     [layout.stateRoot, 0o700],
   ] as const)
     await auditPath(path, mode, "directory", violations);
   await auditPath(layout.hostConfigPath, 0o600, "file", violations);
   await auditPath(layout.installManifestPath, 0o600, "file", violations);
+  await readFile(layout.hostConfigPath, "utf8")
+    .then((raw) => HostConfigSchema.parse(JSON.parse(raw)))
+    .catch((error: unknown) =>
+      violations.push(`host config is invalid: ${errorMessage(error)}`),
+    );
 
   const manifest = await readInstallManifest(layout).catch((error: unknown) => {
     violations.push(
@@ -496,6 +526,34 @@ export async function auditOpenClawInstall(
       resolve(releaseRoot),
     );
     await auditSecureTree(releaseRoot, canonicalReleaseRoot, violations);
+    const metadata = await readReleaseMetadata(releaseRoot).catch(
+      (error: unknown) => {
+        violations.push(
+          `release metadata is invalid in ${releaseRoot}: ${errorMessage(error)}`,
+        );
+        return undefined;
+      },
+    );
+    if (
+      metadata &&
+      (metadata.releaseId !== release.id ||
+        metadata.sourceDigest !== release.sourceDigest)
+    )
+      violations.push(
+        `release metadata does not match install manifest: ${releaseRoot}`,
+      );
+    const actualDigest = await digestPreparedReleaseSource(releaseRoot).catch(
+      (error: unknown) => {
+        violations.push(
+          `release source is invalid in ${releaseRoot}: ${errorMessage(error)}`,
+        );
+        return undefined;
+      },
+    );
+    if (actualDigest && actualDigest !== release.sourceDigest)
+      violations.push(
+        `source digest does not match release metadata: ${releaseRoot}`,
+      );
   }
   if (manifest.active) {
     await auditOwnedLink(
@@ -514,19 +572,15 @@ export async function auditOpenClawInstall(
 
 function installConfigPatch(
   layout: OpenClawInstallLayout,
-  currentPlugins: Record<string, unknown>,
   currentAllow: string[],
-  currentEntries: Record<string, unknown>,
   options: OpenClawPluginConfig,
 ): Record<string, unknown> {
   return {
     plugins: {
-      ...currentPlugins,
       allow: currentAllow.includes(PLUGIN_ID)
         ? currentAllow
         : [...currentAllow, PLUGIN_ID],
       entries: {
-        ...currentEntries,
         [PLUGIN_ID]: installConfigEntry(layout, options),
       },
     },
@@ -551,82 +605,73 @@ function installConfigEntry(
 }
 
 function uninstallConfigPatch(
-  currentPlugins: Record<string, unknown>,
   currentAllow: string[],
-  currentEntries: Record<string, unknown>,
+  currentEntry: unknown,
 ): Record<string, unknown> {
-  const entries = { ...currentEntries };
-  const currentEntry = entries[PLUGIN_ID];
+  let disabledEntry: Record<string, unknown> | undefined;
   if (
     currentEntry !== null &&
     typeof currentEntry === "object" &&
     !Array.isArray(currentEntry)
   )
-    entries[PLUGIN_ID] = {
+    disabledEntry = {
       ...(currentEntry as Record<string, unknown>),
       enabled: false,
     };
   return {
     plugins: {
-      ...currentPlugins,
       allow: currentAllow.filter((id) => id !== PLUGIN_ID),
-      entries,
+      entries: disabledEntry ? { [PLUGIN_ID]: disabledEntry } : {},
     },
   };
+}
+
+function validatePluginConfig(options: OpenClawPluginConfig): void {
+  for (const [name, value] of [
+    ["confirmationTtlMs", options.confirmationTtlMs],
+    ["maxRenderedChars", options.maxRenderedChars],
+    ["notificationPollMs", options.notificationPollMs],
+  ] as const)
+    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0))
+      throw new Error(`${name} must be a positive integer`);
 }
 
 async function readConfigSnapshot(
   dependencies: Pick<OpenClawLifecycleDependencies, "readConfigValue">,
 ): Promise<ConfigSnapshot> {
-  const rawPlugins = await dependencies.readConfigValue("plugins");
-  if (
-    rawPlugins !== undefined &&
-    (rawPlugins === null ||
-      typeof rawPlugins !== "object" ||
-      Array.isArray(rawPlugins))
-  )
-    throw new Error("OpenClaw plugins must be an object");
-  const plugins =
-    rawPlugins === undefined
-      ? {}
-      : { ...(rawPlugins as Record<string, unknown>) };
-  const rawAllow = plugins.allow;
-  const rawEntries = plugins.entries;
+  const rawAllow = await dependencies.readConfigValue("plugins.allow");
   if (
     rawAllow !== undefined &&
     (!Array.isArray(rawAllow) ||
       rawAllow.some((value) => typeof value !== "string" || !value))
   )
     throw new Error("OpenClaw plugins.allow must be an array of plugin ids");
-  if (
-    rawEntries !== undefined &&
-    (rawEntries === null ||
-      typeof rawEntries !== "object" ||
-      Array.isArray(rawEntries))
-  )
-    throw new Error("OpenClaw plugins.entries must be an object");
-  const entries =
-    rawEntries === undefined
-      ? {}
-      : { ...(rawEntries as Record<string, unknown>) };
   return {
-    plugins,
     allow: rawAllow === undefined ? [] : [...rawAllow],
-    entries,
-    entry: entries[PLUGIN_ID],
+    entry: await dependencies.readConfigValue(
+      'plugins.entries["prime-dispatch"]',
+    ),
   };
 }
 
 async function restoreConfigSnapshot(
   snapshot: ConfigSnapshot,
   dependencies: OpenClawLifecycleDependencies,
+  fallbackEntry?: Record<string, unknown>,
 ): Promise<void> {
-  await dependencies.replaceConfigValue("plugins.entries", snapshot.entries);
+  const entry =
+    snapshot.entry ??
+    (fallbackEntry ? { ...fallbackEntry, enabled: false } : { enabled: false });
   await dependencies.applyConfigPatch(
     {
-      plugins: { allow: snapshot.allow },
+      plugins: {
+        allow: snapshot.allow,
+        entries: {
+          [PLUGIN_ID]: entry,
+        },
+      },
     },
-    ["plugins.allow"],
+    CONFIG_REPLACE_PATHS,
   );
 }
 
@@ -638,24 +683,121 @@ async function ensureInstallDirectories(
     layout.releasesRoot,
     layout.backupsRoot,
     layout.configRoot,
-    dirname(layout.extensionPath),
   ]) {
-    await mkdir(path, { recursive: true, mode: 0o700 });
-    await chmod(path, 0o700);
+    await ensureRealDirectory(path, true);
   }
+  await ensureRealDirectory(dirname(layout.extensionPath), false);
+}
+
+async function ensureRealDirectory(
+  path: string,
+  owned: boolean,
+): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const value = await lstat(path);
+  if (value.isSymbolicLink() || !value.isDirectory())
+    throw new Error(
+      `${owned ? "owned install" : "OpenClaw extensions"} path must be a real directory: ${path}`,
+    );
+  if (owned) await chmod(path, 0o700);
 }
 
 async function acquireInstallLock(
   layout: OpenClawInstallLayout,
 ): Promise<() => Promise<void>> {
+  const nonce = randomUUID();
+  while (true) {
+    try {
+      await mkdir(layout.lockPath, { mode: 0o700 });
+      await atomicWriteFile(
+        join(layout.lockPath, "owner.json"),
+        `${JSON.stringify({
+          pid: process.pid,
+          createdAtMs: Date.now(),
+          nonce,
+        })}\n`,
+      );
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!(await reclaimStaleInstallLock(layout)))
+        throw new Error("Prime Dispatch OpenClaw lifecycle is already running");
+    }
+  }
+  return async () => {
+    const owner = await readInstallLockOwner(layout.lockPath).catch(
+      () => undefined,
+    );
+    if (owner?.nonce === nonce)
+      await rm(layout.lockPath, { recursive: true, force: true });
+  };
+}
+
+type InstallLockOwner = {
+  pid: number;
+  createdAtMs: number;
+  nonce: string;
+};
+
+async function reclaimStaleInstallLock(
+  layout: OpenClawInstallLayout,
+): Promise<boolean> {
+  const owner = await readInstallLockOwner(layout.lockPath).catch(
+    () => undefined,
+  );
+  let stale: boolean;
+  if (owner) {
+    stale =
+      Date.now() - owner.createdAtMs > INSTALL_LOCK_STALE_MS &&
+      !processExists(owner.pid);
+  } else {
+    const lockStat = await stat(layout.lockPath).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      },
+    );
+    if (!lockStat) return true;
+    stale = Date.now() - lockStat.mtimeMs > INSTALL_LOCK_STALE_MS;
+  }
+  if (!stale) return false;
+  const abandoned = join(
+    layout.installRoot,
+    `.abandoned-install-lock-${randomUUID()}`,
+  );
   try {
-    await mkdir(layout.lockPath, { mode: 0o700 });
+    await rename(layout.lockPath, abandoned);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST")
-      throw new Error("Prime Dispatch OpenClaw lifecycle is already running");
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
     throw error;
   }
-  return async () => await rm(layout.lockPath, { recursive: true });
+  await rm(abandoned, { recursive: true, force: true });
+  return true;
+}
+
+async function readInstallLockOwner(path: string): Promise<InstallLockOwner> {
+  const value = JSON.parse(
+    await readFile(join(path, "owner.json"), "utf8"),
+  ) as Partial<InstallLockOwner>;
+  if (
+    !Number.isSafeInteger(value.pid) ||
+    (value.pid ?? 0) <= 0 ||
+    typeof value.createdAtMs !== "number" ||
+    !Number.isFinite(value.createdAtMs) ||
+    typeof value.nonce !== "string" ||
+    !value.nonce
+  )
+    throw new Error("Prime Dispatch install lock owner is invalid");
+  return value as InstallLockOwner;
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 async function prepareRelease(
@@ -740,18 +882,17 @@ async function copyRequiredEntries(
 
 async function digestReleaseSource(sourceRoot: string): Promise<string> {
   const hash = createHash("sha256");
-  for (const relativePath of [
-    "dist",
-    "package.json",
-    "pnpm-lock.yaml",
-    "openclaw-plugin/dist",
-    "openclaw-plugin/openclaw.plugin.json",
-    "openclaw-plugin/package.json",
-    "openclaw-plugin/pnpm-lock.yaml",
-    "openclaw-plugin/pnpm-workspace.yaml",
-    "openclaw-plugin/README.md",
-  ])
-    await digestPath(join(sourceRoot, relativePath), relativePath, hash);
+  for (const entry of RELEASE_SOURCE_PATHS)
+    await digestPath(join(sourceRoot, entry.source), entry.label, hash);
+  return hash.digest("hex");
+}
+
+async function digestPreparedReleaseSource(
+  releaseRoot: string,
+): Promise<string> {
+  const hash = createHash("sha256");
+  for (const entry of RELEASE_SOURCE_PATHS)
+    await digestPath(join(releaseRoot, entry.prepared), entry.label, hash);
   return hash.digest("hex");
 }
 
@@ -787,7 +928,10 @@ async function releaseMatches(
     () => undefined,
   );
   return (
-    metadata?.releaseId === releaseId && metadata.sourceDigest === sourceDigest
+    metadata?.releaseId === releaseId &&
+    metadata.sourceDigest === sourceDigest &&
+    (await digestPreparedReleaseSource(releaseRoot).catch(() => undefined)) ===
+      sourceDigest
   );
 }
 
@@ -862,15 +1006,30 @@ async function hostConfigMatches(
     },
   );
   if (destinationRaw === undefined) return false;
-  const destinationValue = HostConfigSchema.parse(JSON.parse(destinationRaw));
-  return isDeepStrictEqual(sourceValue, destinationValue);
+  try {
+    const destinationValue = HostConfigSchema.parse(JSON.parse(destinationRaw));
+    return isDeepStrictEqual(sourceValue, destinationValue);
+  } catch {
+    return false;
+  }
 }
 
 async function initializeState(
   source: string | undefined,
   layout: OpenClawInstallLayout,
 ): Promise<void> {
-  if (await pathExists(layout.stateRoot)) return;
+  const existing = await lstat(layout.stateRoot).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    },
+  );
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory())
+      throw new Error("durable state must be a real directory");
+    await chmod(layout.stateRoot, 0o700);
+    return;
+  }
   if (!source) {
     await mkdir(layout.stateRoot, { mode: 0o700 });
     return;
@@ -879,6 +1038,7 @@ async function initializeState(
   const sourceStat = await lstat(canonicalSource);
   if (!sourceStat.isDirectory())
     throw new Error("state source must be a directory");
+  await assertNoSymlinks(canonicalSource, "state source");
   const staging = `${layout.stateRoot}.staging-${randomUUID()}`;
   try {
     await cp(canonicalSource, staging, {
@@ -893,6 +1053,15 @@ async function initializeState(
     await rm(staging, { recursive: true, force: true });
     throw error;
   }
+}
+
+async function assertNoSymlinks(path: string, label: string): Promise<void> {
+  const value = await lstat(path);
+  if (value.isSymbolicLink())
+    throw new Error(`${label} cannot contain symlinks: ${path}`);
+  if (value.isDirectory())
+    for (const child of await readdir(path))
+      await assertNoSymlinks(join(path, child), label);
 }
 
 async function switchDirectoryLink(
@@ -1016,8 +1185,30 @@ async function readInstallManifest(
     )
   )
     throw new Error("Prime Dispatch install manifest is invalid");
+  if (
+    !Number.isFinite(Date.parse(value.installedAt)) ||
+    !Number.isFinite(Date.parse(value.updatedAt))
+  )
+    throw new Error("Prime Dispatch install manifest timestamps are invalid");
   validateReleaseId(value.currentRelease);
   if (value.previousRelease) validateReleaseId(value.previousRelease);
+  const releaseIds = new Set<string>();
+  for (const release of value.releases) {
+    validateReleaseId(release.id);
+    if (!/^[a-f0-9]{64}$/.test(release.sourceDigest))
+      throw new Error(`release ${release.id} has an invalid source digest`);
+    if (!Number.isFinite(Date.parse(release.installedAt)))
+      throw new Error(`release ${release.id} has an invalid install time`);
+    if (releaseIds.has(release.id))
+      throw new Error(`release ${release.id} is duplicated`);
+    releaseIds.add(release.id);
+  }
+  if (!releaseIds.has(value.currentRelease))
+    throw new Error("current release is absent from install manifest releases");
+  if (value.previousRelease && !releaseIds.has(value.previousRelease))
+    throw new Error(
+      "previous release is absent from install manifest releases",
+    );
   return value as InstallManifest;
 }
 
@@ -1048,7 +1239,12 @@ function upsertRelease(
 }
 
 function validateReleaseId(value: string): void {
-  if (!RELEASE_ID_PATTERN.test(value) || value === "." || value === "..")
+  if (
+    value.length > 128 ||
+    !RELEASE_ID_PATTERN.test(value) ||
+    value === "." ||
+    value === ".."
+  )
     throw new Error(`invalid Prime Dispatch release id: ${value}`);
 }
 

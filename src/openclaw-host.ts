@@ -148,27 +148,6 @@ function dependencies(options: CommonOptions): OpenClawLifecycleDependencies {
         await rm(scratch, { recursive: true, force: true });
       }
     },
-    async replaceConfigValue(path, value) {
-      const serialized = JSON.stringify(value);
-      await runOpenClaw([
-        "config",
-        "set",
-        path,
-        serialized,
-        "--strict-json",
-        "--replace",
-        "--dry-run",
-        "--json",
-      ]);
-      await runOpenClaw([
-        "config",
-        "set",
-        path,
-        serialized,
-        "--strict-json",
-        "--replace",
-      ]);
-    },
     async validateConfig() {
       await runOpenClaw(["config", "validate", "--json"]);
     },
