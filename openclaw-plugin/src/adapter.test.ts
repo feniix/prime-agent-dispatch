@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { PrimeDispatchAdapter, type TrustedToolContext } from "./adapter.js";
+import {
+  confirmationContextHash,
+  PrimeDispatchAdapter,
+  type TrustedToolContext,
+} from "./adapter.js";
 
 const ownerContext: TrustedToolContext = {
   senderId: "owner-1",
@@ -108,12 +112,18 @@ describe("PrimeDispatchAdapter", () => {
     const restarted = new PrimeDispatchAdapter(adapter.config, {
       runCli: adapter.runCli,
     });
-    await expect(
-      restarted.start(
-        { action: "confirm", confirmationToken: preview.confirmationToken },
-        { ...ownerContext, threadId: "different" },
-      ),
-    ).rejects.toThrow(/context/);
+    for (const mismatchedContext of [
+      { ...ownerContext, to: "different-channel" },
+      { ...ownerContext, threadId: "different-thread" },
+      { ...ownerContext, senderId: "different-sender" },
+    ]) {
+      await expect(
+        restarted.start(
+          { action: "confirm", confirmationToken: preview.confirmationToken },
+          mismatchedContext,
+        ),
+      ).rejects.toThrow(/context/);
+    }
     expect(calls).toHaveLength(1);
 
     const launched = await restarted.start(
@@ -131,6 +141,23 @@ describe("PrimeDispatchAdapter", () => {
       ),
     ).rejects.toThrow(/used/);
     expect(stateRoot).toMatch(/prime-adapter-/);
+  });
+
+  it("hashes sender, channel, target, account, and thread independently", () => {
+    const context = {
+      ...ownerContext,
+      accountId: "default",
+    };
+    const baseline = confirmationContextHash(context);
+    for (const changed of [
+      { ...context, senderId: "different-sender" },
+      { ...context, channel: "different-channel" },
+      { ...context, to: "different-target" },
+      { ...context, accountId: "different-account" },
+      { ...context, threadId: "different-thread" },
+    ]) {
+      expect(confirmationContextHash(changed)).not.toBe(baseline);
+    }
   });
 
   it("maps the remaining typed operations to bounded, redacted CLI results", async () => {

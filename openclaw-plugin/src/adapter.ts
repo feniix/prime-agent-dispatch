@@ -125,7 +125,7 @@ export class PrimeDispatchAdapter {
       createdAt: new Date(now).toISOString(),
       expiresAt: new Date(now + this.config.confirmationTtlMs).toISOString(),
       requestHash,
-      contextHash: contextHash(context),
+      contextHash: confirmationContextHash(context),
       launchArgs,
     });
     const boundedPreview = sanitize(
@@ -151,7 +151,7 @@ export class PrimeDispatchAdapter {
       ["--job-id", input.jobId],
       context,
     );
-    const consumerId = `openclaw:${contextHash(context)}`;
+    const consumerId = `openclaw:${confirmationContextHash(context)}`;
     const pending = asRecord(
       await this.runCli([
         "notifications",
@@ -477,7 +477,7 @@ export class PrimeDispatchAdapter {
         throw new Error("confirmation was already used");
       if (Date.parse(record.expiresAt) <= Date.now())
         throw new Error("confirmation expired");
-      if (record.contextHash !== contextHash(context))
+      if (record.contextHash !== confirmationContextHash(context))
         throw new Error("confirmation context does not match the preview");
       const used = {
         ...record,
@@ -502,7 +502,7 @@ async function atomicWrite(path: string, value: unknown): Promise<void> {
   await rename(temporary, path);
 }
 
-function contextHash(context: TrustedToolContext): string {
+export function confirmationContextHash(context: TrustedToolContext): string {
   return createHash("sha256")
     .update(
       JSON.stringify({
