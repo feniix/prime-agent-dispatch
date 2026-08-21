@@ -3,7 +3,9 @@ import plugin, {
   buildCliEnvironment,
   confirmationCommandResult,
   confirmationCommandFailure,
+  createDiscordRefreshHandler,
   createNotificationDelivery,
+  statusCommandResult,
   trustedContext,
   trustedCommandContext,
 } from "./index.js";
@@ -232,12 +234,31 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     });
   });
 
+  it("returns a concise text-only snapshot for manual status commands", () => {
+    expect(
+      statusCommandResult(
+        {
+          state: { status: "running", secret: "must-not-render" },
+          presentation: {
+            blocks: [{ type: "text", text: "Status: running" }],
+          },
+        },
+        "job-1",
+      ),
+    ).toEqual({ text: "Prime job job-1\nStatus: running" });
+  });
+
   it("registers five optional typed tools and Discord confirmation commands", () => {
     const tools: string[] = [];
     const commands: Array<{
       name: string;
       requiredScopes?: string[];
       exposeSenderIsOwner?: boolean;
+    }> = [];
+    const interactiveHandlers: Array<{
+      channel: string;
+      namespace: string;
+      handler: unknown;
     }> = [];
     const api = {
       pluginConfig: {
@@ -247,6 +268,9 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       },
       registerTool: vi.fn((_factory, options) => tools.push(...options.names)),
       registerCommand: vi.fn((command) => commands.push(command)),
+      registerInteractiveHandler: vi.fn((handler) =>
+        interactiveHandlers.push(handler),
+      ),
       registerService: vi.fn(),
       runtime: { channel: { outbound: { loadAdapter: vi.fn() } } },
       logger: { warn: vi.fn() },
@@ -262,6 +286,13 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     expect(commands.map((command) => command.name)).toEqual([
       "prime-confirm",
       "prime-status",
+    ]);
+    expect(interactiveHandlers).toEqual([
+      {
+        channel: "discord",
+        namespace: "prime-dispatch",
+        handler: expect.any(Function),
+      },
     ]);
     expect(
       commands.find((command) => command.name === "prime-confirm"),
@@ -289,8 +320,9 @@ describe("Prime Dispatch OpenClaw plugin", () => {
                       type: "actions",
                       buttons: block.buttons.map((button: any) => ({
                         label: button.label,
-                        callbackData: button.action.command,
-                        callbackDataKind: "command",
+                        callbackData:
+                          button.action.command ?? button.action.value,
+                        callbackDataKind: button.action.type,
                         disabled: button.disabled,
                         reusable: button.reusable,
                       })),
@@ -343,7 +375,10 @@ describe("Prime Dispatch OpenClaw plugin", () => {
           buttons: [
             {
               label: "Refresh",
-              action: { type: "command", command: "/prime-status job-1" },
+              action: {
+                type: "callback",
+                value: "prime-dispatch:refresh:job-1",
+              },
               reusable: true,
             },
           ],
@@ -426,5 +461,63 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       }),
     );
     expect(gatewayRequest).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the originating status card without sending another message", async () => {
+    const status = {
+      jobId: "job-1",
+      route: {
+        channel: "discord",
+        to: "channel-1",
+        accountId: "default",
+        threadId: "thread-1",
+      },
+      text: "Prime job job-1: running",
+      presentation: {
+        title: "Prime job job-1",
+        tone: "info" as const,
+        blocks: [{ type: "text", text: "Status: running" }],
+      },
+    };
+    const adapter = {
+      interactiveStatus: vi.fn(async () => status),
+    };
+    const delivery = {
+      upsertStatusCard: vi.fn(async () => "message-1"),
+      deliverTerminal: vi.fn(async () => undefined),
+    };
+    const followUp = vi.fn(async () => undefined);
+    const handler = createDiscordRefreshHandler(
+      { config: {}, runtime: {} } as any,
+      adapter,
+      delivery,
+    );
+
+    await expect(
+      handler({
+        interactionId: "interaction-1",
+        senderId: "owner-1",
+        auth: { isAuthorizedSender: true },
+        interaction: {
+          payload: "refresh:job-1",
+          messageId: "message-1",
+        },
+        respond: { followUp },
+      }),
+    ).resolves.toEqual({ handled: true });
+
+    expect(adapter.interactiveStatus).toHaveBeenCalledWith(
+      { jobId: "job-1" },
+      { senderId: "owner-1", isAuthorizedSender: true },
+    );
+    expect(delivery.upsertStatusCard).toHaveBeenCalledWith({
+      jobId: "job-1",
+      route: status.route,
+      text: status.text,
+      presentation: status.presentation,
+      previousMessageId: "message-1",
+      deliveryKey: "job-1:refresh:interaction-1",
+    });
+    expect(followUp).not.toHaveBeenCalled();
   });
 });

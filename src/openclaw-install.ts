@@ -251,6 +251,16 @@ export async function installOpenClaw(
       rollbackReferenceIsVerified(existingManifest)
     ) {
       await dependencies.refreshPluginRegistry();
+      if (options.restartGateway) {
+        try {
+          await dependencies.restartGateway();
+        } catch (error) {
+          throw new Error(
+            `repaired ${releaseId} registry but gateway restart failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+      }
       return {
         changed: false,
         currentRelease: releaseId,
@@ -637,11 +647,11 @@ export async function auditOpenClawInstall(
         .readPluginSource()
         .catch((error: unknown) => {
           violations.push(
-            `active plugin source could not be read: ${errorMessage(error)}`,
+            `persisted plugin source could not be read: ${errorMessage(error)}`,
           );
           return undefined;
         });
-      if (!activeSource) violations.push("active plugin source is missing");
+      if (!activeSource) violations.push("persisted plugin source is missing");
       else {
         const [expectedCanonical, activeCanonical] = await Promise.all([
           realpath(expectedSource).catch(() => resolve(expectedSource)),
@@ -649,7 +659,7 @@ export async function auditOpenClawInstall(
         ]);
         if (activeCanonical !== expectedCanonical)
           violations.push(
-            `active plugin source targets another release: ${activeSource}`,
+            `persisted plugin source targets another release: ${activeSource}`,
           );
       }
     }

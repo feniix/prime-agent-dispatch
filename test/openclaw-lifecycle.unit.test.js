@@ -312,7 +312,7 @@ test("installs idempotently, preserves state across upgrade, and rolls back atom
     assert.equal(repeated.changed, false);
     assert.equal(dependencies.calls.dependencies.length, 2);
     assert.equal(dependencies.calls.registryRefreshes, 2);
-    assert.equal(dependencies.calls.restarts, 1);
+    assert.equal(dependencies.calls.restarts, 2);
 
     await writeSource(sourceRoot, "two");
     await writeFile(join(layout.stateRoot, "preserved.txt"), "durable\n");
@@ -423,7 +423,7 @@ test("audit detects a stale persisted plugin registry source", async () => {
           readPluginSource: async () => staleSource,
         })
       ).join("\n"),
-      /active plugin source targets another release/,
+      /persisted plugin source targets another release/,
     );
     assert.deepEqual(
       await auditOpenClawInstall(openclawStateDir, {
@@ -468,6 +468,43 @@ test("keeps a committed install coherent when gateway restart fails", async () =
         .currentRelease,
       "release-1",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an identical registry repair honors an explicit gateway restart", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    dependencies.restartGateway = async () => {
+      throw new Error("gateway unavailable");
+    };
+
+    await assert.rejects(
+      () =>
+        installOpenClaw(
+          {
+            openclawStateDir,
+            sourceRoot,
+            hostConfigSource,
+            releaseId: "release-1",
+            restartGateway: true,
+          },
+          dependencies,
+        ),
+      /repaired release-1 registry but gateway restart failed.*gateway unavailable/,
+    );
+    assert.equal(dependencies.calls.registryRefreshes, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

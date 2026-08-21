@@ -31,7 +31,10 @@ dependencies inside each release, records a digest over the complete published
 runtime and plugin trees, validates the host policy and resulting OpenClaw
 configuration, changes active symlinks atomically, and refreshes OpenClaw's
 persisted plugin registry before an optional Gateway restart. Audit verifies
-that the registry's active plugin source resolves to the current release, and
+that the persisted registry source resolves to the current release; it does not
+inspect module code already loaded in Gateway process memory. The explicit
+`--restart-gateway` option reloads that process even during an identical repair
+install. Audit also verifies published release content, and
 rollback recomputes the published digest before trusting a release. The shared
 state and host policy live outside releases, so upgrades and rollbacks do not
 replace job evidence.
@@ -85,7 +88,8 @@ Rerunning an identical install is a no-op. Reusing a release id for different
 source content is rejected. A changed plugin setting or host policy is applied
 without rebuilding an unchanged release. An identical rerun still refreshes
 the plugin registry, so it repairs a stale canonical plugin source left by an
-older installer or an interrupted activation.
+older installer or an interrupted activation. When `--restart-gateway` is
+present, that repair also restarts Gateway so the repaired source is loaded.
 
 An upgrade preserves releases created before published-tree digests were
 recorded, but does not retain them as rollback targets. Their source remains

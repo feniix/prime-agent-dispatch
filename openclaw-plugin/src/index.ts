@@ -166,6 +166,12 @@ const plugin = definePluginEntry({
       (p, c) => adapter.result({ jobId: p.jobId }, c),
     );
 
+    api.registerInteractiveHandler({
+      channel: "discord",
+      namespace: "prime-dispatch",
+      handler: createDiscordRefreshHandler(api, adapter),
+    });
+
     api.registerCommand({
       name: "prime-confirm",
       description: "Confirm one immutable Prime Dispatch preview",
@@ -204,8 +210,9 @@ const plugin = definePluginEntry({
       async handler(context) {
         const jobId = context.args?.trim();
         if (!jobId) throw new Error("job id is required");
-        return commandResult(
+        return statusCommandResult(
           await adapter.status({ jobId }, trustedCommandContext(context)),
+          jobId,
         );
       },
     });
@@ -255,6 +262,56 @@ type LoadedOutbound = NonNullable<
 type RenderPresentationInput = Parameters<
   NonNullable<LoadedOutbound["renderPresentation"]>
 >[0];
+
+type DiscordRefreshContext = {
+  interactionId: string;
+  senderId?: string;
+  auth: { isAuthorizedSender: boolean };
+  interaction: {
+    payload: string;
+    messageId?: string;
+  };
+  respond: {
+    followUp(input: { text: string; ephemeral?: boolean }): Promise<void>;
+  };
+};
+
+export function createDiscordRefreshHandler(
+  api: NotificationApi,
+  adapter: Pick<PrimeDispatchAdapter, "interactiveStatus">,
+  delivery: NotificationDelivery = createNotificationDelivery(api),
+) {
+  return async (rawContext: unknown) => {
+    const context = rawContext as DiscordRefreshContext;
+    try {
+      const jobId = refreshJobId(context.interaction.payload);
+      const messageId = context.interaction.messageId?.trim();
+      if (!messageId)
+        throw new Error("Discord refresh interaction omitted message id");
+      const status = await adapter.interactiveStatus(
+        { jobId },
+        {
+          ...(context.senderId ? { senderId: context.senderId } : {}),
+          isAuthorizedSender: context.auth.isAuthorizedSender,
+        },
+      );
+      await delivery.upsertStatusCard({
+        jobId,
+        route: status.route,
+        text: status.text,
+        presentation: status.presentation,
+        previousMessageId: messageId,
+        deliveryKey: `${jobId}:refresh:${context.interactionId}`,
+      });
+    } catch (error) {
+      await context.respond.followUp({
+        text: refreshFailure(error),
+        ephemeral: true,
+      });
+    }
+    return { handled: true };
+  };
+}
 
 export function createNotificationDelivery(
   api: NotificationApi,
@@ -561,10 +618,23 @@ function result(value: any) {
   };
 }
 
-function commandResult(value: any) {
+export function statusCommandResult(value: any, jobId: string) {
+  const status =
+    typeof value?.state?.status === "string" ? value.state.status : "unknown";
+  const detail = Array.isArray(value?.presentation?.blocks)
+    ? value.presentation.blocks.find(
+        (block: unknown) =>
+          typeof block === "object" &&
+          block !== null &&
+          (block as { type?: unknown }).type === "text" &&
+          typeof (block as { text?: unknown }).text === "string",
+      )?.text
+    : undefined;
   return {
-    text: JSON.stringify(value.state ?? value.resolvedRequest ?? value),
-    presentation: value.presentation,
+    text:
+      typeof detail === "string" && detail.trim()
+        ? `Prime job ${jobId}\n${detail}`
+        : `Prime job ${jobId}: ${status}`,
   };
 }
 
@@ -575,6 +645,27 @@ export function confirmationCommandResult(value: any) {
       ? `Prime job ${jobId} launched. Status updates will follow in this thread.`
       : "Prime job launched. Status updates will follow in this thread.",
   };
+}
+
+function refreshJobId(payload: string): string {
+  const prefix = "refresh:";
+  if (!payload.startsWith(prefix))
+    throw new Error("invalid Prime refresh action");
+  const jobId = payload.slice(prefix.length).trim();
+  if (!/^[a-zA-Z0-9._-]+$/.test(jobId))
+    throw new Error("invalid Prime refresh job id");
+  return jobId;
+}
+
+function refreshFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return [
+    "Prime Dispatch is owner-only",
+    "invalid Prime refresh action",
+    "invalid Prime refresh job id",
+  ].includes(message)
+    ? `Prime refresh failed: ${message}`
+    : "Prime refresh failed; inspect the gateway log";
 }
 
 function messageIdFromDelivery(value: any): string {

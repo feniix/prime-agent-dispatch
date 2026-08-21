@@ -71,6 +71,20 @@ export type Presentation = {
   blocks: Array<Record<string, unknown>>;
 };
 
+export type StatusCardRoute = {
+  channel: string;
+  to: string;
+  accountId?: string;
+  threadId?: string;
+};
+
+export type InteractiveStatusResult = {
+  jobId: string;
+  route: StatusCardRoute;
+  text: string;
+  presentation: Presentation;
+};
+
 type PreviewInput = {
   action: "preview";
   task: string;
@@ -188,6 +202,58 @@ export class PrimeDispatchAdapter {
     };
   }
 
+  async interactiveStatus(
+    input: { jobId: string },
+    actor: { senderId?: string; isAuthorizedSender: boolean },
+  ): Promise<InteractiveStatusResult> {
+    if (!actor.isAuthorizedSender || !actor.senderId)
+      throw new Error("Prime Dispatch is owner-only");
+    const pending = asRecord(
+      await this.runCli([
+        "notifications",
+        "--state-root",
+        this.config.stateRoot,
+        "--job-id",
+        input.jobId,
+        "--consumer-id",
+        "openclaw:discord-status-v1",
+      ]),
+    );
+    const request = asRecord(pending.request);
+    const authorization = asRecord(request.authorization);
+    if (
+      authorization.senderIsOwner !== true ||
+      stringField(authorization, "senderId") !== actor.senderId
+    )
+      throw new Error("Prime Dispatch is owner-only");
+    const route = statusCardRoute(authorization);
+    if (route.channel !== "discord")
+      throw new Error("Prime Dispatch beta is Discord-only");
+    const response = await this.readOperation(
+      "status",
+      ["--job-id", input.jobId],
+      {
+        senderId: actor.senderId,
+        senderIsOwner: true,
+        channel: "discord",
+        to: route.to,
+        ...(route.accountId ? { accountId: route.accountId } : {}),
+        ...(route.threadId ? { threadId: route.threadId } : {}),
+      },
+    );
+    const state = asRecord(response.state);
+    const status = stringField(state, "status");
+    return {
+      jobId: input.jobId,
+      route,
+      text: statusSummary(input.jobId, status, state.inference).slice(
+        0,
+        this.config.maxRenderedChars,
+      ),
+      presentation: response.presentation as Presentation,
+    };
+  }
+
   async steer(
     input: { jobId: string; message: string },
     context: TrustedToolContext,
@@ -253,16 +319,7 @@ export class PrimeDispatchAdapter {
       const request = asRecord(pending.request);
       const authorization = asRecord(request.authorization);
       if (authorization.senderIsOwner !== true) continue;
-      const route = {
-        channel: stringField(authorization, "provider"),
-        to: stringField(authorization, "channelId"),
-        ...(typeof authorization.accountId === "string"
-          ? { accountId: authorization.accountId }
-          : {}),
-        ...(typeof authorization.threadId === "string"
-          ? { threadId: authorization.threadId }
-          : {}),
-      };
+      const route = statusCardRoute(authorization);
       const state = asRecord(pending.state);
       const status = stringField(state, "status");
       const presentation = statusPresentation(jobId, status, state.inference);
@@ -273,12 +330,10 @@ export class PrimeDispatchAdapter {
         throw new Error("notification omitted sequence");
       const deliveryKey = stringField(last, "deliveryKey");
       const previousMessageId = await this.readStatusCard(jobId);
-      const text = [
-        `Prime job ${jobId}: ${status}`,
-        ...inferenceStatusLines(state.inference).slice(0, 1),
-      ]
-        .join(" · ")
-        .slice(0, this.config.maxRenderedChars);
+      const text = statusSummary(jobId, status, state.inference).slice(
+        0,
+        this.config.maxRenderedChars,
+      );
       const messageId = await delivery.upsertStatusCard({
         jobId,
         route,
@@ -723,7 +778,10 @@ function statusPresentation(
         buttons: [
           {
             label: "Refresh",
-            action: { type: "command", command: `/prime-status ${jobId}` },
+            action: {
+              type: "callback",
+              value: `prime-dispatch:refresh:${jobId}`,
+            },
             disabled: terminal,
             reusable: true,
           },
@@ -731,4 +789,28 @@ function statusPresentation(
       },
     ],
   };
+}
+
+function statusCardRoute(authorization: Record<string, any>): StatusCardRoute {
+  return {
+    channel: stringField(authorization, "provider"),
+    to: stringField(authorization, "channelId"),
+    ...(typeof authorization.accountId === "string"
+      ? { accountId: authorization.accountId }
+      : {}),
+    ...(typeof authorization.threadId === "string"
+      ? { threadId: authorization.threadId }
+      : {}),
+  };
+}
+
+function statusSummary(
+  jobId: string,
+  status: string,
+  inference?: unknown,
+): string {
+  return [
+    `Prime job ${jobId}: ${status}`,
+    ...inferenceStatusLines(inference).slice(0, 1),
+  ].join(" · ");
 }

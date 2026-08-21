@@ -56,7 +56,10 @@ function withCommonOptions(command: Command): Command {
       "notification poll interval in milliseconds",
       Number,
     )
-    .option("--restart-gateway", "restart the Gateway after a valid change");
+    .option(
+      "--restart-gateway",
+      "restart the Gateway after activation or registry repair",
+    );
 }
 
 function pluginConfig(options: CommonOptions): OpenClawPluginConfig {
