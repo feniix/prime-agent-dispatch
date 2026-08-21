@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import plugin, {
   buildCliEnvironment,
+  confirmationCommandResult,
   confirmationCommandFailure,
   createNotificationDelivery,
   trustedContext,
@@ -219,6 +220,18 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     );
   });
 
+  it("returns only a minimal acknowledgement after confirmation launches", () => {
+    expect(
+      confirmationCommandResult({
+        jobId: "job-1",
+        state: { status: "queued" },
+        presentation: { title: "stale queued card" },
+      }),
+    ).toEqual({
+      text: "Prime job job-1 launched. Status updates will follow in this thread.",
+    });
+  });
+
   it("registers five optional typed tools and Discord confirmation commands", () => {
     const tools: string[] = [];
     const commands: Array<{
@@ -268,7 +281,23 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       channelData: {
         discord: {
           presentationComponents: {
-            blocks: presentation.blocks,
+            blocks: [
+              { type: "text", text: presentation.title },
+              ...presentation.blocks.map((block: any) =>
+                block.type === "buttons"
+                  ? {
+                      type: "actions",
+                      buttons: block.buttons.map((button: any) => ({
+                        label: button.label,
+                        callbackData: button.action.command,
+                        callbackDataKind: "command",
+                        disabled: button.disabled,
+                        reusable: button.reusable,
+                      })),
+                    }
+                  : block,
+              ),
+            ],
           },
         },
       },
@@ -307,7 +336,19 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     const presentation = {
       title: "Prime job job-1",
       tone: "info" as const,
-      blocks: [{ type: "text", text: "Status: running" }],
+      blocks: [
+        { type: "text", text: "Status: running" },
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Refresh",
+              action: { type: "command", command: "/prime-status job-1" },
+              reusable: true,
+            },
+          ],
+        },
+      ],
     };
 
     await expect(
@@ -324,7 +365,22 @@ describe("Prime Dispatch OpenClaw plugin", () => {
         jobId: "job-1",
         route,
         text: "Prime job job-1: succeeded",
-        presentation: { ...presentation, tone: "success" },
+        presentation: {
+          ...presentation,
+          tone: "success",
+          blocks: [
+            presentation.blocks[0],
+            {
+              ...presentation.blocks[1],
+              buttons: [
+                {
+                  ...presentation.blocks[1].buttons[0],
+                  disabled: true,
+                },
+              ],
+            },
+          ],
+        },
         previousMessageId: "message-1",
         deliveryKey: "job-1:event:8",
       }),
@@ -351,8 +407,23 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     expect(editDiscordComponentMessage).toHaveBeenCalledWith(
       "channel:thread-1",
       "message-1",
-      expect.objectContaining({ blocks: presentation.blocks }),
+      expect.objectContaining({
+        blocks: expect.arrayContaining([
+          expect.objectContaining({
+            type: "actions",
+            buttons: [expect.objectContaining({ disabled: true })],
+          }),
+        ]),
+      }),
       expect.objectContaining({ cfg: {}, accountId: "default" }),
+    );
+    expect(renderPresentation).toHaveBeenCalledTimes(2);
+    expect(sendPayload).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        payload: { text: "Prime job job-1: succeeded" },
+        deliveryQueueId: "job-1:event:8:terminal",
+      }),
     );
     expect(gatewayRequest).not.toHaveBeenCalled();
   });

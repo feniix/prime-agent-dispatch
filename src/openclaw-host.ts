@@ -151,6 +151,23 @@ function dependencies(options: CommonOptions): OpenClawLifecycleDependencies {
     async validateConfig() {
       await runOpenClaw(["config", "validate", "--json"]);
     },
+    async refreshPluginRegistry() {
+      await runOpenClaw(["plugins", "registry", "--refresh", "--json"]);
+    },
+    async readPluginSource() {
+      const { stdout } = await runOpenClaw([
+        "plugins",
+        "info",
+        "prime-dispatch",
+        "--json",
+      ]);
+      const result = JSON.parse(stdout) as {
+        plugin?: { source?: unknown };
+      };
+      return typeof result.plugin?.source === "string"
+        ? result.plugin.source
+        : undefined;
+    },
     async restartGateway() {
       await runOpenClaw(["gateway", "restart"]);
     },
@@ -256,8 +273,12 @@ program
     "OpenClaw state directory",
     join(homedir(), ".openclaw"),
   )
-  .action(async (options: { openclawStateDir: string }) => {
-    const violations = await auditOpenClawInstall(options.openclawStateDir);
+  .option("--openclaw-bin <path>", "OpenClaw CLI executable", "openclaw")
+  .action(async (options: CommonOptions) => {
+    const violations = await auditOpenClawInstall(
+      options.openclawStateDir,
+      dependencies(options),
+    );
     print({ ok: violations.length === 0, violations });
     if (violations.length > 0) process.exitCode = 1;
   });

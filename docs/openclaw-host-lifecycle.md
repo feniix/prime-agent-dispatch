@@ -29,8 +29,10 @@ Directories are mode `0700` and regular files are mode `0600`. The installer
 rejects release-source symlinks, installs lockfile-pinned production
 dependencies inside each release, records a digest over the complete published
 runtime and plugin trees, validates the host policy and resulting OpenClaw
-configuration, and changes active symlinks atomically. Audit and rollback both
-recompute that digest before trusting a release. The shared
+configuration, changes active symlinks atomically, and refreshes OpenClaw's
+persisted plugin registry before an optional Gateway restart. Audit verifies
+that the registry's active plugin source resolves to the current release, and
+rollback recomputes the published digest before trusting a release. The shared
 state and host policy live outside releases, so upgrades and rollbacks do not
 replace job evidence.
 
@@ -81,7 +83,9 @@ node dist/openclaw-host.js install \
 
 Rerunning an identical install is a no-op. Reusing a release id for different
 source content is rejected. A changed plugin setting or host policy is applied
-without rebuilding an unchanged release.
+without rebuilding an unchanged release. An identical rerun still refreshes
+the plugin registry, so it repairs a stale canonical plugin source left by an
+older installer or an interrupted activation.
 
 An upgrade preserves releases created before published-tree digests were
 recorded, but does not retain them as rollback targets. Their source remains

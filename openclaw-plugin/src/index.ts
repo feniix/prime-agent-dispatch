@@ -180,7 +180,7 @@ const plugin = definePluginEntry({
           const token = context.args?.trim();
           if (!token) throw new Error("confirmation token is required");
           trusted = trustedCommandContext(context);
-          return commandResult(
+          return confirmationCommandResult(
             await adapter.start(
               { action: "confirm", confirmationToken: token },
               trusted,
@@ -325,7 +325,22 @@ export function createNotificationDelivery(
       return input.previousMessageId;
     },
     async deliverTerminal(input) {
-      await send(input);
+      if (input.route.channel !== "discord")
+        throw new Error("Prime Dispatch notification route must be Discord");
+      const outbound =
+        await api.runtime.channel.outbound.loadAdapter("discord");
+      if (!outbound?.sendPayload)
+        throw new Error("Discord outbound adapter lacks payload delivery");
+      const payload = { text: input.text };
+      await outbound.sendPayload({
+        cfg: api.config,
+        to: input.route.to,
+        text: input.text,
+        payload,
+        deliveryQueueId: input.deliveryKey,
+        ...(input.route.accountId ? { accountId: input.route.accountId } : {}),
+        ...(input.route.threadId ? { threadId: input.route.threadId } : {}),
+      });
     },
   };
 }
@@ -550,6 +565,15 @@ function commandResult(value: any) {
   return {
     text: JSON.stringify(value.state ?? value.resolvedRequest ?? value),
     presentation: value.presentation,
+  };
+}
+
+export function confirmationCommandResult(value: any) {
+  const jobId = typeof value?.jobId === "string" ? value.jobId : undefined;
+  return {
+    text: jobId
+      ? `Prime job ${jobId} launched. Status updates will follow in this thread.`
+      : "Prime job launched. Status updates will follow in this thread.",
   };
 }
 

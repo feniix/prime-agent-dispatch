@@ -114,6 +114,7 @@ function fakeDependencies(config) {
     dependencies: [],
     patches: [],
     validations: 0,
+    registryRefreshes: 0,
     restarts: 0,
   };
   return {
@@ -144,6 +145,9 @@ function fakeDependencies(config) {
     },
     async validateConfig() {
       calls.validations += 1;
+    },
+    async refreshPluginRegistry() {
+      calls.registryRefreshes += 1;
     },
     async restartGateway() {
       calls.restarts += 1;
@@ -266,6 +270,7 @@ test("installs idempotently, preserves state across upgrade, and rolls back atom
     assert.equal(first.changed, true);
     assert.equal(first.currentRelease, "release-1");
     assert.equal(dependencies.calls.dependencies.length, 2);
+    assert.equal(dependencies.calls.registryRefreshes, 1);
     assert.equal(dependencies.calls.restarts, 1);
     assert.deepEqual(config.plugins.allow, [
       "existing-plugin",
@@ -306,6 +311,7 @@ test("installs idempotently, preserves state across upgrade, and rolls back atom
     );
     assert.equal(repeated.changed, false);
     assert.equal(dependencies.calls.dependencies.length, 2);
+    assert.equal(dependencies.calls.registryRefreshes, 2);
     assert.equal(dependencies.calls.restarts, 1);
 
     await writeSource(sourceRoot, "two");
@@ -322,6 +328,7 @@ test("installs idempotently, preserves state across upgrade, and rolls back atom
     );
     assert.equal(upgraded.currentRelease, "release-2");
     assert.equal(upgraded.previousRelease, "release-1");
+    assert.equal(dependencies.calls.registryRefreshes, 3);
     assert.equal(
       await readFile(join(layout.stateRoot, "preserved.txt"), "utf8"),
       "durable\n",
@@ -333,6 +340,7 @@ test("installs idempotently, preserves state across upgrade, and rolls back atom
     );
     assert.equal(rolledBack.currentRelease, "release-1");
     assert.equal(rolledBack.previousRelease, "release-2");
+    assert.equal(dependencies.calls.registryRefreshes, 4);
     assert.equal(
       await readFile(join(layout.stateRoot, "preserved.txt"), "utf8"),
       "durable\n",
@@ -382,6 +390,47 @@ test("restores the active release when config validation fails", async () => {
       JSON.parse(await readFile(layout.installManifestPath, "utf8"))
         .currentRelease,
       "release-1",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audit detects a stale persisted plugin registry source", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+        releaseId: "release-1",
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    const staleSource = join(
+      layout.releasesRoot,
+      "previous-release",
+      "plugin",
+      "dist",
+      "index.js",
+    );
+    assert.match(
+      (
+        await auditOpenClawInstall(openclawStateDir, {
+          readPluginSource: async () => staleSource,
+        })
+      ).join("\n"),
+      /active plugin source targets another release/,
+    );
+    assert.deepEqual(
+      await auditOpenClawInstall(openclawStateDir, {
+        readPluginSource: async () =>
+          join(layout.releasesRoot, "release-1", "plugin", "dist", "index.js"),
+      }),
+      [],
     );
   } finally {
     await rm(root, { recursive: true, force: true });
