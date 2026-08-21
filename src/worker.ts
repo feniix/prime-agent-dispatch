@@ -31,6 +31,7 @@ import {
 } from "./policy.js";
 import { readProcessStartIdentity } from "./worker-identity.js";
 import { containWorkerSocketErrors } from "./ipc.js";
+import type { RecoveryStage, ResumePlan } from "./recovery.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -215,6 +216,7 @@ async function finalizeTerminalOutcome(
   summary: string,
   gateResults: GateResult[],
   patch: Pick<JobState, "commitSha" | "noChanges" | "summary" | "error">,
+  recoveryCheckpoint?: { attemptId: string; operationKey: string },
 ): Promise<JobState> {
   current = await syncInferenceUsage(current);
   const terminalView = { ...current, ...patch, status } satisfies JobState;
@@ -224,7 +226,29 @@ async function finalizeTerminalOutcome(
     summary,
     gateResults,
   );
-  return await store.finalizeTerminal(result, patch, leaseToken);
+  return await store.finalizeTerminal(
+    result,
+    patch,
+    leaseToken,
+    recoveryCheckpoint,
+  );
+}
+
+const resumeStageOrder: readonly RecoveryStage[] = [
+  "worktree",
+  "model_provisioning",
+  "prime_execution",
+  "quiescence",
+  "verification",
+  "commit",
+  "terminal_materialization",
+];
+
+function shouldRunStage(plan: ResumePlan | undefined, stage: RecoveryStage) {
+  if (!plan) return true;
+  return (
+    resumeStageOrder.indexOf(stage) >= resumeStageOrder.indexOf(plan.nextStage)
+  );
 }
 
 async function syncInferenceUsage(current: JobState): Promise<JobState> {
@@ -282,7 +306,9 @@ async function main(): Promise<void> {
     }
   };
   let state = await store.readState(jobId);
-  let gateResults: GateResult[] = [];
+  const attempt = await store.currentAttempt(jobId);
+  const resumePlan = attempt.resumePlan;
+  let gateResults: GateResult[] = [...(resumePlan?.gateResults ?? [])];
   const requestCancellation = async (): Promise<void> => {
     cancellationRequested = true;
     cancellationPromise ??= (async () => {
@@ -315,12 +341,34 @@ async function main(): Promise<void> {
     state = await store.updateState(jobId, "provisioning", {
       ...executionPlan,
     });
-    const execution = await executionBackend.prepare(request, stateRoot, {
-      signal: controller.signal,
-      terminationGraceMs: request.budget.cancellationGraceMs,
-    });
-    assertJobActive();
-    state = await store.updateState(jobId, "running", execution);
+    let execution = executionPlan;
+    if (shouldRunStage(resumePlan, "worktree")) {
+      await store.beginCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "worktree:prepare",
+        "worktree",
+        executionPlan,
+      );
+      execution = await executionBackend.prepare(request, stateRoot, {
+        signal: controller.signal,
+        terminationGraceMs: request.budget.cancellationGraceMs,
+      });
+      assertJobActive();
+      await store.completeCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "worktree:prepare",
+        execution,
+      );
+    } else {
+      if (!resumePlan?.worktreePath || !resumePlan.branchName)
+        throw new Error("resume plan omitted preserved worktree identity");
+      execution = {
+        worktreePath: resumePlan.worktreePath,
+        branchName: resumePlan.branchName,
+      };
+    }
     let primeRuntime:
       | {
           homeDir: string;
@@ -330,7 +378,19 @@ async function main(): Promise<void> {
           path: string;
         }
       | undefined;
-    if (request.agent.kind === "prime-rpc") {
+    if (shouldRunStage(resumePlan, "model_provisioning")) {
+      await store.beginCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "model:provision",
+        "model_provisioning",
+        { agentKind: request.agent.kind },
+      );
+    }
+    if (
+      shouldRunStage(resumePlan, "model_provisioning") &&
+      request.agent.kind === "prime-rpc"
+    ) {
       const auth = await abortable(
         resolveCodexSubscriptionAuth(),
         controller.signal,
@@ -387,39 +447,92 @@ async function main(): Promise<void> {
         terminationGraceMs: request.budget.cancellationGraceMs,
       });
     }
+    if (shouldRunStage(resumePlan, "model_provisioning"))
+      await store.completeCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "model:provision",
+        { runtimeVerified: true },
+      );
     assertJobActive();
-    agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
-    const agentResult = await agent.start(
-      request.task,
-      execution.worktreePath,
-      controller.signal,
-    );
-    const boundedRpcRecords = agentResult.metadata.oversizedRpcRecords;
-    if (Array.isArray(boundedRpcRecords) && boundedRpcRecords.length > 0)
-      await store.appendEvent(jobId, "agent_rpc_records_bounded", {
-        records: boundedRpcRecords,
-        ...(typeof agentResult.metadata.oversizedRpcRecordsOmitted === "number"
-          ? {
-              omitted: agentResult.metadata.oversizedRpcRecordsOmitted,
-            }
-          : {}),
+    state = await store.updateState(jobId, "running", execution);
+    let agentResult = resumePlan?.agentResult;
+    if (shouldRunStage(resumePlan, "prime_execution")) {
+      agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
+      await store.beginCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "prime:execute",
+        "prime_execution",
+        { turnsUsed },
+      );
+      agentResult = await agent.start(
+        request.task,
+        execution.worktreePath,
+        controller.signal,
+      );
+      const boundedRpcRecords = agentResult.metadata.oversizedRpcRecords;
+      if (Array.isArray(boundedRpcRecords) && boundedRpcRecords.length > 0)
+        await store.appendEvent(jobId, "agent_rpc_records_bounded", {
+          records: boundedRpcRecords,
+          ...(typeof agentResult.metadata.oversizedRpcRecordsOmitted ===
+          "number"
+            ? {
+                omitted: agentResult.metadata.oversizedRpcRecordsOmitted,
+              }
+            : {}),
+        });
+      assertJobActive();
+      await inferenceLease?.revoke();
+      state = await syncInferenceUsage(state);
+      await store.completeCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "prime:execute",
+        { agentResult, turnsUsed },
+      );
+      await store.beginCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "prime:quiesce",
+        "quiescence",
+      );
+      await agent.dispose();
+      agent = undefined;
+      await store.completeCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "prime:quiesce",
+        { processTreeExited: true },
+      );
+      await store.appendEvent(jobId, "agent_completed", {
+        summary: agentResult.summary,
+        metadata: agentResult.metadata,
       });
-    assertJobActive();
-    await inferenceLease?.revoke();
-    state = await syncInferenceUsage(state);
-    await store.appendEvent(jobId, "agent_completed", {
-      summary: agentResult.summary,
-      metadata: agentResult.metadata,
-    });
-    if (inferenceBroker)
-      await store.appendEvent(jobId, "inference_completed", {
-        ...inferenceBroker.stats(),
-        usage: inferenceLease?.usage(),
-      });
+      if (inferenceBroker)
+        await store.appendEvent(jobId, "inference_completed", {
+          ...inferenceBroker.stats(),
+          usage: inferenceLease?.usage(),
+        });
+    }
+    if (!agentResult)
+      throw new Error("resume plan omitted completed Prime result");
     state = await store.updateState(jobId, "verifying", {
       summary: agentResult.summary,
     });
-    for (const [gateIndex, gate] of request.gates.entries()) {
+    for (
+      let gateIndex = gateResults.length;
+      gateIndex < request.gates.length;
+      gateIndex += 1
+    ) {
+      const gate = request.gates[gateIndex]!;
+      await store.beginCheckpoint(
+        jobId,
+        attempt.attemptId,
+        `gate:${gateIndex}`,
+        "verification",
+        { gateIndex, name: gate.name },
+      );
       const command = await runCommand(gate.command, gate.args, {
         cwd: execution.worktreePath,
         env: buildRemoteInertGitEnvironment(),
@@ -445,6 +558,12 @@ async function main(): Promise<void> {
         `checks/${String(gateIndex + 1).padStart(3, "0")}-${gate.name.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`,
         gateResult.output,
       );
+      await store.completeCheckpoint(
+        jobId,
+        attempt.attemptId,
+        `gate:${gateIndex}`,
+        { gateIndex, gateResult },
+      );
       if (!gateResult.ok)
         throw new Error(`verification gate failed: ${gate.name}`);
     }
@@ -455,38 +574,67 @@ async function main(): Promise<void> {
       signal: controller.signal,
       terminationGraceMs: request.budget.cancellationGraceMs,
     };
-    await git(execution.worktreePath, ["add", "-A"], gitControl);
-    assertJobActive();
-    const staged = await git(
-      execution.worktreePath,
-      ["diff", "--cached", "--name-only"],
-      gitControl,
-    );
-    let commitSha: string | undefined;
-    const noChanges = staged.length === 0;
-    if (!noChanges) {
-      await git(
+    let commitSha = resumePlan?.commitSha;
+    let noChanges = resumePlan?.noChanges;
+    if (shouldRunStage(resumePlan, "commit")) {
+      await store.beginCheckpoint(
+        jobId,
+        attempt.attemptId,
+        "git:commit",
+        "commit",
+        { baseSha: request.baseSha },
+      );
+      await git(execution.worktreePath, ["add", "-A"], gitControl);
+      assertJobActive();
+      const staged = await git(
         execution.worktreePath,
-        [
-          "-c",
-          "user.name=Prime Dispatch",
-          "-c",
-          "user.email=prime-dispatch@local.invalid",
-          "-c",
-          "commit.gpgsign=false",
-          "commit",
-          "-m",
-          `prime dispatch ${jobId}`,
-        ],
+        ["diff", "--cached", "--name-only"],
         gitControl,
       );
-      commitSha = await git(
-        execution.worktreePath,
-        ["rev-parse", "HEAD"],
-        gitControl,
-      );
+      noChanges = staged.length === 0;
+      if (!noChanges) {
+        await git(
+          execution.worktreePath,
+          [
+            "-c",
+            "user.name=Prime Dispatch",
+            "-c",
+            "user.email=prime-dispatch@local.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            `prime dispatch ${jobId}`,
+          ],
+          gitControl,
+        );
+        commitSha = await git(
+          execution.worktreePath,
+          ["rev-parse", "HEAD"],
+          gitControl,
+        );
+      }
+      await store.completeCheckpoint(jobId, attempt.attemptId, "git:commit", {
+        ...(commitSha ? { commitSha } : {}),
+        noChanges,
+      });
     }
+    if (noChanges === undefined)
+      throw new Error("resume plan omitted commit outcome");
     assertJobActive();
+    await store.beginCheckpoint(
+      jobId,
+      attempt.attemptId,
+      "terminal:materialize",
+      "terminal_materialization",
+      {
+        terminalStatus: "succeeded",
+        summary: agentResult.summary,
+        gateResults,
+        ...(commitSha ? { commitSha } : {}),
+        noChanges,
+      },
+    );
     const diff = await git(
       execution.worktreePath,
       ["diff", "--binary", `${request.baseSha}..HEAD`],
@@ -521,6 +669,7 @@ async function main(): Promise<void> {
         noChanges,
         summary: agentResult.summary,
       },
+      { attemptId: attempt.attemptId, operationKey: "terminal:materialize" },
     );
   } catch (error) {
     await cancellationPromise?.catch(() => undefined);

@@ -35,6 +35,15 @@ import {
   type ControlDatabase,
 } from "./sqlite.js";
 import { assertTransition, terminalStatuses } from "./state-machine.js";
+import {
+  ExecutionAttemptSchema,
+  RecoveryCheckpointSchema,
+  ResumePlanSchema,
+  type ExecutionAttempt,
+  type RecoveryCheckpoint,
+  type RecoveryStage,
+  type ResumePlan,
+} from "./recovery.js";
 
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
 const projectionQueues = new Map<string, Promise<void>>();
@@ -85,6 +94,30 @@ type JobRow = {
   request_json: string;
   state_json: string;
   result_json: string | null;
+};
+
+type AttemptRow = {
+  attempt_id: string;
+  job_id: string;
+  ordinal: number;
+  resumed_from_attempt_id: string | null;
+  status: ExecutionAttempt["status"];
+  started_at: string;
+  completed_at: string | null;
+  resume_plan_json: string | null;
+  terminal_result_json: string | null;
+};
+
+type CheckpointRow = {
+  attempt_id: string;
+  job_id: string;
+  operation_key: string;
+  ordinal: number;
+  stage: RecoveryStage;
+  status: RecoveryCheckpoint["status"];
+  facts_json: string;
+  started_at: string;
+  completed_at: string | null;
 };
 
 export type JobStoreOptions = {
@@ -253,6 +286,7 @@ export class JobStore {
     if (this.jobExists(request.jobId))
       throw alreadyExists(join(dir, "request.json"));
     const now = new Date().toISOString();
+    const attemptId = randomUUID();
     const state = JobStateSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       revision: 0,
@@ -267,7 +301,7 @@ export class JobStore {
       at: now,
       jobId: request.jobId,
       type: "job_created",
-      data: { status: "queued" },
+      data: { status: "queued", attemptId, attemptNumber: 1 },
     });
     this.transaction("initialize", () => {
       if (this.jobExists(request.jobId))
@@ -280,6 +314,14 @@ export class JobStore {
            ) VALUES (?, ?, ?, NULL, ?, ?, 0)`,
         )
         .run(request.jobId, sqliteJson(request), sqliteJson(state), now, now);
+      this.database
+        .prepare(
+          `INSERT INTO execution_attempts(
+             attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
+             started_at, completed_at, resume_plan_json, terminal_result_json
+           ) VALUES (?, ?, 1, NULL, 'active', ?, NULL, NULL, NULL)`,
+        )
+        .run(attemptId, request.jobId, now);
       this.insertEvent(event);
     });
     await this.projectRequest(request);
@@ -303,6 +345,411 @@ export class JobStore {
     const state = this.readStateFromDatabase(jobId);
     await this.projectState(state);
     return state;
+  }
+
+  async currentAttempt(jobId: string): Promise<ExecutionAttempt> {
+    await this.ensureImported(jobId);
+    return this.currentAttemptFromDatabase(jobId);
+  }
+
+  async readAttempts(jobId: string): Promise<ExecutionAttempt[]> {
+    await this.ensureImported(jobId);
+    return (
+      this.database
+        .prepare(
+          `SELECT attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
+                  started_at, completed_at, resume_plan_json, terminal_result_json
+           FROM execution_attempts WHERE job_id = ? ORDER BY ordinal`,
+        )
+        .all(jobId) as AttemptRow[]
+    ).map((row) => this.attemptFromRow(row));
+  }
+
+  async readCheckpoints(
+    jobId: string,
+    attemptId?: string,
+  ): Promise<RecoveryCheckpoint[]> {
+    await this.ensureImported(jobId);
+    const rows = (
+      attemptId
+        ? this.database
+            .prepare(
+              `SELECT attempt_id, job_id, operation_key, ordinal, stage, status,
+                      facts_json, started_at, completed_at
+               FROM recovery_checkpoints
+               WHERE job_id = ? AND attempt_id = ? ORDER BY ordinal`,
+            )
+            .all(jobId, attemptId)
+        : this.database
+            .prepare(
+              `SELECT attempt_id, job_id, operation_key, ordinal, stage, status,
+                      facts_json, started_at, completed_at
+               FROM recovery_checkpoints WHERE job_id = ?
+               ORDER BY attempt_id, ordinal`,
+            )
+            .all(jobId)
+    ) as CheckpointRow[];
+    return rows.map((row) => this.checkpointFromRow(row));
+  }
+
+  async beginCheckpoint(
+    jobId: string,
+    attemptId: string,
+    operationKey: string,
+    stage: RecoveryStage,
+    facts: Record<string, unknown> = {},
+  ): Promise<RecoveryCheckpoint> {
+    await this.ensureImported(jobId);
+    const checkpoint = this.transaction("begin_checkpoint", () => {
+      const attempt = this.currentAttemptFromDatabase(jobId);
+      if (attempt.attemptId !== attemptId || attempt.status !== "active")
+        throw new Error("checkpoint requires the active execution attempt");
+      const prior = this.database
+        .prepare(
+          `SELECT attempt_id, job_id, operation_key, ordinal, stage, status,
+                  facts_json, started_at, completed_at
+           FROM recovery_checkpoints
+           WHERE attempt_id = ? AND operation_key = ?`,
+        )
+        .get(attemptId, operationKey) as CheckpointRow | undefined;
+      if (prior)
+        throw new Error(
+          `checkpoint ${operationKey} already ${prior.status}; refusing to repeat it`,
+        );
+      const ordinal = (
+        this.database
+          .prepare(
+            `SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal
+             FROM recovery_checkpoints WHERE attempt_id = ?`,
+          )
+          .get(attemptId) as { ordinal: number }
+      ).ordinal;
+      const startedAt = new Date().toISOString();
+      const checkpoint = RecoveryCheckpointSchema.parse({
+        attemptId,
+        jobId,
+        operationKey,
+        ordinal,
+        stage,
+        status: "started",
+        facts,
+        startedAt,
+      });
+      this.database
+        .prepare(
+          `INSERT INTO recovery_checkpoints(
+             attempt_id, job_id, operation_key, ordinal, stage, status,
+             facts_json, started_at, completed_at
+           ) VALUES (?, ?, ?, ?, ?, 'started', ?, ?, NULL)`,
+        )
+        .run(
+          attemptId,
+          jobId,
+          operationKey,
+          ordinal,
+          stage,
+          sqliteJson(facts),
+          startedAt,
+        );
+      this.insertEvent(
+        this.newEvent(jobId, "recovery_checkpoint_started", {
+          attemptId,
+          operationKey,
+          stage,
+          ordinal,
+        }),
+      );
+      return checkpoint;
+    });
+    await this.projectEvents(jobId);
+    return checkpoint;
+  }
+
+  async completeCheckpoint(
+    jobId: string,
+    attemptId: string,
+    operationKey: string,
+    facts: Record<string, unknown> = {},
+  ): Promise<RecoveryCheckpoint> {
+    await this.ensureImported(jobId);
+    const checkpoint = this.transaction("complete_checkpoint", () => {
+      const attempt = this.currentAttemptFromDatabase(jobId);
+      if (attempt.attemptId !== attemptId || attempt.status !== "active")
+        throw new Error("checkpoint requires the active execution attempt");
+      const completedAt = new Date().toISOString();
+      const checkpoint = this.completeCheckpointInTransaction(
+        attemptId,
+        operationKey,
+        facts,
+        completedAt,
+      );
+      this.insertEvent(
+        this.newEvent(jobId, "recovery_checkpoint_completed", {
+          attemptId,
+          operationKey,
+          stage: checkpoint.stage,
+          ordinal: checkpoint.ordinal,
+        }),
+      );
+      return checkpoint;
+    });
+    await this.projectEvents(jobId);
+    return checkpoint;
+  }
+
+  async reconcileCheckpoint(
+    jobId: string,
+    attemptId: string,
+    operationKey: string,
+    facts: Record<string, unknown>,
+    decision: string,
+    resolution: "completed" | "retryable" = "completed",
+  ): Promise<RecoveryCheckpoint> {
+    await this.ensureImported(jobId);
+    const checkpoint = this.transaction("reconcile_checkpoint", () => {
+      const attempt = this.currentAttemptFromDatabase(jobId);
+      if (attempt.attemptId !== attemptId || attempt.status !== "interrupted")
+        throw new Error(
+          "checkpoint reconciliation requires the interrupted current attempt",
+        );
+      const row = this.database
+        .prepare(
+          `SELECT attempt_id, job_id, operation_key, ordinal, stage, status,
+                  facts_json, started_at, completed_at
+           FROM recovery_checkpoints
+           WHERE attempt_id = ? AND operation_key = ?`,
+        )
+        .get(attemptId, operationKey) as CheckpointRow | undefined;
+      if (!row || row.status !== "uncertain")
+        throw new Error("only uncertain checkpoint evidence can be reconciled");
+      if (
+        resolution === "retryable" &&
+        ![
+          "worktree",
+          "model_provisioning",
+          "commit",
+          "terminal_materialization",
+        ].includes(row.stage)
+      )
+        throw new Error(
+          `${row.stage} checkpoint cannot be declared safe to replay`,
+        );
+      const completedAt = new Date().toISOString();
+      const mergedFacts = {
+        ...(parseSqliteJson(
+          row.facts_json,
+          "recovery checkpoint facts",
+        ) as Record<string, unknown>),
+        ...facts,
+        reconciliationDecision: decision,
+      };
+      this.database
+        .prepare(
+          `UPDATE recovery_checkpoints
+           SET status = ?, facts_json = ?, completed_at = ?
+           WHERE attempt_id = ? AND operation_key = ? AND status = 'uncertain'`,
+        )
+        .run(
+          resolution,
+          sqliteJson(mergedFacts),
+          completedAt,
+          attemptId,
+          operationKey,
+        );
+      this.insertEvent(
+        this.newEvent(jobId, "recovery_decision_recorded", {
+          attemptId,
+          operationKey,
+          decision,
+          resolution,
+        }),
+      );
+      return this.checkpointFromRow({
+        ...row,
+        status: resolution,
+        facts_json: sqliteJson(mergedFacts),
+        completed_at: completedAt,
+      });
+    });
+    await this.projectEvents(jobId);
+    return checkpoint;
+  }
+
+  async createResumeConfirmation(
+    planValue: ResumePlan,
+    contextHash: string,
+    ttlMs = 5 * 60_000,
+  ): Promise<{
+    confirmationToken: string;
+    expiresAt: string;
+    plan: ResumePlan;
+  }> {
+    const plan = ResumePlanSchema.parse(planValue);
+    if (!/^[a-f0-9]{64}$/.test(contextHash))
+      throw new Error("invalid resume confirmation context hash");
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 10_000 || ttlMs > 900_000)
+      throw new Error("invalid resume confirmation TTL");
+    await this.ensureImported(plan.jobId);
+    const confirmationToken = randomUUID();
+    const tokenHash = sha256(confirmationToken);
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+    this.transaction("create_resume_confirmation", () => {
+      const state = this.readStateFromDatabase(plan.jobId);
+      const attempt = this.currentAttemptFromDatabase(plan.jobId);
+      if (state.status !== "interrupted" || attempt.status !== "interrupted")
+        throw new Error("only interrupted jobs can be resumed");
+      if (
+        plan.expectedRevision !== state.revision ||
+        plan.sourceAttemptId !== attempt.attemptId
+      )
+        throw new Error("resume plan is stale");
+      this.database
+        .prepare(
+          `INSERT INTO resume_confirmations(
+             token_hash, job_id, source_attempt_id, expected_revision,
+             context_hash, plan_json, created_at, expires_at, used_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(
+          tokenHash,
+          plan.jobId,
+          plan.sourceAttemptId,
+          plan.expectedRevision,
+          contextHash,
+          sqliteJson(plan),
+          createdAt,
+          expiresAt,
+        );
+      this.insertEvent(
+        this.newEvent(plan.jobId, "resume_preview_created", {
+          sourceAttemptId: plan.sourceAttemptId,
+          expectedRevision: plan.expectedRevision,
+          nextStage: plan.nextStage,
+          expiresAt,
+        }),
+      );
+    });
+    await this.projectEvents(plan.jobId);
+    return { confirmationToken, expiresAt, plan };
+  }
+
+  async consumeResumeConfirmation(
+    confirmationToken: string,
+    contextHash: string,
+    expectedJobId?: string,
+  ): Promise<{
+    state: JobState;
+    attempt: ExecutionAttempt;
+    plan: ResumePlan;
+  }> {
+    if (!/^[a-f0-9]{64}$/.test(contextHash))
+      throw new Error("invalid resume confirmation context hash");
+    const tokenHash = sha256(confirmationToken);
+    const now = new Date().toISOString();
+    const result = this.transaction("consume_resume_confirmation", () => {
+      const row = this.database
+        .prepare(
+          `SELECT job_id, source_attempt_id, expected_revision, context_hash,
+                  plan_json, expires_at, used_at
+           FROM resume_confirmations WHERE token_hash = ?`,
+        )
+        .get(tokenHash) as
+        | {
+            job_id: string;
+            source_attempt_id: string;
+            expected_revision: number;
+            context_hash: string;
+            plan_json: string;
+            expires_at: string;
+            used_at: string | null;
+          }
+        | undefined;
+      if (!row) throw new Error("resume confirmation is invalid");
+      if (expectedJobId && row.job_id !== expectedJobId)
+        throw new Error("resume confirmation job mismatch");
+      if (row.used_at) throw new Error("resume confirmation was already used");
+      if (row.expires_at <= now) throw new Error("resume confirmation expired");
+      if (row.context_hash !== contextHash)
+        throw new Error("resume confirmation context mismatch");
+      const plan = ResumePlanSchema.parse(
+        parseSqliteJson(row.plan_json, "resume plan"),
+      );
+      const current = this.readStateFromDatabase(row.job_id);
+      const source = this.currentAttemptFromDatabase(row.job_id);
+      if (
+        current.status !== "interrupted" ||
+        current.revision !== row.expected_revision ||
+        source.attemptId !== row.source_attempt_id ||
+        source.status !== "interrupted"
+      )
+        throw new Error("resume confirmation is stale");
+      const ordinal = source.ordinal + 1;
+      const attempt = ExecutionAttemptSchema.parse({
+        attemptId: randomUUID(),
+        jobId: row.job_id,
+        ordinal,
+        resumedFromAttemptId: source.attemptId,
+        status: "active",
+        startedAt: now,
+        resumePlan: plan,
+      });
+      const state = JobStateSchema.parse({
+        ...current,
+        status: "queued",
+        revision: current.revision + 1,
+        updatedAt: now,
+        workerPid: undefined,
+        workerStartIdentity: undefined,
+        workerNonce: undefined,
+        workerProtocolVersion: undefined,
+        socketPath: undefined,
+        commitSha: plan.commitSha,
+        noChanges: plan.noChanges,
+        summary: plan.agentResult?.summary,
+        error: undefined,
+        terminalIntentStatus: undefined,
+      });
+      this.database
+        .prepare(
+          "UPDATE resume_confirmations SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+        )
+        .run(now, tokenHash);
+      this.database
+        .prepare(
+          `INSERT INTO execution_attempts(
+             attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
+             started_at, completed_at, resume_plan_json, terminal_result_json
+           ) VALUES (?, ?, ?, ?, 'active', ?, NULL, ?, NULL)`,
+        )
+        .run(
+          attempt.attemptId,
+          attempt.jobId,
+          attempt.ordinal,
+          source.attemptId,
+          now,
+          sqliteJson(plan),
+        );
+      this.database
+        .prepare(
+          `UPDATE jobs SET state_json = ?, result_json = NULL, updated_at = ?
+           WHERE job_id = ?`,
+        )
+        .run(sqliteJson(state), now, row.job_id);
+      this.insertEvent(
+        this.newEvent(row.job_id, "resume_attempt_started", {
+          attemptId: attempt.attemptId,
+          attemptNumber: attempt.ordinal,
+          resumedFromAttemptId: source.attemptId,
+          nextStage: plan.nextStage,
+          expectedRevision: row.expected_revision,
+        }),
+      );
+      return { state, attempt, plan };
+    });
+    await this.projectState(result.state);
+    await this.projectEvents(result.state.jobId);
+    return result;
   }
 
   async updateState(
@@ -346,6 +793,7 @@ export class JobStore {
     resultValue: JobResult,
     patch: StatePatch,
     leaseToken?: LeaseReleaseToken,
+    recoveryCheckpoint?: { attemptId: string; operationKey: string },
   ): Promise<JobState> {
     const result = JobResultSchema.parse(resultValue);
     await this.ensureImported(result.jobId);
@@ -353,6 +801,18 @@ export class JobStore {
     const resultText = `${JSON.stringify(result, null, 2)}\n`;
     const { next } = this.transaction("finalize_terminal", () => {
       const current = this.readStateFromDatabase(result.jobId);
+      const attempt = this.currentAttemptFromDatabase(result.jobId);
+      if (attempt.status !== "active")
+        throw new Error(
+          "terminal finalization requires an active execution attempt",
+        );
+      if (
+        recoveryCheckpoint &&
+        recoveryCheckpoint.attemptId !== attempt.attemptId
+      )
+        throw new Error(
+          "terminal checkpoint does not belong to the active attempt",
+        );
       const request = JobRequestSchema.parse(
         parseSqliteJson(this.jobRow(result.jobId).request_json, "job request"),
       );
@@ -400,6 +860,33 @@ export class JobStore {
           sqliteJson(result),
           next.updatedAt,
           result.jobId,
+        );
+      if (!recoveryCheckpoint)
+        this.database
+          .prepare(
+            `UPDATE recovery_checkpoints
+             SET status = 'uncertain', completed_at = ?
+             WHERE attempt_id = ? AND status = 'started'`,
+          )
+          .run(result.completedAt, attempt.attemptId);
+      this.database
+        .prepare(
+          `UPDATE execution_attempts
+           SET status = ?, completed_at = ?, terminal_result_json = ?
+           WHERE attempt_id = ? AND status = 'active'`,
+        )
+        .run(
+          result.status,
+          result.completedAt,
+          sqliteJson(result),
+          attempt.attemptId,
+        );
+      if (recoveryCheckpoint)
+        this.completeCheckpointInTransaction(
+          recoveryCheckpoint.attemptId,
+          recoveryCheckpoint.operationKey,
+          { terminalStatus: result.status },
+          result.completedAt,
         );
       this.insertEvent(event);
       this.upsertArtifactMetadata(
@@ -863,6 +1350,94 @@ export class JobStore {
     return row;
   }
 
+  private currentAttemptFromDatabase(jobId: string): ExecutionAttempt {
+    const row = this.database
+      .prepare(
+        `SELECT attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
+                started_at, completed_at, resume_plan_json, terminal_result_json
+         FROM execution_attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1`,
+      )
+      .get(jobId) as AttemptRow | undefined;
+    if (!row) throw new Error(`job ${jobId} has no execution attempt`);
+    return this.attemptFromRow(row);
+  }
+
+  private attemptFromRow(row: AttemptRow): ExecutionAttempt {
+    return ExecutionAttemptSchema.parse({
+      attemptId: row.attempt_id,
+      jobId: row.job_id,
+      ordinal: row.ordinal,
+      ...(row.resumed_from_attempt_id
+        ? { resumedFromAttemptId: row.resumed_from_attempt_id }
+        : {}),
+      status: row.status,
+      startedAt: row.started_at,
+      ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+      ...(row.resume_plan_json
+        ? {
+            resumePlan: ResumePlanSchema.parse(
+              parseSqliteJson(row.resume_plan_json, "resume plan"),
+            ),
+          }
+        : {}),
+    });
+  }
+
+  private checkpointFromRow(row: CheckpointRow): RecoveryCheckpoint {
+    return RecoveryCheckpointSchema.parse({
+      attemptId: row.attempt_id,
+      jobId: row.job_id,
+      operationKey: row.operation_key,
+      ordinal: row.ordinal,
+      stage: row.stage,
+      status: row.status,
+      facts: parseSqliteJson(row.facts_json, "recovery checkpoint facts"),
+      startedAt: row.started_at,
+      ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    });
+  }
+
+  private completeCheckpointInTransaction(
+    attemptId: string,
+    operationKey: string,
+    facts: Record<string, unknown>,
+    completedAt: string,
+  ): RecoveryCheckpoint {
+    const row = this.database
+      .prepare(
+        `SELECT attempt_id, job_id, operation_key, ordinal, stage, status,
+                facts_json, started_at, completed_at
+         FROM recovery_checkpoints
+         WHERE attempt_id = ? AND operation_key = ?`,
+      )
+      .get(attemptId, operationKey) as CheckpointRow | undefined;
+    if (!row) throw new Error(`checkpoint ${operationKey} was not started`);
+    if (row.status !== "started")
+      throw new Error(
+        `checkpoint ${operationKey} is ${row.status}; refusing to overwrite evidence`,
+      );
+    const mergedFacts = {
+      ...(parseSqliteJson(
+        row.facts_json,
+        "recovery checkpoint facts",
+      ) as Record<string, unknown>),
+      ...facts,
+    };
+    this.database
+      .prepare(
+        `UPDATE recovery_checkpoints
+         SET status = 'completed', facts_json = ?, completed_at = ?
+         WHERE attempt_id = ? AND operation_key = ? AND status = 'started'`,
+      )
+      .run(sqliteJson(mergedFacts), completedAt, attemptId, operationKey);
+    return this.checkpointFromRow({
+      ...row,
+      status: "completed",
+      facts_json: sqliteJson(mergedFacts),
+      completed_at: completedAt,
+    });
+  }
+
   private readStateFromDatabase(jobId: string): JobState {
     return JobStateSchema.parse(
       parseSqliteJson(this.jobRow(jobId).state_json, "job state"),
@@ -1077,6 +1652,21 @@ export class JobStore {
           result ? sqliteJson(result) : null,
           state.createdAt,
           state.updatedAt,
+        );
+      this.database
+        .prepare(
+          `INSERT INTO execution_attempts(
+             attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
+             started_at, completed_at, resume_plan_json, terminal_result_json
+           ) VALUES (?, ?, 1, NULL, ?, ?, ?, NULL, ?)`,
+        )
+        .run(
+          `legacy:${jobId}`,
+          jobId,
+          terminalStatuses.has(state.status) ? state.status : "active",
+          state.createdAt,
+          terminalStatuses.has(state.status) ? state.updatedAt : null,
+          result ? sqliteJson(result) : null,
         );
       for (const event of events)
         this.insertEvent(

@@ -163,6 +163,8 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     signal: AbortSignal,
   ): Promise<AgentRunResult> {
     if (this.child) throw new Error("agent backend already started");
+    if (signal.aborted)
+      throw signal.reason ?? new Error("agent start was already aborted");
     await mkdir(this.codingAgentDir, { recursive: true });
     const env =
       this.environment ??
@@ -208,6 +210,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     });
     const onAbort = () => void this.abort(this.abortGraceMs);
     signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
     await this.send({
       id: "initial-prompt",
       type: "prompt",

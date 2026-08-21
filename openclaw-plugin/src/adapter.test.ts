@@ -25,6 +25,23 @@ async function fixture() {
     if (args[0] === "jobs") return { jobIds: [] };
     if (args[0] === "notifications") return { notifications: [] };
     if (args[0] === "notification-ack") return { acknowledged: true };
+    if (args[0] === "resume-preview")
+      return {
+        confirmationToken: "00000000-0000-4000-8000-000000000001",
+        expiresAt: "2026-08-21T22:05:00.000Z",
+        plan: {
+          nextStage: "verification",
+          preserved: ["worktree", "logs"],
+          willNotRepeat: ["prime:execute", "gate:0"],
+          rationale: "completed model work is preserved",
+        },
+      };
+    if (args[0] === "resume-confirm")
+      return {
+        jobId: "job-1",
+        attemptId: "attempt-2",
+        state: { status: "queued" },
+      };
     if (args.includes("--preview")) {
       return {
         resolvedRequest: {
@@ -191,6 +208,52 @@ describe("PrimeDispatchAdapter", () => {
     ]) {
       expect(confirmationContextHash(changed)).not.toBe(baseline);
     }
+  });
+
+  it("previews and confirms a revision-bound safe resume through the trusted route", async () => {
+    const { adapter, calls } = await fixture();
+    const preview = await adapter.resume(
+      { action: "preview", jobId: "job-1" },
+      ownerContext,
+    );
+    expect(preview.plan.nextStage).toBe("verification");
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Will not repeat: prime:execute, gate:0",
+    );
+    expect(preview.presentation.blocks[1].buttons[0].action.command).toBe(
+      "/prime-resume-confirm job-1 00000000-0000-4000-8000-000000000001",
+    );
+    expect(calls[0]).toEqual(
+      expect.arrayContaining([
+        "resume-preview",
+        "--job-id",
+        "job-1",
+        "--owner",
+        "--thread",
+        "thread-1",
+      ]),
+    );
+
+    const launched = await adapter.resume(
+      {
+        action: "confirm",
+        jobId: "job-1",
+        confirmationToken: preview.confirmationToken,
+      },
+      ownerContext,
+    );
+    expect(launched).toMatchObject({
+      phase: "launched",
+      jobId: "job-1",
+      attemptId: "attempt-2",
+    });
+    expect(calls[1]).toEqual(
+      expect.arrayContaining([
+        "resume-confirm",
+        "--confirmation-token",
+        preview.confirmationToken,
+      ]),
+    );
   });
 
   it("maps the remaining typed operations to bounded, redacted CLI results", async () => {

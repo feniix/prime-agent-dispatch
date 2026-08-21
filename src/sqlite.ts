@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export const CONTROL_DATABASE_NAME = "control-plane.sqlite3";
-export const CONTROL_SCHEMA_VERSION = 1;
+export const CONTROL_SCHEMA_VERSION = 2;
 
 export type ControlDatabase = DatabaseSync;
 
@@ -72,18 +72,19 @@ function migrate(database: ControlDatabase): void {
     throw new Error(
       `unsupported control database schema ${current.version}; expected at most ${CONTROL_SCHEMA_VERSION}`,
     );
-  if (current.version === CONTROL_SCHEMA_VERSION) return;
-
-  immediateTransaction(database, () => {
-    const locked = database
-      .prepare(
-        "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-      )
-      .get() as { version: number };
-    if (locked.version === CONTROL_SCHEMA_VERSION) return;
-    if (locked.version !== 0)
-      throw new Error(`unsupported control database schema ${locked.version}`);
-    database.exec(`
+  if (current.version < 1)
+    immediateTransaction(database, () => {
+      const locked = database
+        .prepare(
+          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+        )
+        .get() as { version: number };
+      if (locked.version >= 1) return;
+      if (locked.version !== 0)
+        throw new Error(
+          `unsupported control database schema ${locked.version}`,
+        );
+      database.exec(`
       CREATE TABLE jobs (
         job_id TEXT PRIMARY KEY,
         request_json TEXT NOT NULL,
@@ -147,10 +148,128 @@ function migrate(database: ControlDatabase): void {
         data_json TEXT NOT NULL
       ) STRICT;
     `);
-    database
-      .prepare(
-        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-      )
-      .run(1, "initial transactional authority", new Date().toISOString());
-  });
+      database
+        .prepare(
+          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+        )
+        .run(1, "initial transactional authority", new Date().toISOString());
+    });
+
+  const afterInitial = database
+    .prepare(
+      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+    )
+    .get() as { version: number };
+  if (afterInitial.version < 2)
+    immediateTransaction(database, () => {
+      const locked = database
+        .prepare(
+          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+        )
+        .get() as { version: number };
+      if (locked.version >= 2) return;
+      if (locked.version !== 1)
+        throw new Error(
+          `unsupported control database schema ${locked.version}`,
+        );
+      database.exec(`
+        CREATE TABLE execution_attempts (
+          attempt_id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
+          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+          resumed_from_attempt_id TEXT REFERENCES execution_attempts(attempt_id) ON DELETE RESTRICT,
+          status TEXT NOT NULL CHECK (status IN ('active', 'succeeded', 'failed', 'cancelled', 'interrupted')),
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          resume_plan_json TEXT,
+          terminal_result_json TEXT,
+          UNIQUE (job_id, ordinal)
+        ) STRICT;
+
+        CREATE TABLE recovery_checkpoints (
+          attempt_id TEXT NOT NULL REFERENCES execution_attempts(attempt_id) ON DELETE RESTRICT,
+          job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
+          operation_key TEXT NOT NULL,
+          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+          stage TEXT NOT NULL CHECK (stage IN (
+            'worktree',
+            'model_provisioning',
+            'prime_execution',
+            'quiescence',
+            'verification',
+            'commit',
+            'terminal_materialization'
+          )),
+          status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'uncertain', 'retryable')),
+          facts_json TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          PRIMARY KEY (attempt_id, operation_key),
+          UNIQUE (attempt_id, ordinal)
+        ) STRICT;
+
+        CREATE TABLE resume_confirmations (
+          token_hash TEXT PRIMARY KEY CHECK (length(token_hash) = 64),
+          job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
+          source_attempt_id TEXT NOT NULL REFERENCES execution_attempts(attempt_id) ON DELETE RESTRICT,
+          expected_revision INTEGER NOT NULL CHECK (expected_revision >= 0),
+          context_hash TEXT NOT NULL CHECK (length(context_hash) = 64),
+          plan_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          used_at TEXT
+        ) STRICT;
+
+        CREATE INDEX recovery_checkpoints_job
+          ON recovery_checkpoints(job_id, attempt_id, ordinal);
+        CREATE INDEX resume_confirmations_job
+          ON resume_confirmations(job_id, created_at);
+      `);
+      const jobs = database
+        .prepare(
+          "SELECT job_id, state_json, result_json, created_at, updated_at FROM jobs ORDER BY job_id",
+        )
+        .all() as Array<{
+        job_id: string;
+        state_json: string;
+        result_json: string | null;
+        created_at: string;
+        updated_at: string;
+      }>;
+      const insertAttempt = database.prepare(
+        `INSERT INTO execution_attempts(
+           attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
+           started_at, completed_at, resume_plan_json, terminal_result_json
+         ) VALUES (?, ?, 1, NULL, ?, ?, ?, NULL, ?)`,
+      );
+      for (const job of jobs) {
+        const state = parseSqliteJson(job.state_json, "job state") as {
+          status?: string;
+        };
+        const terminal = new Set([
+          "succeeded",
+          "failed",
+          "cancelled",
+          "interrupted",
+        ]).has(state.status ?? "");
+        const status = terminal ? (state.status as string) : "active";
+        insertAttempt.run(
+          `legacy:${job.job_id}`,
+          job.job_id,
+          status,
+          job.created_at,
+          terminal ? job.updated_at : null,
+          job.result_json,
+        );
+      }
+      database
+        .prepare(
+          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+        )
+        .run(
+          2,
+          "execution attempts and recovery checkpoints",
+          new Date().toISOString(),
+        );
+    });
 }

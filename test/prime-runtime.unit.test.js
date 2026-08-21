@@ -32,6 +32,20 @@ async function rpcFixture(name, source, options = {}) {
   };
 }
 
+test("Prime RPC does not miss an abort that precedes startup", async () => {
+  const { root, backend } = await rpcFixture(
+    "pre-aborted",
+    "setInterval(() => {}, 30_000);",
+    { abortGraceMs: 20 },
+  );
+  const controller = new AbortController();
+  controller.abort(new Error("deadline already exceeded"));
+  await assert.rejects(
+    () => backend.start("task", root, controller.signal),
+    /deadline already exceeded/,
+  );
+});
+
 test("Prime RPC backend enforces the configured assistant-turn budget", async () => {
   const { root, backend } = await rpcFixture(
     "turn-budget",

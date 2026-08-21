@@ -76,6 +76,7 @@ export const AuthorizationSchema = z.object({
   threadId: z.string().min(1).optional(),
   deliveryId: z.string().min(1).optional(),
 });
+export type Authorization = z.infer<typeof AuthorizationSchema>;
 
 export const AgentConfigSchema = z.discriminatedUnion("kind", [
   z.object({

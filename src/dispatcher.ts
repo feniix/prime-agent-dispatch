@@ -7,6 +7,7 @@ import { JobStore } from "./store.js";
 import {
   PrimeStartInputSchema,
   SCHEMA_VERSION,
+  type Authorization,
   type JobRequest,
   type JobState,
   type PrimeStartInput,
@@ -22,6 +23,7 @@ import {
   workerIdentityFromState,
   type WorkerVerification,
 } from "./worker-identity.js";
+import { assessSafeResume, resumeAuthorizationContextHash } from "./resume.js";
 
 type VerifyWorkerIdentity = (
   identity: NonNullable<ReturnType<typeof workerIdentityFromState>>,
@@ -121,61 +123,7 @@ export class PrimeDispatcher {
     };
     try {
       const state = await this.store.initialize(request);
-      const workerPath = fileURLToPath(new URL("./worker.js", import.meta.url));
-      const logFd = openSync(
-        join(this.store.jobDir(jobId), "artifacts", "logs", "worker.log"),
-        "a",
-        0o600,
-      );
-      const child = spawn(
-        process.execPath,
-        [
-          workerPath,
-          "--state-root",
-          this.stateRoot,
-          "--job-id",
-          jobId,
-          "--launch-nonce",
-          launcherToken.nonce,
-          "--worker-nonce",
-          workerNonce,
-        ],
-        {
-          detached: true,
-          stdio: ["ignore", logFd, logFd],
-          env: buildWorkerEnvironment(),
-        },
-      );
-      closeSync(logFd);
-      let spawnError: Error | undefined;
-      child.once("error", (error) => (spawnError = error));
-      if (!child.pid)
-        throw new Error("job worker did not receive a process id");
-      const startupDeadline = Date.now() + 5_000;
-      let startupConfirmed = false;
-      while (Date.now() < startupDeadline) {
-        const current = await this.store.readState(jobId);
-        if (await workerStartupIsConfirmed(current, child.pid, workerNonce)) {
-          startupConfirmed = true;
-          break;
-        }
-        if (spawnError) throw spawnError;
-        if (child.exitCode !== null)
-          throw new Error(
-            `job worker exited during startup with code ${String(child.exitCode)}`,
-          );
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      if (!startupConfirmed) {
-        try {
-          if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
-          else child.kill("SIGKILL");
-        } catch {
-          // The failed worker may already have exited.
-        }
-        throw new Error("timed out waiting for job worker startup");
-      }
-      child.unref();
+      await this.spawnWorker(jobId, launcherToken.nonce, workerNonce);
       return { jobId, state };
     } catch (error) {
       await lease
@@ -183,6 +131,138 @@ export class PrimeDispatcher {
         .catch(() => lease.release(launcherToken).catch(() => undefined));
       throw error;
     }
+  }
+
+  async previewResume(
+    jobId: string,
+    authorization: Authorization,
+    ttlMs = 5 * 60_000,
+  ) {
+    await this.assertResumeAuthorization(jobId, authorization);
+    await this.status(jobId);
+    const plan = await assessSafeResume(this.store, jobId);
+    return await this.store.createResumeConfirmation(
+      plan,
+      resumeAuthorizationContextHash(authorization),
+      ttlMs,
+    );
+  }
+
+  async resumeConfirmed(
+    jobId: string,
+    confirmationToken: string,
+    authorization: Authorization,
+  ): Promise<{ jobId: string; state: JobState; attemptId: string }> {
+    await this.assertResumeAuthorization(jobId, authorization);
+    const lease = new GlobalJobLease(this.stateRoot);
+    const launcherToken = await lease.acquire(jobId);
+    const workerNonce = randomUUID();
+    const workerToken: LeaseToken = {
+      kind: "worker",
+      jobId,
+      nonce: workerNonce,
+    };
+    try {
+      const resumed = await this.store.consumeResumeConfirmation(
+        confirmationToken,
+        resumeAuthorizationContextHash(authorization),
+        jobId,
+      );
+      await this.spawnWorker(jobId, launcherToken.nonce, workerNonce);
+      return {
+        jobId,
+        state: resumed.state,
+        attemptId: resumed.attempt.attemptId,
+      };
+    } catch (error) {
+      await lease
+        .release(workerToken)
+        .catch(() => lease.release(launcherToken).catch(() => undefined));
+      throw error;
+    }
+  }
+
+  private async spawnWorker(
+    jobId: string,
+    launchNonce: string,
+    workerNonce: string,
+  ): Promise<void> {
+    const workerPath = fileURLToPath(new URL("./worker.js", import.meta.url));
+    const logFd = openSync(
+      join(this.store.jobDir(jobId), "artifacts", "logs", "worker.log"),
+      "a",
+      0o600,
+    );
+    const child = spawn(
+      process.execPath,
+      [
+        workerPath,
+        "--state-root",
+        this.stateRoot,
+        "--job-id",
+        jobId,
+        "--launch-nonce",
+        launchNonce,
+        "--worker-nonce",
+        workerNonce,
+      ],
+      {
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: buildWorkerEnvironment(),
+      },
+    );
+    closeSync(logFd);
+    let spawnError: Error | undefined;
+    child.once("error", (error) => (spawnError = error));
+    if (!child.pid) throw new Error("job worker did not receive a process id");
+    const startupDeadline = Date.now() + 5_000;
+    let startupConfirmed = false;
+    while (Date.now() < startupDeadline) {
+      const current = await this.store.readState(jobId);
+      if (await workerStartupIsConfirmed(current, child.pid, workerNonce)) {
+        startupConfirmed = true;
+        break;
+      }
+      if (spawnError) throw spawnError;
+      if (child.exitCode !== null)
+        throw new Error(
+          `job worker exited during startup with code ${String(child.exitCode)}`,
+        );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!startupConfirmed) {
+      try {
+        if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        // The failed worker may already have exited.
+      }
+      throw new Error("timed out waiting for job worker startup");
+    }
+    child.unref();
+  }
+
+  private async assertResumeAuthorization(
+    jobId: string,
+    authorization: Authorization,
+  ): Promise<void> {
+    if (authorization.senderIsOwner !== true)
+      throw new Error("Prime resume requires an owner-authenticated context");
+    const original = (await this.store.readRequest(jobId)).authorization;
+    if (original.senderIsOwner !== true)
+      throw new Error("original job was not owner-authenticated");
+    for (const field of [
+      "provider",
+      "channelId",
+      "senderId",
+      "accountId",
+      "threadId",
+    ] as const)
+      if (
+        (original[field] ?? undefined) !== (authorization[field] ?? undefined)
+      )
+        throw new Error(`resume authorization ${field} mismatch`);
   }
 
   async status(jobId: string): Promise<unknown> {
