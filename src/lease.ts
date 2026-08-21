@@ -1,15 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
 import { z } from "zod";
 import { WorkerIdentitySchema, type WorkerIdentity } from "./schemas.js";
+import {
+  immediateTransaction,
+  openControlDatabase,
+  parseSqliteJson,
+  sqliteJson,
+  type ControlDatabase,
+} from "./sqlite.js";
 import {
   readProcessStartIdentity,
   verifyWorkerIdentity,
   type WorkerVerification,
 } from "./worker-identity.js";
 
-const INCOMPLETE_LEASE_GRACE_MS = 1_000;
+const LEASE_NAME = "global-job";
 
 const LauncherLeaseOwnerSchema = z.object({
   kind: z.literal("launcher"),
@@ -56,13 +61,11 @@ type LauncherOptions = {
   nonce?: string;
 };
 
+type LeaseRow = { owner_json: string; revision: number };
+
 function ownerToken(owner: LeaseOwner): LeaseToken {
   return owner.kind === "launcher"
-    ? {
-        kind: "launcher",
-        jobId: owner.jobId,
-        nonce: owner.nonce,
-      }
+    ? { kind: "launcher", jobId: owner.jobId, nonce: owner.nonce }
     : {
         kind: "worker",
         jobId: owner.jobId,
@@ -79,22 +82,24 @@ function tokensMatch(left: LeaseToken, right: LeaseToken): boolean {
 }
 
 export class GlobalJobLease {
-  private readonly leaseDir: string;
-  private readonly ownerPath: string;
+  private readonly database: ControlDatabase;
   private readonly dependencies: LeaseDependencies;
 
   constructor(
     stateRoot: string,
     dependencies: Partial<LeaseDependencies> = {},
   ) {
-    this.leaseDir = join(stateRoot, "global-job.lease");
-    this.ownerPath = join(this.leaseDir, "owner.json");
+    this.database = openControlDatabase(stateRoot);
     this.dependencies = {
       readProcessStartIdentity:
         dependencies.readProcessStartIdentity ?? readProcessStartIdentity,
       verifyWorkerIdentity:
         dependencies.verifyWorkerIdentity ?? verifyWorkerIdentity,
     };
+  }
+
+  close(): void {
+    this.database.close();
   }
 
   async acquire(
@@ -115,35 +120,51 @@ export class GlobalJobLease {
       nonce: normalized.nonce ?? randomUUID(),
       acquiredAt: new Date().toISOString(),
     });
-    await mkdir(join(this.leaseDir, ".."), { recursive: true });
     while (true) {
-      const candidate = `${this.leaseDir}.candidate-${randomUUID()}`;
-      await mkdir(candidate);
-      await this.writeOwner(join(candidate, "owner.json"), owner);
-      try {
-        await rename(candidate, this.leaseDir);
-        return ownerToken(owner);
-      } catch (error) {
-        await rm(candidate, { recursive: true, force: true });
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
-        const inspection = await this.inspect();
-        if (inspection.status === "missing") continue;
-        if (inspection.status === "stale") {
-          if (await this.quarantineOwner(inspection.owner)) continue;
-          continue;
-        }
-        if (inspection.status === "malformed") {
-          const ageMs = Date.now() - (await stat(this.leaseDir)).mtimeMs;
-          if (ageMs > INCOMPLETE_LEASE_GRACE_MS) {
-            await this.quarantineMalformedLease();
-            continue;
-          }
-        }
-        const currentJob =
-          "owner" in inspection ? `: ${inspection.owner.jobId}` : "";
-        throw new Error(`active job already holds global lease${currentJob}`);
+      const acquired = immediateTransaction(this.database, () => {
+        if (this.readRow()) return false;
+        this.database
+          .prepare(
+            "INSERT INTO leases(name, owner_json, revision, updated_at) VALUES (?, ?, 1, ?)",
+          )
+          .run(LEASE_NAME, sqliteJson(owner), owner.acquiredAt);
+        return true;
+      });
+      if (acquired) return ownerToken(owner);
+      const inspection = await this.inspect();
+      if (inspection.status === "missing") continue;
+      if (inspection.status === "stale") {
+        const removed = immediateTransaction(this.database, () => {
+          const row = this.readRow();
+          if (!row) return false;
+          const current = {
+            owner: LeaseOwnerSchema.parse(
+              parseSqliteJson(row.owner_json, "lease owner"),
+            ),
+            revision: row.revision,
+          };
+          if (
+            !tokensMatch(
+              ownerToken(current.owner),
+              ownerToken(inspection.owner),
+            )
+          )
+            return false;
+          this.database
+            .prepare("DELETE FROM leases WHERE name = ? AND revision = ?")
+            .run(LEASE_NAME, current.revision);
+          return true;
+        });
+        if (removed) continue;
+        continue;
       }
+      if (inspection.status === "malformed")
+        throw new Error(
+          "active job lease is corrupt; manual recovery required",
+        );
+      const currentJob =
+        "owner" in inspection ? `: ${inspection.owner.jobId}` : "";
+      throw new Error(`active job already holds global lease${currentJob}`);
     }
   }
 
@@ -163,26 +184,41 @@ export class GlobalJobLease {
       throw new Error(
         `worker identity could not claim global lease: ${verification.status}`,
       );
-    const current = await this.readOwner();
-    if (
-      current.kind !== "launcher" ||
-      !tokensMatch(ownerToken(current), launcher)
-    )
-      throw new Error("global lease owner mismatch");
-    const next = WorkerLeaseOwnerSchema.parse({
-      kind: "worker",
-      jobId: launcher.jobId,
-      identity: validatedIdentity,
-      acquiredAt: current.acquiredAt,
+    const next = immediateTransaction(this.database, () => {
+      const current = this.readOwner();
+      if (
+        current.owner.kind !== "launcher" ||
+        !tokensMatch(ownerToken(current.owner), launcher)
+      )
+        throw new Error("global lease owner mismatch");
+      const next = WorkerLeaseOwnerSchema.parse({
+        kind: "worker",
+        jobId: launcher.jobId,
+        identity: validatedIdentity,
+        acquiredAt: current.owner.acquiredAt,
+      });
+      const changed = this.database
+        .prepare(
+          `UPDATE leases SET owner_json = ?, revision = revision + 1, updated_at = ?
+           WHERE name = ? AND revision = ?`,
+        )
+        .run(
+          sqliteJson(next),
+          new Date().toISOString(),
+          LEASE_NAME,
+          current.revision,
+        );
+      if (changed.changes !== 1)
+        throw new Error("global lease changed during claim");
+      return next;
     });
-    await this.replaceOwner(next);
     return ownerToken(next);
   }
 
   async inspect(): Promise<LeaseInspection> {
     let owner: LeaseOwner;
     try {
-      owner = await this.readOwner();
+      owner = this.readOwner().owner;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return { status: "missing" };
@@ -214,56 +250,38 @@ export class GlobalJobLease {
   }
 
   async release(token: LeaseToken): Promise<void> {
-    const owner = await this.readOwner();
-    if (!tokensMatch(ownerToken(owner), token))
-      throw new Error("global lease owner mismatch");
-    await rm(this.leaseDir, { recursive: true });
+    immediateTransaction(this.database, () => {
+      const current = this.readOwner();
+      if (!tokensMatch(ownerToken(current.owner), token))
+        throw new Error("global lease owner mismatch");
+      const removed = this.database
+        .prepare("DELETE FROM leases WHERE name = ? AND revision = ?")
+        .run(LEASE_NAME, current.revision);
+      if (removed.changes !== 1)
+        throw new Error("global lease changed during release");
+    });
   }
 
-  private async readOwner(): Promise<LeaseOwner> {
-    return LeaseOwnerSchema.parse(
-      JSON.parse(await readFile(this.ownerPath, "utf8")),
-    );
+  private readRow(): LeaseRow | undefined {
+    return this.database
+      .prepare("SELECT owner_json, revision FROM leases WHERE name = ?")
+      .get(LEASE_NAME) as LeaseRow | undefined;
   }
 
-  private async writeOwner(path: string, owner: LeaseOwner): Promise<void> {
-    const handle = await open(path, "wx", 0o600);
-    try {
-      await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-  }
-
-  private async replaceOwner(owner: LeaseOwner): Promise<void> {
-    const temporary = `${this.ownerPath}.${process.pid}.${randomUUID()}.tmp`;
-    await this.writeOwner(temporary, owner);
-    await rename(temporary, this.ownerPath);
-  }
-
-  private async quarantineOwner(expected: LeaseOwner): Promise<boolean> {
-    const current = await this.readOwner().catch(() => undefined);
-    if (!current || !tokensMatch(ownerToken(current), ownerToken(expected)))
-      return false;
-    const stalePath = `${this.leaseDir}.stale-${randomUUID()}`;
-    try {
-      await rename(this.leaseDir, stalePath);
-      await rm(stalePath, { recursive: true, force: true });
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+  private readOwner(): { owner: LeaseOwner; revision: number } {
+    const row = this.readRow();
+    if (!row) {
+      const error = new Error(
+        "global lease is missing",
+      ) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
       throw error;
     }
-  }
-
-  private async quarantineMalformedLease(): Promise<void> {
-    const stalePath = `${this.leaseDir}.stale-${randomUUID()}`;
-    try {
-      await rename(this.leaseDir, stalePath);
-      await rm(stalePath, { recursive: true, force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    return {
+      owner: LeaseOwnerSchema.parse(
+        parseSqliteJson(row.owner_json, "lease owner"),
+      ),
+      revision: row.revision,
+    };
   }
 }

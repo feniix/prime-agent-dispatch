@@ -496,7 +496,7 @@ test("gate artifacts remain distinct when names sanitize to the same filename", 
   assert.notEqual(files[0], files[1]);
 });
 
-test("event reader ignores only a partial final JSONL record and rejects middle corruption", async () => {
+test("event projections repair partial tails and middle corruption from SQLite", async () => {
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
   const started = await startConfirmed(
@@ -528,9 +528,11 @@ test("event reader ignores only a partial final JSONL record and rejects middle 
 
   const original = await readFile(path, "utf8");
   await writeFile(path, `not-json\n${original}`);
-  await assert.rejects(
-    () => dispatcher.store.readEvents(started.jobId),
-    /corrupt events journal at line 1/,
+  assert.deepEqual(await dispatcher.store.readEvents(started.jobId), repaired);
+  assert.ok(
+    (await readdir(join(stateRoot, "jobs", started.jobId))).some((name) =>
+      name.startsWith("events.jsonl.quarantine-"),
+    ),
   );
 });
 

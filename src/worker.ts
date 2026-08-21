@@ -174,13 +174,13 @@ async function serveCommands(): Promise<void> {
   };
 }
 
-async function writeTerminalResult(
+function buildTerminalResult(
   state: JobState,
   request: Awaited<ReturnType<JobStore["readRequest"]>>,
   summary: string,
   gateResults: GateResult[] = [],
-): Promise<void> {
-  const result: JobResult = {
+): JobResult {
+  return {
     schemaVersion: 1,
     jobId,
     status: state.status,
@@ -195,7 +195,17 @@ async function writeTerminalResult(
     ...(state.inference ? { inference: state.inference } : {}),
     completedAt: new Date().toISOString(),
   };
-  await store.writeResult(result);
+}
+
+async function writeTerminalResult(
+  state: JobState,
+  request: Awaited<ReturnType<JobStore["readRequest"]>>,
+  summary: string,
+  gateResults: GateResult[] = [],
+): Promise<void> {
+  await store.writeResult(
+    buildTerminalResult(state, request, summary, gateResults),
+  );
 }
 
 async function finalizeTerminalOutcome(
@@ -207,16 +217,14 @@ async function finalizeTerminalOutcome(
   patch: Pick<JobState, "commitSha" | "noChanges" | "summary" | "error">,
 ): Promise<JobState> {
   current = await syncInferenceUsage(current);
-  const intent = await store.updateState(jobId, current.status, {
-    ...patch,
-    terminalIntentStatus: status,
-  });
-  const terminalView = { ...intent, ...patch, status } satisfies JobState;
-  await writeTerminalResult(terminalView, request, summary, gateResults);
-  return await store.updateState(jobId, status, {
-    ...patch,
-    terminalIntentStatus: undefined,
-  });
+  const terminalView = { ...current, ...patch, status } satisfies JobState;
+  const result = buildTerminalResult(
+    terminalView,
+    request,
+    summary,
+    gateResults,
+  );
+  return await store.finalizeTerminal(result, patch, leaseToken);
 }
 
 async function syncInferenceUsage(current: JobState): Promise<JobState> {

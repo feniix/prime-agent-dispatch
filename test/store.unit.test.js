@@ -4,6 +4,7 @@ import {
   appendFile,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   writeFile,
 } from "node:fs/promises";
@@ -155,7 +156,7 @@ test("artifact paths cannot escape the job artifact directory", async () => {
   assert.ok(artifact.startsWith(root));
 });
 
-test("event reads reject mismatched job ids and non-contiguous sequences", async () => {
+test("event reads quarantine corrupt projections and repair from SQLite", async () => {
   for (const mutation of [
     (event) => ({ ...event, jobId: "another-job" }),
     (event) => ({ ...event, sequence: event.sequence + 2 }),
@@ -164,9 +165,21 @@ test("event reads reject mismatched job ids and non-contiguous sequences", async
     const events = await store.readEvents(request.jobId);
     const path = join(store.jobDir(request.jobId), "events.jsonl");
     await appendFile(path, `${JSON.stringify(mutation(events[0]))}\n`);
-    await assert.rejects(
-      () => store.readEvents(request.jobId),
-      /journal (?:job id|sequence) mismatch/,
+    assert.deepEqual(await store.readEvents(request.jobId), events);
+    const names = await readdir(store.jobDir(request.jobId));
+    assert.ok(
+      names.some((name) => name.startsWith("events.jsonl.quarantine-")),
+    );
+    assert.equal(
+      store
+        .readAuthorityAudit(request.jobId)
+        .filter(
+          (record) =>
+            record.action === "projection_repaired" &&
+            record.data.kind === "events" &&
+            record.data.quarantinePath,
+        ).length,
+      1,
     );
   }
 });
@@ -224,7 +237,19 @@ test("lifecycle notification catch-up resumes after an idempotent consumer curso
     resumed.at(-1).event.sequence,
   );
   await store.updateState(request.jobId, "committing");
-  await store.updateState(request.jobId, "succeeded");
+  await store.finalizeTerminal(
+    {
+      schemaVersion: 1,
+      jobId: request.jobId,
+      status: "succeeded",
+      summary: "notification fixture complete",
+      baseSha: request.baseSha,
+      noChanges: true,
+      gateResults: [],
+      completedAt: new Date().toISOString(),
+    },
+    { summary: "notification fixture complete", noChanges: true },
+  );
   assert.deepEqual(
     (
       await store.pendingLifecycleNotifications(

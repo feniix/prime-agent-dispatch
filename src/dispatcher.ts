@@ -295,7 +295,7 @@ export class PrimeDispatcher {
       try {
         const result = await this.store.readResult(jobId);
         if (result.status === state.terminalIntentStatus) {
-          state = await this.store.updateState(jobId, result.status, {
+          state = await this.store.finalizeTerminal(result, {
             ...(result.commitSha ? { commitSha: result.commitSha } : {}),
             noChanges: result.noChanges,
             summary: result.summary,
@@ -303,7 +303,6 @@ export class PrimeDispatcher {
             ...(result.status === "failed" || result.status === "cancelled"
               ? { error: result.summary }
               : {}),
-            terminalIntentStatus: undefined,
           });
         }
       } catch (error) {
@@ -377,24 +376,32 @@ export class PrimeDispatcher {
       `${workerNonce}:${reason}`,
       { reason },
     );
-    const interrupted = await this.store.updateState(
-      state.jobId,
-      "interrupted",
-      { error: reason, summary: reason },
+    const token: LeaseToken | undefined = owner
+      ? owner.kind === "launcher"
+        ? { kind: "launcher", jobId: owner.jobId, nonce: owner.nonce }
+        : {
+            kind: "worker",
+            jobId: owner.jobId,
+            nonce: owner.identity.nonce,
+          }
+      : undefined;
+    const request = await this.store.readRequest(state.jobId);
+    const interrupted = await this.store.finalizeTerminal(
+      {
+        schemaVersion: SCHEMA_VERSION,
+        jobId: state.jobId,
+        status: "interrupted",
+        summary: reason,
+        baseSha: request.baseSha,
+        noChanges: state.noChanges ?? true,
+        ...(state.worktreePath ? { worktreePath: state.worktreePath } : {}),
+        gateResults: [],
+        ...(state.inference ? { inference: state.inference } : {}),
+        completedAt: new Date().toISOString(),
+      },
+      { error: reason, summary: reason, noChanges: state.noChanges ?? true },
+      token,
     );
-    if (owner) {
-      const token: LeaseToken =
-        owner.kind === "launcher"
-          ? { kind: "launcher", jobId: owner.jobId, nonce: owner.nonce }
-          : {
-              kind: "worker",
-              jobId: owner.jobId,
-              nonce: owner.identity.nonce,
-            };
-      await new GlobalJobLease(this.stateRoot)
-        .release(token)
-        .catch(() => undefined);
-    }
     return interrupted;
   }
 }
