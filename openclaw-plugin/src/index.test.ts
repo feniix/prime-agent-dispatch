@@ -123,6 +123,34 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     });
   });
 
+  it("uses the command thread when OpenClaw reports the Discord provider as To", () => {
+    const previewContext = trustedContext({
+      requesterSenderId: "owner-1",
+      senderIsOwner: true,
+      messageChannel: "discord",
+      deliveryContext: {
+        channel: "discord",
+        to: "channel:thread-1",
+        accountId: "default",
+      },
+    } as any);
+    const commandContext = trustedCommandContext({
+      senderId: "owner-1",
+      senderIsOwner: true,
+      channel: "discord",
+      channelId: "discord",
+      to: "channel:discord",
+      accountId: "default",
+      messageThreadId: "thread-1",
+    } as any);
+
+    expect(commandContext).toMatchObject({ to: "channel:thread-1" });
+    expect(commandContext).not.toHaveProperty("threadId");
+    expect(confirmationContextHash(commandContext)).toBe(
+      confirmationContextHash(previewContext),
+    );
+  });
+
   it("preserves a nested Discord thread distinct from its delivery target", () => {
     const previewContext = trustedContext({
       requesterSenderId: "owner-1",
@@ -161,6 +189,15 @@ describe("Prime Dispatch OpenClaw plugin", () => {
         senderIsOwner: true,
         channel: "discord",
         to: "slash:owner-1",
+      } as any),
+    ).not.toHaveProperty("to");
+    expect(
+      trustedCommandContext({
+        senderId: "owner-1",
+        senderIsOwner: true,
+        channel: "discord",
+        channelId: "discord",
+        to: "channel:discord",
       } as any),
     ).not.toHaveProperty("to");
   });

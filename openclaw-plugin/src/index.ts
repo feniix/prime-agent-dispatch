@@ -420,13 +420,14 @@ export function normalizeTrustedContext(
 ): TrustedToolContext {
   const senderId = normalizedString(context.senderId);
   const channel = normalizedString(context.channel);
+  const explicitThreadId = normalizedString(context.threadId);
   const to = trustedDeliveryTarget(
     channel,
     normalizedString(context.to),
     normalizedString(context.channelId),
+    explicitThreadId,
   );
   const accountId = normalizedString(context.accountId);
-  const explicitThreadId = normalizedString(context.threadId);
   const conversationId = discordConversationIdFromTarget(channel, to);
   const threadId =
     explicitThreadId && explicitThreadId !== conversationId
@@ -458,8 +459,11 @@ function trustedDeliveryTarget(
   channel: string | undefined,
   to: string | undefined,
   channelId: string | undefined,
+  threadId: string | undefined,
 ): string | undefined {
   if (channel !== "discord") return to ?? channelId;
+  if (to === "channel:discord")
+    return threadId ? `channel:${threadId}` : undefined;
   if (to && !to.startsWith("slash:")) return to;
   if (!channelId) return undefined;
   return channelId.startsWith("channel:") ? channelId : `channel:${channelId}`;
