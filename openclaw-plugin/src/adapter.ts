@@ -763,31 +763,34 @@ function statusPresentation(
   const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(
     status,
   );
+  const blocks: Presentation["blocks"] = [
+    {
+      type: "text",
+      text: [`Status: ${status}`, ...inferenceStatusLines(inference)].join(
+        "\n",
+      ),
+    },
+  ];
+  if (!terminal) {
+    blocks.push({
+      type: "buttons",
+      buttons: [
+        {
+          label: "Refresh",
+          action: {
+            type: "callback",
+            value: `prime-dispatch:refresh:${jobId}`,
+          },
+          disabled: false,
+          reusable: true,
+        },
+      ],
+    });
+  }
   return {
     title: `Prime job ${jobId}`,
     tone: status === "succeeded" ? "success" : terminal ? "danger" : "info",
-    blocks: [
-      {
-        type: "text",
-        text: [`Status: ${status}`, ...inferenceStatusLines(inference)].join(
-          "\n",
-        ),
-      },
-      {
-        type: "buttons",
-        buttons: [
-          {
-            label: "Refresh",
-            action: {
-              type: "callback",
-              value: `prime-dispatch:refresh:${jobId}`,
-            },
-            disabled: terminal,
-            reusable: true,
-          },
-        ],
-      },
-    ],
+    blocks,
   };
 }
 

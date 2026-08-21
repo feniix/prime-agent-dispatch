@@ -403,18 +403,7 @@ describe("Prime Dispatch OpenClaw plugin", () => {
         presentation: {
           ...presentation,
           tone: "success",
-          blocks: [
-            presentation.blocks[0],
-            {
-              ...presentation.blocks[1],
-              buttons: [
-                {
-                  ...presentation.blocks[1].buttons[0],
-                  disabled: true,
-                },
-              ],
-            },
-          ],
+          blocks: [presentation.blocks[0]],
         },
         previousMessageId: "message-1",
         deliveryKey: "job-1:event:8",
@@ -443,11 +432,8 @@ describe("Prime Dispatch OpenClaw plugin", () => {
       "channel:thread-1",
       "message-1",
       expect.objectContaining({
-        blocks: expect.arrayContaining([
-          expect.objectContaining({
-            type: "actions",
-            buttons: [expect.objectContaining({ disabled: true })],
-          }),
+        blocks: expect.not.arrayContaining([
+          expect.objectContaining({ type: "actions" }),
         ]),
       }),
       expect.objectContaining({ cfg: {}, accountId: "default" }),
