@@ -86,3 +86,46 @@ test("trusted host config defaults repositories to non-fixtures", async () => {
   );
   assert.equal(policy.fixture, false);
 });
+
+test("trusted retention policy cannot discard the minimum explanatory evidence set", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-host-config-retention-"));
+  const path = join(root, "host.json");
+  await writeFile(
+    path,
+    JSON.stringify({
+      schemaVersion: 1,
+      repoRoots: [root],
+      prime: {
+        executable: "/trusted/prime.js",
+        releaseArtifact: "/trusted/prime.tgz",
+      },
+      retention: {
+        maxTotalBytes: 0,
+        retainForMsByStatus: {
+          succeeded: 0,
+          failed: 0,
+          cancelled: 0,
+          interrupted: 0,
+        },
+        minimumEvidence: ["result.json"],
+      },
+      repositories: [
+        {
+          path: root,
+          gates: [
+            {
+              name: "test",
+              command: "/usr/bin/true",
+              args: [],
+              timeoutMs: 1000,
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  await assert.rejects(
+    () => loadHostConfig(path),
+    /minimum evidence must include/,
+  );
+});

@@ -2,6 +2,70 @@ import { readFile, realpath } from "node:fs/promises";
 import { z } from "zod";
 import { GateSchema, SCHEMA_VERSION } from "./schemas.js";
 
+export const DEFAULT_MINIMUM_EVIDENCE = [
+  "result.json",
+  "report.md",
+  "final.diff",
+  "inference-usage.json",
+  "checks/",
+  "logs/worker.log",
+] as const;
+const DEFAULT_RETENTION_AGES = {
+  succeeded: 30 * 24 * 60 * 60_000,
+  failed: 60 * 24 * 60 * 60_000,
+  cancelled: 30 * 24 * 60 * 60_000,
+  interrupted: 90 * 24 * 60 * 60_000,
+};
+const DEFAULT_RETENTION_POLICY = {
+  maxTotalBytes: 10_000_000_000,
+  retainForMsByStatus: DEFAULT_RETENTION_AGES,
+  minimumEvidence: [...DEFAULT_MINIMUM_EVIDENCE],
+};
+
+export const RetentionPolicySchema = z
+  .object({
+    maxTotalBytes: z.number().int().nonnegative().default(10_000_000_000),
+    retainForMsByStatus: z
+      .object({
+        succeeded: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(DEFAULT_RETENTION_AGES.succeeded),
+        failed: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(DEFAULT_RETENTION_AGES.failed),
+        cancelled: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(DEFAULT_RETENTION_AGES.cancelled),
+        interrupted: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(DEFAULT_RETENTION_AGES.interrupted),
+      })
+      .default(DEFAULT_RETENTION_AGES),
+    minimumEvidence: z
+      .array(z.string().min(1))
+      .min(1)
+      .default([...DEFAULT_MINIMUM_EVIDENCE]),
+  })
+  .strict()
+  .superRefine((policy, context) => {
+    for (const required of DEFAULT_MINIMUM_EVIDENCE)
+      if (!policy.minimumEvidence.includes(required))
+        context.addIssue({
+          code: "custom",
+          path: ["minimumEvidence"],
+          message: `minimum evidence must include ${required}`,
+        });
+  });
+export type RetentionPolicy = z.infer<typeof RetentionPolicySchema>;
+
 export const HostConfigSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),
@@ -10,6 +74,7 @@ export const HostConfigSchema = z
       executable: z.string().min(1),
       releaseArtifact: z.string().min(1),
     }),
+    retention: RetentionPolicySchema.default(DEFAULT_RETENTION_POLICY),
     repositories: z
       .array(
         z.object({

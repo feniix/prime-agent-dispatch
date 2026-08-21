@@ -14,7 +14,7 @@ This is not production-ready. The default execution backend is intentionally nam
 - **Beta Milestone 2:** **IMPLEMENTED for the operational Discord fixture path.** The package in [`openclaw-plugin`](openclaw-plugin/README.md) exposes owner-only typed tools, hash-bound one-time confirmation, editable status-card delivery, terminal notification catch-up, and the standalone CLI/control boundary. See the [Beta Milestone 2 report](docs/beta-milestone-2.md).
 - **OpenClaw deployment:** [`prime-dispatch-openclaw`](docs/openclaw-host-lifecycle.md) prepares versioned host-local releases, migrates durable state, validates the exact OpenClaw config delta, and provides idempotent upgrade, audit, rollback, and state-preserving uninstall operations.
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
-- **Beta Milestone 3:** **IN PROGRESS.** Node 24's built-in SQLite owns transactional state, attempts, checkpoints, confirmations, leases, results, cursors, usage, and artifact digests. Explicit owner-confirmed resume can continue only from mechanically proven safe evidence; uncertain Prime requests, gates, commits, and effects are preserved and rejected. Bounded lossless cleanup remains tracked separately.
+- **Beta Milestone 3:** **IMPLEMENTED for the disposable-fixture path.** Node 24's built-in SQLite owns transactional state, attempts, checkpoints, confirmations, leases, results, cursors, usage, artifact digests, and cleanup history. Explicit owner-confirmed resume continues only from mechanically proven safe evidence. Durable cleanup plans enforce host-owned age/byte policy while preserving minimum explanatory evidence. See the [Beta Milestone 3 report](docs/beta-milestone-3.md).
 
 The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
 
@@ -56,7 +56,7 @@ flowchart TD
     Worker --> Gates --> Commit --> Artifacts
 ```
 
-The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`, `resume-preview`, and `resume-confirm`), while the OpenClaw adapter exposes `prime_start`, `prime_resume`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
+The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`, `resume-preview`, `resume-confirm`, `cleanup-plan`, and `cleanup-apply`), while the OpenClaw adapter exposes `prime_start`, `prime_resume`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
 
 Every CLI invocation scans nonterminal jobs before handling its requested
 operation. A matching live worker is reconnected without restarting Prime; a
@@ -98,6 +98,15 @@ The state root and each job have this layout:
 ```
 
 SQLite uses WAL mode, foreign keys, a five-second busy timeout, `synchronous=FULL`, and explicit immediate transactions. One transaction assigns each state revision and event sequence; terminal transactions also bind result metadata, the lease release, inference accounting, and the current artifact-digest inventory. JSON/JSONL files are projections written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Missing or stale projections regenerate from SQLite; contradictory projections and bulky evidence are quarantined with an authority-audit record. Existing schema-v1 JSON jobs import losslessly and idempotently, while corrupt or unknown schemas remain untouched and fail closed.
+
+Cleanup is an explicit two-step operator action. `cleanup-plan` inventories every
+authoritative artifact, disposable runtime cache, worktree, and local branch,
+then persists the exact keep/delete decisions and their reasons. `cleanup-apply`
+accepts only that run id, validates the canonical snapshot and current object
+identity, and checkpoints each deletion. Nonterminal, leased, uncertain,
+corrupt, quarantined, and foreign content is never selected. Core result,
+report, diff, inference, gate, and worker-log evidence remains protected even
+when that leaves a visible quota deficit.
 
 The state machine is:
 
@@ -213,6 +222,8 @@ node dist/cli.js status --state-root /tmp/prime-dispatch-state --job-id JOB_ID
 node dist/cli.js steer --state-root /tmp/prime-dispatch-state --job-id JOB_ID --message "stay bounded"
 node dist/cli.js cancel --state-root /tmp/prime-dispatch-state --job-id JOB_ID
 node dist/cli.js result --state-root /tmp/prime-dispatch-state --job-id JOB_ID
+node dist/cli.js cleanup-plan --state-root /tmp/prime-dispatch-state --host-config ./host-config.json
+node dist/cli.js cleanup-apply --state-root /tmp/prime-dispatch-state --run-id REVIEWED_RUN_ID
 ```
 
 `steer` and `cancel` apply only while the worker socket exists. `status` reads the durable snapshot and advances the adapter's idempotent notification cursor, and `result` reads the durable terminal artifact.
@@ -262,12 +273,12 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 - The official Prime archive omits runtime dependencies. The archive and configured entrypoint are checked, but the complete loaded dependency tree is not yet represented by a self-contained pinned artifact.
 - Remote Git prevention and single-process/root enforcement are not hard security boundaries under `unsafe-local`; Prime has IPython and normal host networking. Current controls are defense in depth for trusted repositories.
 - Concurrent writers in separate worktrees of the same repository are not serialized; repository-local build services can still conflict.
-- Worktrees and branches are intentionally preserved. There is no cleanup command yet.
+- Cleanup is explicit rather than scheduled. It can reclaim optional artifacts, disposable runtime caches, owned worktrees, and local job branches; minimum evidence and authoritative SQLite history remain permanent.
 - Container execution is not implemented. The installed OpenClaw adapter provides Discord confirmation and status components, but clean Gateway restart acceptance remains host-service-manager dependent.
 - Ordinary tests use no real Prime binary, provider credential, or job network call. The opt-in acceptance test exercises the production real-Prime/broker path only against a disposable fixture; it makes no EVP change or real-repository write.
 
 ## Production exit criteria
 
-Before adopting this design, add bounded artifact storage and lossless cleanup. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
+Before broader adoption, build the self-contained checksum-pinned Prime runtime and make an explicit selected-repository rollout decision. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 See the [deep-review catalog](docs/beta-milestone-1-review.md) for resolved findings and issue-ready deferred work.
