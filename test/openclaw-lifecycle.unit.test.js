@@ -437,6 +437,34 @@ test("audit detects a stale persisted plugin registry source", async () => {
   }
 });
 
+test("audit fails closed on a corrupt transactional control database", async () => {
+  const {
+    openclawStateDir,
+    sourceRoot,
+    hostConfigSource,
+    stateSource,
+    dependencies,
+  } = await fixture();
+  await installOpenClaw(
+    {
+      openclawStateDir,
+      sourceRoot,
+      hostConfigSource,
+      stateSource,
+    },
+    dependencies,
+  );
+  const layout = openClawLayout(openclawStateDir);
+  await writeFile(
+    join(layout.stateRoot, "control-plane.sqlite3"),
+    "not sqlite",
+  );
+  assert.match(
+    (await auditOpenClawInstall(openclawStateDir)).join("\n"),
+    /control database is invalid/i,
+  );
+});
+
 test("keeps a committed install coherent when gateway restart fails", async () => {
   const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
     await fixture();

@@ -13,10 +13,12 @@ import {
   symlink,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
 import { acquireProcessDirectoryLock } from "./process-lock.js";
+import { CONTROL_DATABASE_NAME, CONTROL_SCHEMA_VERSION } from "./sqlite.js";
 
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
@@ -548,6 +550,7 @@ export async function auditOpenClawInstall(
     .catch((error: unknown) =>
       violations.push(`host config is invalid: ${errorMessage(error)}`),
     );
+  await auditControlDatabase(layout.stateRoot, violations);
 
   const manifest = await readInstallManifest(layout).catch((error: unknown) => {
     violations.push(
@@ -665,6 +668,43 @@ export async function auditOpenClawInstall(
     }
   }
   return violations;
+}
+
+async function auditControlDatabase(
+  stateRoot: string,
+  violations: string[],
+): Promise<void> {
+  const path = join(stateRoot, CONTROL_DATABASE_NAME);
+  if (!(await pathExists(path))) return;
+  await auditPath(path, 0o600, "file", violations);
+  for (const suffix of ["-wal", "-shm"])
+    if (await pathExists(`${path}${suffix}`))
+      await auditPath(`${path}${suffix}`, 0o600, "file", violations);
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(path, { readOnly: true });
+    const integrity = database.prepare("PRAGMA integrity_check").get() as
+      | { integrity_check?: unknown }
+      | undefined;
+    if (integrity?.integrity_check !== "ok")
+      violations.push("control database integrity check failed");
+    const foreignKeys = database.prepare("PRAGMA foreign_key_check").all();
+    if (foreignKeys.length > 0)
+      violations.push("control database foreign-key check failed");
+    const migration = database
+      .prepare(
+        "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+      )
+      .get() as { version?: unknown } | undefined;
+    if (migration?.version !== CONTROL_SCHEMA_VERSION)
+      violations.push(
+        `control database schema is ${String(migration?.version)}; expected ${CONTROL_SCHEMA_VERSION}`,
+      );
+  } catch (error) {
+    violations.push(`control database is invalid: ${errorMessage(error)}`);
+  } finally {
+    database?.close();
+  }
 }
 
 function installConfigPatch(

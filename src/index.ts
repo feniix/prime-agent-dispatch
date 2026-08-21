@@ -11,6 +11,7 @@ export * from "./prime-runtime.js";
 export * from "./release.js";
 export * from "./repository.js";
 export * from "./schemas.js";
+export * from "./sqlite.js";
 export * from "./state-machine.js";
 export * from "./store.js";
 export * from "./worker-identity.js";
