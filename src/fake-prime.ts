@@ -16,6 +16,25 @@ async function handle(message: Record<string, unknown>): Promise<void> {
     };
     emit({ type: "response", command: "prompt", success: true });
     emit({ type: "agent_start", data: { sessionId: `fake-${process.pid}` } });
+    if (payload.task.includes("OVERSIZED_RPC_CONTROL")) {
+      emit({
+        type: "agent_end",
+        data: { lastAssistantText: "x".repeat(300_000) },
+      });
+      return;
+    }
+    if (payload.task.includes("OVERSIZED_RPC_OBSERVATION")) {
+      emit({ type: "turn_start" });
+      emit({
+        type: "tool_execution_end",
+        toolCallId: "fake-oversized-call",
+        toolName: "ipython",
+        result: {
+          content: [{ type: "text", text: "x".repeat(300_000) }],
+          details: { stdout: "x".repeat(300_000) },
+        },
+      });
+    }
     if (payload.task.includes("SLOW")) {
       timer = setTimeout(() => {
         emit({

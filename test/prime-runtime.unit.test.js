@@ -77,6 +77,156 @@ test("Prime RPC quiesces the process tree before returning and rejects late stee
   assert.throws(() => process.kill(pid, 0), /ESRCH/);
 });
 
+test("Prime RPC gives the model an edit-only execution contract", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-execution-contract-"));
+  const executable = join(root, "capture-prompt.js");
+  const promptFile = join(root, "prompt.txt");
+  await writeFile(
+    executable,
+    [
+      'import { writeFileSync } from "node:fs";',
+      'process.stdin.once("data", (chunk) => {',
+      "  const command = JSON.parse(String(chunk).trim());",
+      `  writeFileSync(${JSON.stringify(promptFile)}, command.message);`,
+      '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "done" } }) + "\\n");',
+      "  setInterval(() => {}, 30_000);",
+      "});",
+    ].join("\n"),
+  );
+  const backend = new PrimeJsonlRpcBackend({
+    kind: "contract-fixture",
+    command: process.execPath,
+    args: [executable],
+    codingAgentDir: join(root, "agent"),
+    abortGraceMs: 20,
+  });
+  try {
+    await backend.start(
+      "change the file, discover and run the gate, then commit",
+      root,
+      new AbortController().signal,
+    );
+  } finally {
+    await backend.dispose();
+  }
+  const prompt = await readFile(promptFile, "utf8");
+  assert.match(prompt, /Modify only files under the current working directory/);
+  assert.match(prompt, /Do not inspect paths outside the current worktree/);
+  assert.match(prompt, /Do not locate or run verification gates/);
+  assert.match(prompt, /Do not stage files or create a Git commit/);
+  assert.match(
+    prompt,
+    /change the file, discover and run the gate, then commit/,
+  );
+});
+
+test("Prime RPC drains oversized observational events and accepts a later agent_end", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-rpc-observation-"));
+  const executable = join(root, "oversized-tool-event.js");
+  await writeFile(
+    executable,
+    [
+      'process.stdin.once("data", () => {',
+      '  const stdout = "x".repeat(300_000);',
+      '  process.stdout.write(JSON.stringify({ type: "turn_start" }) + "\\n");',
+      '  for (const type of ["tool_execution_end", "message_start", "message_end"])',
+      "    process.stdout.write(JSON.stringify({",
+      "      type,",
+      '      toolCallId: "call-oversized",',
+      '      toolName: "ipython",',
+      '      result: { content: [{ type: "text", text: stdout }], details: { stdout } },',
+      '    }) + "\\n");',
+      '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "completed after large output" } }) + "\\n");',
+      "  setInterval(() => {}, 30_000);",
+      "});",
+    ].join("\n"),
+  );
+  const backend = new PrimeJsonlRpcBackend({
+    kind: "oversized-observation-fixture",
+    command: process.execPath,
+    args: [executable],
+    codingAgentDir: join(root, "agent"),
+    abortGraceMs: 20,
+  });
+  const result = await backend.start(
+    "task",
+    root,
+    new AbortController().signal,
+  );
+  assert.equal(result.summary, "completed after large output");
+  assert.ok(Array.isArray(result.metadata.oversizedRpcRecords));
+  assert.deepEqual(
+    result.metadata.oversizedRpcRecords.map((record) => record.eventType),
+    ["tool_execution_end", "message_start", "message_end"],
+  );
+  const evidence = result.metadata.oversizedRpcRecords[0];
+  assert.equal(evidence.eventType, "tool_execution_end");
+  assert.equal(evidence.toolCallId, "call-oversized");
+  assert.equal(evidence.toolName, "ipython");
+  assert.ok(evidence.bytes > 256 * 1024);
+  assert.match(evidence.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(evidence.lastAcceptedEventType, "turn_start");
+});
+
+test("Prime RPC bounds the bytes drained from oversized observational events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-rpc-drain-limit-"));
+  const executable = join(root, "unbounded-tool-event.js");
+  await writeFile(
+    executable,
+    [
+      'process.stdin.once("data", () => {',
+      '  process.stdout.write(JSON.stringify({ type: "tool_execution_end", result: { text: "x".repeat(5_000) } }) + "\\n");',
+      "  setInterval(() => {}, 30_000);",
+      "});",
+    ].join("\n"),
+  );
+  const backend = new PrimeJsonlRpcBackend({
+    kind: "drain-limit-fixture",
+    command: process.execPath,
+    args: [executable],
+    codingAgentDir: join(root, "agent"),
+    abortGraceMs: 20,
+    maxRpcLineBytes: 1_024,
+    maxDiscardedRpcLineBytes: 2_048,
+    maxDiscardedRpcBytes: 4_096,
+  });
+  await assert.rejects(
+    () => backend.start("task", root, new AbortController().signal),
+    /RPC discard ceiling exceeded.*type=tool_execution_end/,
+  );
+  await backend.dispose();
+});
+
+test("Prime RPC does not classify a nested event type as the record type", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-rpc-nested-type-"));
+  const executable = join(root, "nested-type.js");
+  await writeFile(
+    executable,
+    [
+      'process.stdin.once("data", () => {',
+      '  process.stdout.write(JSON.stringify({ nested: { type: "tool_execution_end" }, type: "agent_end", data: { lastAssistantText: "x".repeat(5_000) } }) + "\\n");',
+      '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "must not be reached" } }) + "\\n");',
+      "  setInterval(() => {}, 30_000);",
+      "});",
+    ].join("\n"),
+  );
+  const backend = new PrimeJsonlRpcBackend({
+    kind: "nested-type-fixture",
+    command: process.execPath,
+    args: [executable],
+    codingAgentDir: join(root, "agent"),
+    abortGraceMs: 20,
+    maxRpcLineBytes: 1_024,
+    maxDiscardedRpcLineBytes: 8_192,
+    maxDiscardedRpcBytes: 16_384,
+  });
+  await assert.rejects(
+    () => backend.start("task", root, new AbortController().signal),
+    /RPC line exceeded input limit.*type=unknown/,
+  );
+  await backend.dispose();
+});
+
 test("Prime RPC rejects oversized lines and bounds terminal summaries", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-rpc-bounds-"));
   const oversized = join(root, "oversized.js");

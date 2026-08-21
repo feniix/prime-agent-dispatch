@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash, type Hash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { JobRequest } from "./schemas.js";
@@ -30,6 +31,60 @@ type RpcEnvelope = {
   [key: string]: unknown;
 };
 
+export type OversizedRpcRecordEvidence = {
+  eventType: string;
+  bytes: number;
+  sha256: string;
+  lineComplete: boolean;
+  disposition: "dropped" | "rejected";
+  toolCallId?: string;
+  toolName?: string;
+  lastAcceptedEventType?: string;
+};
+
+type OversizedRpcLine = {
+  bytes: number;
+  hash: Hash;
+  eventType: string;
+  droppable: boolean;
+  toolCallId?: string;
+  toolName?: string;
+};
+
+const DROPPABLE_OVERSIZED_RPC_EVENTS = new Set([
+  "message_start",
+  "message_update",
+  "message_end",
+  "tool_execution_start",
+  "tool_execution_update",
+  "tool_execution_end",
+]);
+
+const MAX_RPC_EVIDENCE_RECORDS = 16;
+const MAX_RPC_CLASSIFICATION_PREFIX_BYTES = 8 * 1024;
+
+export class AgentRpcLineLimitError extends Error {
+  constructor(
+    readonly evidence: OversizedRpcRecordEvidence,
+    reason = "agent RPC line exceeded input limit",
+  ) {
+    super(
+      [
+        reason,
+        `type=${evidence.eventType}`,
+        `bytes=${evidence.bytes}`,
+        `sha256=${evidence.sha256}`,
+        ...(evidence.toolName ? [`tool=${evidence.toolName}`] : []),
+        ...(evidence.toolCallId ? [`toolCallId=${evidence.toolCallId}`] : []),
+        ...(evidence.lastAcceptedEventType
+          ? [`lastAccepted=${evidence.lastAcceptedEventType}`]
+          : []),
+      ].join("; "),
+    );
+    this.name = "AgentRpcLineLimitError";
+  }
+}
+
 export class PrimeJsonlRpcBackend implements AgentBackend {
   readonly kind: string;
   private child?: ChildProcessWithoutNullStreams;
@@ -40,6 +95,10 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       }
     | undefined;
   private buffer = Buffer.alloc(0);
+  private oversizedLine?: OversizedRpcLine;
+  private readonly oversizedRpcRecords: OversizedRpcRecordEvidence[] = [];
+  private oversizedRpcRecordsOmitted = 0;
+  private lastAcceptedEventType?: string;
   private stderr = "";
   private readonly command: string;
   private readonly args: string[];
@@ -47,10 +106,13 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   private readonly environment: NodeJS.ProcessEnv | undefined;
   private readonly abortGraceMs: number;
   private readonly maxTurns: number;
+  private readonly maxRpcLineBytes: number;
+  private readonly maxDiscardedRpcLineBytes: number;
+  private readonly maxDiscardedRpcBytes: number;
+  private discardedRpcBytes = 0;
   private turnsUsed = 0;
   private aborting?: Promise<void>;
   private acceptingSteer = false;
-  private readonly maxRpcLineBytes = 256 * 1024;
   private readonly maxTerminalFieldBytes = 64 * 1024;
 
   constructor(options: {
@@ -61,6 +123,9 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     environment?: NodeJS.ProcessEnv;
     abortGraceMs?: number;
     maxTurns?: number;
+    maxRpcLineBytes?: number;
+    maxDiscardedRpcLineBytes?: number;
+    maxDiscardedRpcBytes?: number;
   }) {
     this.kind = options.kind;
     this.command = options.command;
@@ -69,6 +134,22 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     this.environment = options.environment;
     this.abortGraceMs = options.abortGraceMs ?? 1_000;
     this.maxTurns = options.maxTurns ?? 50;
+    this.maxRpcLineBytes = options.maxRpcLineBytes ?? 256 * 1024;
+    this.maxDiscardedRpcLineBytes =
+      options.maxDiscardedRpcLineBytes ?? 32 * 1024 * 1024;
+    this.maxDiscardedRpcBytes =
+      options.maxDiscardedRpcBytes ?? 128 * 1024 * 1024;
+    if (
+      ![
+        this.maxRpcLineBytes,
+        this.maxDiscardedRpcLineBytes,
+        this.maxDiscardedRpcBytes,
+      ].every(Number.isSafeInteger) ||
+      this.maxRpcLineBytes < 1 ||
+      this.maxDiscardedRpcLineBytes <= this.maxRpcLineBytes ||
+      this.maxDiscardedRpcBytes < this.maxDiscardedRpcLineBytes
+    )
+      throw new Error("invalid Prime RPC byte limits");
   }
 
   async start(
@@ -103,11 +184,18 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     this.child.on("exit", (code, signalName) => {
       this.acceptingSteer = false;
       if (this.pending) {
-        this.rejectPending(
-          new Error(
-            `agent RPC exited before agent_end (code=${String(code)}, signal=${String(signalName)}): ${this.stderr}`,
-          ),
-        );
+        if (this.oversizedLine)
+          this.rejectOversizedLine(
+            this.oversizedLine,
+            "agent RPC line exceeded input limit",
+            false,
+          );
+        else
+          this.rejectPending(
+            new Error(
+              `agent RPC exited before agent_end (code=${String(code)}, signal=${String(signalName)}): ${this.stderr}`,
+            ),
+          );
       }
     });
     const result = new Promise<AgentRunResult>((resolve, reject) => {
@@ -119,7 +207,9 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       id: "initial-prompt",
       type: "prompt",
       message:
-        this.kind === "fake" ? JSON.stringify({ task, worktreePath }) : task,
+        this.kind === "fake"
+          ? JSON.stringify({ task, worktreePath })
+          : buildAgentExecutionPrompt(task),
     });
     try {
       return await result;
@@ -173,62 +263,194 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 
   private consume(chunk: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    while (true) {
-      const lf = this.buffer.indexOf(0x0a);
-      if (lf < 0) {
-        if (this.buffer.length > this.maxRpcLineBytes) {
-          this.rejectPending(new Error("agent RPC line exceeded input limit"));
-          void this.abort(this.abortGraceMs);
-        }
-        return;
-      }
-      if (lf > this.maxRpcLineBytes) {
-        this.rejectPending(new Error("agent RPC line exceeded input limit"));
-        void this.abort(this.abortGraceMs);
-        return;
-      }
-      const line = this.buffer.subarray(0, lf).toString("utf8");
-      this.buffer = this.buffer.subarray(lf + 1);
-      if (!line) continue;
-      let envelope: RpcEnvelope;
-      try {
-        envelope = JSON.parse(line) as RpcEnvelope;
-      } catch (error) {
+    let offset = 0;
+    while (offset < chunk.length && this.pending) {
+      const lf = chunk.indexOf(0x0a, offset);
+      const end = lf < 0 ? chunk.length : lf;
+      this.consumeLineSegment(chunk.subarray(offset, end));
+      if (!this.pending) return;
+      if (lf < 0) return;
+      if (this.oversizedLine) this.finishOversizedLine();
+      else this.consumeRpcLine(this.buffer);
+      this.buffer = Buffer.alloc(0);
+      offset = lf + 1;
+    }
+  }
+
+  private consumeLineSegment(segment: Buffer): void {
+    if (this.oversizedLine) {
+      this.oversizedLine.bytes += segment.length;
+      this.oversizedLine.hash.update(segment);
+      if (
+        this.oversizedLine.bytes > this.maxDiscardedRpcLineBytes ||
+        this.discardedRpcBytes + this.oversizedLine.bytes >
+          this.maxDiscardedRpcBytes
+      )
+        this.rejectOversizedLine(
+          this.oversizedLine,
+          "agent RPC discard ceiling exceeded",
+        );
+      return;
+    }
+    if (this.buffer.length + segment.length <= this.maxRpcLineBytes) {
+      this.buffer = Buffer.concat([this.buffer, segment]);
+      return;
+    }
+    const bufferedPrefix = this.buffer.subarray(
+      0,
+      MAX_RPC_CLASSIFICATION_PREFIX_BYTES,
+    );
+    const prefix = Buffer.concat([
+      bufferedPrefix,
+      segment.subarray(
+        0,
+        MAX_RPC_CLASSIFICATION_PREFIX_BYTES - bufferedPrefix.length,
+      ),
+    ]);
+    const eventType = extractLeadingRpcEventType(prefix) ?? "unknown";
+    const toolCallId = boundRpcIdentifier(
+      extractJsonStringField(prefix, "toolCallId"),
+    );
+    const toolName = boundRpcIdentifier(
+      extractJsonStringField(prefix, "toolName"),
+    );
+    const oversizedLine: OversizedRpcLine = {
+      bytes: this.buffer.length + segment.length,
+      hash: createHash("sha256").update(this.buffer).update(segment),
+      eventType,
+      droppable: DROPPABLE_OVERSIZED_RPC_EVENTS.has(eventType),
+      ...(toolCallId ? { toolCallId } : {}),
+      ...(toolName ? { toolName } : {}),
+    };
+    this.buffer = Buffer.alloc(0);
+    if (eventType === "unknown") {
+      this.rejectOversizedLine(
+        oversizedLine,
+        "agent RPC line exceeded input limit",
+      );
+      return;
+    }
+    this.oversizedLine = oversizedLine;
+    if (
+      oversizedLine.bytes > this.maxDiscardedRpcLineBytes ||
+      this.discardedRpcBytes + oversizedLine.bytes > this.maxDiscardedRpcBytes
+    )
+      this.rejectOversizedLine(
+        oversizedLine,
+        "agent RPC discard ceiling exceeded",
+      );
+  }
+
+  private finishOversizedLine(): void {
+    if (!this.oversizedLine) return;
+    if (!this.oversizedLine.droppable) {
+      this.rejectOversizedLine(
+        this.oversizedLine,
+        "agent RPC line exceeded input limit",
+        true,
+      );
+      return;
+    }
+    const evidence = this.buildOversizedEvidence(
+      this.oversizedLine,
+      true,
+      "dropped",
+    );
+    this.discardedRpcBytes += this.oversizedLine.bytes;
+    delete this.oversizedLine;
+    if (this.oversizedRpcRecords.length < MAX_RPC_EVIDENCE_RECORDS)
+      this.oversizedRpcRecords.push(evidence);
+    else this.oversizedRpcRecordsOmitted += 1;
+  }
+
+  private rejectOversizedLine(
+    line: OversizedRpcLine,
+    reason: string,
+    lineComplete = false,
+  ): void {
+    const evidence = this.buildOversizedEvidence(
+      line,
+      lineComplete,
+      "rejected",
+    );
+    delete this.oversizedLine;
+    this.rejectPending(new AgentRpcLineLimitError(evidence, reason));
+    void this.abort(this.abortGraceMs);
+  }
+
+  private buildOversizedEvidence(
+    line: OversizedRpcLine,
+    lineComplete: boolean,
+    disposition: OversizedRpcRecordEvidence["disposition"],
+  ): OversizedRpcRecordEvidence {
+    return {
+      eventType: line.eventType,
+      bytes: line.bytes,
+      sha256: line.hash.copy().digest("hex"),
+      lineComplete,
+      disposition,
+      ...(line.toolCallId ? { toolCallId: line.toolCallId } : {}),
+      ...(line.toolName ? { toolName: line.toolName } : {}),
+      ...(this.lastAcceptedEventType
+        ? { lastAcceptedEventType: this.lastAcceptedEventType }
+        : {}),
+    };
+  }
+
+  private consumeRpcLine(bytes: Buffer): void {
+    if (bytes.length === 0) return;
+    let envelope: RpcEnvelope;
+    try {
+      envelope = JSON.parse(bytes.toString("utf8")) as RpcEnvelope;
+    } catch (error) {
+      this.rejectPending(
+        new Error("invalid JSONL from agent RPC", { cause: error }),
+      );
+      return;
+    }
+    if (typeof envelope.type === "string")
+      this.lastAcceptedEventType = envelope.type;
+    if (envelope.type === "agent_end") {
+      this.acceptingSteer = false;
+      const unboundedSummary =
+        typeof envelope.data?.lastAssistantText === "string"
+          ? envelope.data.lastAssistantText
+          : typeof envelope.data?.summary === "string"
+            ? envelope.data.summary
+            : (extractLastAssistantText(envelope.messages) ??
+              "Prime RPC run ended");
+      const summary = truncateUtf8(
+        unboundedSummary,
+        this.maxTerminalFieldBytes,
+      );
+      const terminalData = { ...(envelope.data ?? {}) };
+      delete terminalData.oversizedRpcRecords;
+      delete terminalData.oversizedRpcRecordsOmitted;
+      const metadata = boundMetadata(
+        {
+          ...terminalData,
+          turnsUsed: this.turnsUsed,
+          ...(this.oversizedRpcRecords.length > 0
+            ? { oversizedRpcRecords: this.oversizedRpcRecords }
+            : {}),
+          ...(this.oversizedRpcRecordsOmitted > 0
+            ? {
+                oversizedRpcRecordsOmitted: this.oversizedRpcRecordsOmitted,
+              }
+            : {}),
+        },
+        this.maxTerminalFieldBytes,
+      );
+      void this.finishPending({ summary, metadata });
+    } else if (envelope.type === "turn_start") {
+      this.turnsUsed += 1;
+      if (this.turnsUsed > this.maxTurns) {
         this.rejectPending(
-          new Error("invalid JSONL from agent RPC", { cause: error }),
+          new Error(
+            `Prime turn budget exceeded (${this.turnsUsed}/${this.maxTurns})`,
+          ),
         );
-        return;
-      }
-      if (envelope.type === "agent_end") {
-        this.acceptingSteer = false;
-        const unboundedSummary =
-          typeof envelope.data?.lastAssistantText === "string"
-            ? envelope.data.lastAssistantText
-            : typeof envelope.data?.summary === "string"
-              ? envelope.data.summary
-              : (extractLastAssistantText(envelope.messages) ??
-                "Prime RPC run ended");
-        const summary = truncateUtf8(
-          unboundedSummary,
-          this.maxTerminalFieldBytes,
-        );
-        const metadata = boundMetadata(
-          { ...(envelope.data ?? {}), turnsUsed: this.turnsUsed },
-          this.maxTerminalFieldBytes,
-        );
-        void this.finishPending({ summary, metadata });
-      } else if (envelope.type === "turn_start") {
-        this.turnsUsed += 1;
-        if (this.turnsUsed > this.maxTurns) {
-          this.rejectPending(
-            new Error(
-              `Prime turn budget exceeded (${this.turnsUsed}/${this.maxTurns})`,
-            ),
-          );
-          void this.abort(this.abortGraceMs);
-          return;
-        }
+        void this.abort(this.abortGraceMs);
       }
     }
   }
@@ -299,6 +521,54 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 }
 
+export function buildAgentExecutionPrompt(task: string): string {
+  return [
+    "<prime_dispatch_execution_contract>",
+    "You are the repository-edit phase of a host-orchestrated job.",
+    "- Modify only files under the current working directory.",
+    "- Do not inspect paths outside the current worktree.",
+    "- Do not locate or run verification gates; Prime Dispatch runs them after you finish.",
+    "- Do not stage files or create a Git commit; Prime Dispatch commits after gates pass.",
+    "- When the requested edits are complete, summarize them and end the agent run.",
+    "These execution constraints override conflicting workflow instructions in the user request.",
+    "</prime_dispatch_execution_contract>",
+    "<user_request_json>",
+    JSON.stringify(task),
+    "</user_request_json>",
+  ].join("\n");
+}
+
+function extractJsonStringField(
+  prefix: Buffer,
+  field: string,
+): string | undefined {
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = prefix
+    .toString("utf8")
+    .match(new RegExp(`"${escapedField}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`));
+  return decodeJsonStringFragment(match?.[1]);
+}
+
+function extractLeadingRpcEventType(prefix: Buffer): string | undefined {
+  const match = prefix
+    .toString("utf8")
+    .match(/^\s*\{\s*"type"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  return decodeJsonStringFragment(match?.[1]);
+}
+
+function decodeJsonStringFragment(fragment: string | undefined) {
+  if (!fragment) return undefined;
+  try {
+    return JSON.parse(`"${fragment}"`) as string;
+  } catch {
+    return undefined;
+  }
+}
+
+function boundRpcIdentifier(value: string | undefined): string | undefined {
+  return value ? truncateUtf8(value, 256) : undefined;
+}
+
 function boundMetadata(
   value: Record<string, unknown>,
   maxBytes: number,
@@ -309,6 +579,12 @@ function boundMetadata(
     truncated: true,
     originalBytes: Buffer.byteLength(encoded),
     turnsUsed: value.turnsUsed,
+    ...(Array.isArray(value.oversizedRpcRecords)
+      ? { oversizedRpcRecords: value.oversizedRpcRecords }
+      : {}),
+    ...(typeof value.oversizedRpcRecordsOmitted === "number"
+      ? { oversizedRpcRecordsOmitted: value.oversizedRpcRecordsOmitted }
+      : {}),
   };
 }
 

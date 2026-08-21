@@ -3,7 +3,11 @@ import { createServer, type Socket } from "node:net";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createAgentBackend, type AgentBackend } from "./agent.js";
+import {
+  AgentRpcLineLimitError,
+  createAgentBackend,
+  type AgentBackend,
+} from "./agent.js";
 import { UnsafeLocalExecutionBackend } from "./execution.js";
 import { JobStore } from "./store.js";
 import {
@@ -382,6 +386,16 @@ async function main(): Promise<void> {
     assertJobActive();
     await inferenceLease?.revoke();
     state = await syncInferenceUsage(state);
+    const droppedRpcRecords = agentResult.metadata.oversizedRpcRecords;
+    if (Array.isArray(droppedRpcRecords) && droppedRpcRecords.length > 0)
+      await store.appendEvent(jobId, "agent_rpc_records_dropped", {
+        records: droppedRpcRecords,
+        ...(typeof agentResult.metadata.oversizedRpcRecordsOmitted === "number"
+          ? {
+              omitted: agentResult.metadata.oversizedRpcRecordsOmitted,
+            }
+          : {}),
+      });
     await store.appendEvent(jobId, "agent_completed", {
       summary: agentResult.summary,
       metadata: agentResult.metadata,
@@ -500,6 +514,10 @@ async function main(): Promise<void> {
   } catch (error) {
     await cancellationPromise?.catch(() => undefined);
     await inferenceLease?.revoke().catch(() => undefined);
+    if (error instanceof AgentRpcLineLimitError)
+      await store
+        .appendEvent(jobId, "agent_rpc_record_rejected", error.evidence)
+        .catch(() => undefined);
     const message = cancellationRequested
       ? "cancelled by request"
       : deadlineExceeded
