@@ -305,7 +305,7 @@ describe("PrimeDispatchAdapter", () => {
   });
 
   it.each(["succeeded", "failed", "cancelled", "interrupted"])(
-    "disables refresh after a job is %s",
+    "removes refresh after a job is %s",
     async (terminalStatus) => {
       const { adapter, runCli } = await fixture();
       runCli
@@ -314,10 +314,10 @@ describe("PrimeDispatchAdapter", () => {
 
       const status = await adapter.status({ jobId: "job-1" }, ownerContext);
 
-      expect(status.presentation.blocks[1]).toMatchObject({
-        type: "buttons",
-        buttons: [{ label: "Refresh", disabled: true }],
-      });
+      expect(status.presentation.blocks).toHaveLength(1);
+      expect(status.presentation.blocks).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "buttons" })]),
+      );
     },
   );
 
