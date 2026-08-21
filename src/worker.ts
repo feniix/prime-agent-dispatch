@@ -383,19 +383,19 @@ async function main(): Promise<void> {
       execution.worktreePath,
       controller.signal,
     );
-    assertJobActive();
-    await inferenceLease?.revoke();
-    state = await syncInferenceUsage(state);
-    const droppedRpcRecords = agentResult.metadata.oversizedRpcRecords;
-    if (Array.isArray(droppedRpcRecords) && droppedRpcRecords.length > 0)
-      await store.appendEvent(jobId, "agent_rpc_records_dropped", {
-        records: droppedRpcRecords,
+    const boundedRpcRecords = agentResult.metadata.oversizedRpcRecords;
+    if (Array.isArray(boundedRpcRecords) && boundedRpcRecords.length > 0)
+      await store.appendEvent(jobId, "agent_rpc_records_bounded", {
+        records: boundedRpcRecords,
         ...(typeof agentResult.metadata.oversizedRpcRecordsOmitted === "number"
           ? {
               omitted: agentResult.metadata.oversizedRpcRecordsOmitted,
             }
           : {}),
       });
+    assertJobActive();
+    await inferenceLease?.revoke();
+    state = await syncInferenceUsage(state);
     await store.appendEvent(jobId, "agent_completed", {
       summary: agentResult.summary,
       metadata: agentResult.metadata,

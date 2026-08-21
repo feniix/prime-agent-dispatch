@@ -18,8 +18,8 @@ async function handle(message: Record<string, unknown>): Promise<void> {
     emit({ type: "agent_start", data: { sessionId: `fake-${process.pid}` } });
     if (payload.task.includes("OVERSIZED_RPC_CONTROL")) {
       emit({
-        type: "agent_end",
-        data: { lastAssistantText: "x".repeat(300_000) },
+        type: "turn_start",
+        data: { payload: "x".repeat(300_000) },
       });
       return;
     }
