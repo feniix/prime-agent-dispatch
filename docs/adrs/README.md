@@ -20,6 +20,7 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 - [ADR-0014: Reuse maintained infrastructure primitives without outsourcing policy](0014-reuse-maintained-infrastructure-primitives.md)
 - [ADR-0015: Record observed inference usage without claiming hard token or cost enforcement](0015-observed-inference-usage-ledger.md)
 - [ADR-0016: Use a versioned host-local lifecycle for the OpenClaw integration](0016-versioned-openclaw-host-lifecycle.md)
+- [ADR-0017: Resume only from mechanically proven checkpoints](0017-mechanically-proven-safe-resume.md)
 
 ## Status conventions
 
