@@ -5,6 +5,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  PRIME_EXECUTION_SYSTEM_PROMPT,
   PrimeJsonlRpcBackend,
   verifyPrimeInstallation,
   writePrimeModelsConfig,
@@ -84,7 +85,7 @@ test("Prime RPC quiesces the process tree before returning and rejects late stee
   assert.throws(() => process.kill(pid, 0), /ESRCH/);
 });
 
-test("Prime RPC gives the model an edit-only execution contract", async () => {
+test("Prime RPC preserves the user request beneath the system execution contract", async () => {
   const { root, backend } = await rpcFixture(
     "execution-contract",
     (fixtureRoot) => {
@@ -113,13 +114,9 @@ test("Prime RPC gives the model an edit-only execution contract", async () => {
     await backend.dispose();
   }
   const prompt = await readFile(join(root, "prompt.txt"), "utf8");
-  assert.match(prompt, /Modify only files under the current working directory/);
-  assert.match(prompt, /Do not inspect paths outside the current worktree/);
-  assert.match(prompt, /Do not locate or run verification gates/);
-  assert.match(prompt, /Do not stage files or create a Git commit/);
-  assert.match(
+  assert.equal(
     prompt,
-    /change the file, discover and run the gate, then commit/,
+    "change the file, discover and run the gate, then commit",
   );
 });
 
@@ -161,6 +158,131 @@ test("Prime RPC drains oversized observational events and accepts a later agent_
   assert.ok(evidence.bytes > 256 * 1024);
   assert.match(evidence.sha256, /^[a-f0-9]{64}$/);
   assert.equal(evidence.lastAcceptedEventType, "turn_start");
+});
+
+test("Prime RPC handles Prime's repeated large tool-result event sequence", async () => {
+  const { root, backend } = await rpcFixture(
+    "repeated-tool-result",
+    [
+      'process.stdin.once("data", () => {',
+      '  const stdout = "x".repeat(300_000);',
+      '  const result = { content: [{ type: "text", text: stdout }], details: { stdout } };',
+      '  const toolResult = { role: "toolResult", toolCallId: "call-1", toolName: "ipython", content: result.content, details: result.details };',
+      '  const assistant = { role: "assistant", content: [{ type: "text", text: "done" }] };',
+      "  for (const event of [",
+      '    { type: "tool_execution_end", toolCallId: "call-1", toolName: "ipython", result },',
+      '    { type: "message_start", message: toolResult },',
+      '    { type: "message_end", message: toolResult },',
+      '    { type: "turn_end", message: assistant, toolResults: [toolResult] },',
+      '    { type: "message_end", message: assistant },',
+      '    { type: "agent_end", messages: [toolResult, assistant] },',
+      '  ]) process.stdout.write(JSON.stringify(event) + "\\n");',
+      "  setInterval(() => {}, 30_000);",
+      "});",
+    ],
+    { abortGraceMs: 20 },
+  );
+  const result = await backend.start(
+    "task",
+    root,
+    new AbortController().signal,
+  );
+  assert.equal(result.summary, "done");
+  assert.deepEqual(
+    result.metadata.oversizedRpcRecords.map((record) => [
+      record.eventType,
+      record.disposition,
+    ]),
+    [
+      ["tool_execution_end", "dropped"],
+      ["message_start", "dropped"],
+      ["message_end", "dropped"],
+      ["turn_end", "dropped"],
+      ["agent_end", "normalized"],
+    ],
+  );
+});
+
+test("Prime RPC rejects malformed or reclassified oversized terminal records", async () => {
+  for (const [name, line, error] of [
+    [
+      "malformed-terminal",
+      `{"type":"agent_end","data":{"lastAssistantText":"${"x".repeat(5_000)}"`,
+      /invalid oversized agent_end record.*type=agent_end/,
+    ],
+    [
+      "reclassified-terminal",
+      JSON.stringify({
+        type: "agent_end",
+        payload: "x".repeat(5_000),
+      }).replace('"payload"', '"type":"turn_start","payload"'),
+      /changed type after parsing.*type=agent_end/,
+    ],
+  ]) {
+    const { root, backend } = await rpcFixture(
+      name,
+      `process.stdin.once("data", () => { process.stdout.write(${JSON.stringify(line)} + "\\n"); setInterval(() => {}, 30_000); });\n`,
+      {
+        abortGraceMs: 20,
+        rpcByteLimits: {
+          lineBytes: 1_024,
+          discardedLineBytes: 8_192,
+          totalDiscardedBytes: 16_384,
+        },
+      },
+    );
+    await assert.rejects(
+      () => backend.start("task", root, new AbortController().signal),
+      error,
+    );
+    await backend.dispose();
+  }
+});
+
+test("Prime RPC rejects oversized terminal records beyond the discard ceiling", async () => {
+  const { root, backend } = await rpcFixture(
+    "terminal-discard-limit",
+    'process.stdin.once("data", () => { process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "x".repeat(5_000) } }) + "\\n"); setInterval(() => {}, 30_000); });\n',
+    {
+      abortGraceMs: 20,
+      rpcByteLimits: {
+        lineBytes: 1_024,
+        discardedLineBytes: 2_048,
+        totalDiscardedBytes: 4_096,
+      },
+    },
+  );
+  await assert.rejects(
+    () => backend.start("task", root, new AbortController().signal),
+    /RPC discard ceiling exceeded.*type=agent_end/,
+  );
+  await backend.dispose();
+});
+
+test("Prime RPC keeps final evidence metadata within its byte ceiling", async () => {
+  const { root, backend } = await rpcFixture(
+    "bounded-evidence",
+    [
+      'process.stdin.once("data", () => {',
+      '  process.stdout.write(JSON.stringify({ type: "z".repeat(250_000) }) + "\\n");',
+      '  process.stdout.write(JSON.stringify({ type: "tool_execution_end", result: { text: "x".repeat(300_000) } }) + "\\n");',
+      '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "done" } }) + "\\n");',
+      "  setInterval(() => {}, 30_000);",
+      "});",
+    ],
+    { abortGraceMs: 20 },
+  );
+  const result = await backend.start(
+    "task",
+    root,
+    new AbortController().signal,
+  );
+  assert.ok(Buffer.byteLength(JSON.stringify(result.metadata)) <= 64 * 1024);
+  assert.ok(
+    Buffer.byteLength(
+      result.metadata.oversizedRpcRecords[0].lastAcceptedEventType,
+    ) <= 256,
+  );
 });
 
 test("Prime RPC bounds the bytes drained from oversized observational events", async () => {
@@ -306,6 +428,8 @@ test("Prime private config contains only scoped broker token and fixed model", a
     "gpt-5.6-sol",
     "--thinking",
     "high",
+    "--append-system-prompt",
+    PRIME_EXECUTION_SYSTEM_PROMPT,
     "--tools",
     "ipython",
   ]);

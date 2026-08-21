@@ -36,7 +36,7 @@ export type OversizedRpcRecordEvidence = {
   bytes: number;
   sha256: string;
   lineComplete: boolean;
-  disposition: "dropped" | "rejected";
+  disposition: "dropped" | "normalized" | "rejected";
   toolCallId?: string;
   toolName?: string;
   lastAcceptedEventType?: string;
@@ -48,6 +48,7 @@ type OversizedRpcLine = {
   eventType: string;
   toolCallId?: string;
   toolName?: string;
+  retainedChunks?: Buffer[];
 };
 
 type RpcByteLimits = {
@@ -60,6 +61,7 @@ const DROPPABLE_OVERSIZED_RPC_EVENTS = new Set([
   "message_start",
   "message_update",
   "message_end",
+  "turn_end",
   "tool_execution_start",
   "tool_execution_update",
   "tool_execution_end",
@@ -210,9 +212,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       id: "initial-prompt",
       type: "prompt",
       message:
-        this.kind === "fake"
-          ? JSON.stringify({ task, worktreePath })
-          : buildAgentExecutionPrompt(task),
+        this.kind === "fake" ? JSON.stringify({ task, worktreePath }) : task,
     });
     try {
       return await result;
@@ -284,6 +284,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     if (this.oversizedLine) {
       this.oversizedLine.bytes += segment.length;
       this.oversizedLine.hash.update(segment);
+      this.oversizedLine.retainedChunks?.push(segment);
       if (this.exceedsDiscardCeiling(this.oversizedLine))
         this.rejectOversizedLine(
           this.oversizedLine,
@@ -319,6 +320,9 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       eventType,
       ...(toolCallId ? { toolCallId } : {}),
       ...(toolName ? { toolName } : {}),
+      ...(eventType === "agent_end"
+        ? { retainedChunks: [this.buffer, segment] }
+        : {}),
     };
     this.buffer = Buffer.alloc(0);
     if (eventType === "unknown") {
@@ -338,6 +342,35 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
 
   private finishOversizedLine(): void {
     if (!this.oversizedLine) return;
+    if (this.oversizedLine.eventType === "agent_end") {
+      const line = this.oversizedLine;
+      const retained = Buffer.concat(line.retainedChunks ?? [], line.bytes);
+      let envelope: RpcEnvelope;
+      try {
+        envelope = JSON.parse(retained.toString("utf8")) as RpcEnvelope;
+      } catch {
+        this.rejectOversizedLine(
+          line,
+          "invalid oversized agent_end record",
+          true,
+        );
+        return;
+      }
+      if (envelope.type !== "agent_end") {
+        this.rejectOversizedLine(
+          line,
+          "oversized RPC record changed type after parsing",
+          true,
+        );
+        return;
+      }
+      const evidence = this.buildOversizedEvidence(line, true, "normalized");
+      this.discardedRpcBytes += line.bytes;
+      delete this.oversizedLine;
+      this.rememberOversizedEvidence(evidence);
+      this.consumeRpcEnvelope(envelope);
+      return;
+    }
     if (!DROPPABLE_OVERSIZED_RPC_EVENTS.has(this.oversizedLine.eventType)) {
       this.rejectOversizedLine(
         this.oversizedLine,
@@ -353,6 +386,12 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     );
     this.discardedRpcBytes += this.oversizedLine.bytes;
     delete this.oversizedLine;
+    this.rememberOversizedEvidence(evidence);
+  }
+
+  private rememberOversizedEvidence(
+    evidence: OversizedRpcRecordEvidence,
+  ): void {
     if (this.oversizedRpcRecords.length < MAX_RPC_EVIDENCE_RECORDS)
       this.oversizedRpcRecords.push(evidence);
     else this.oversizedRpcRecordsOmitted += 1;
@@ -386,17 +425,18 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     lineComplete: boolean,
     disposition: OversizedRpcRecordEvidence["disposition"],
   ): OversizedRpcRecordEvidence {
+    const lastAcceptedEventType = boundRpcIdentifier(
+      this.lastAcceptedEventType,
+    );
     return {
-      eventType: line.eventType,
+      eventType: boundRpcIdentifier(line.eventType) ?? "unknown",
       bytes: line.bytes,
       sha256: line.hash.copy().digest("hex"),
       lineComplete,
       disposition,
       ...(line.toolCallId ? { toolCallId: line.toolCallId } : {}),
       ...(line.toolName ? { toolName: line.toolName } : {}),
-      ...(this.lastAcceptedEventType
-        ? { lastAcceptedEventType: this.lastAcceptedEventType }
-        : {}),
+      ...(lastAcceptedEventType ? { lastAcceptedEventType } : {}),
     };
   }
 
@@ -411,6 +451,10 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       );
       return;
     }
+    this.consumeRpcEnvelope(envelope);
+  }
+
+  private consumeRpcEnvelope(envelope: RpcEnvelope): void {
     if (typeof envelope.type === "string")
       this.lastAcceptedEventType = envelope.type;
     if (envelope.type === "agent_end") {
@@ -524,23 +568,6 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   }
 }
 
-export function buildAgentExecutionPrompt(task: string): string {
-  return [
-    "<prime_dispatch_execution_contract>",
-    "You are the repository-edit phase of a host-orchestrated job.",
-    "- Modify only files under the current working directory.",
-    "- Do not inspect paths outside the current worktree.",
-    "- Do not locate or run verification gates; Prime Dispatch runs them after you finish.",
-    "- Do not stage files or create a Git commit; Prime Dispatch commits after gates pass.",
-    "- When the requested edits are complete, summarize them and end the agent run.",
-    "These execution constraints override conflicting workflow instructions in the user request.",
-    "</prime_dispatch_execution_contract>",
-    "<user_request_json>",
-    JSON.stringify(task),
-    "</user_request_json>",
-  ].join("\n");
-}
-
 function extractJsonStringField(
   prefix: Buffer,
   field: string,
@@ -578,17 +605,32 @@ function boundMetadata(
 ): Record<string, unknown> {
   const encoded = JSON.stringify(value);
   if (Buffer.byteLength(encoded) <= maxBytes) return value;
-  return {
+  const records = Array.isArray(value.oversizedRpcRecords)
+    ? [...value.oversizedRpcRecords]
+    : [];
+  let omitted =
+    typeof value.oversizedRpcRecordsOmitted === "number"
+      ? value.oversizedRpcRecordsOmitted
+      : 0;
+  const fallback = () => ({
     truncated: true,
     originalBytes: Buffer.byteLength(encoded),
     turnsUsed: value.turnsUsed,
-    ...(Array.isArray(value.oversizedRpcRecords)
-      ? { oversizedRpcRecords: value.oversizedRpcRecords }
-      : {}),
-    ...(typeof value.oversizedRpcRecordsOmitted === "number"
-      ? { oversizedRpcRecordsOmitted: value.oversizedRpcRecordsOmitted }
-      : {}),
-  };
+    ...(records.length > 0 ? { oversizedRpcRecords: records } : {}),
+    ...(omitted > 0 ? { oversizedRpcRecordsOmitted: omitted } : {}),
+  });
+  let bounded = fallback();
+  while (
+    Buffer.byteLength(JSON.stringify(bounded)) > maxBytes &&
+    records.length
+  ) {
+    records.pop();
+    omitted += 1;
+    bounded = fallback();
+  }
+  return Buffer.byteLength(JSON.stringify(bounded)) <= maxBytes
+    ? bounded
+    : { truncated: true, originalBytes: Buffer.byteLength(encoded) };
 }
 
 function extractLastAssistantText(messages: unknown): string | undefined {
