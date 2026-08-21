@@ -724,6 +724,7 @@ function statusPresentation(
           {
             label: "Refresh",
             action: { type: "command", command: `/prime-status ${jobId}` },
+            disabled: terminal,
             reusable: true,
           },
         ],

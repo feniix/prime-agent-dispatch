@@ -222,7 +222,28 @@ describe("PrimeDispatchAdapter", () => {
     expect(status.presentation.blocks[0].text).toContain(
       "Hard output-token limit: unsupported; monetary cost: unavailable",
     );
+    expect(status.presentation.blocks[1]).toMatchObject({
+      type: "buttons",
+      buttons: [{ label: "Refresh", disabled: false }],
+    });
   });
+
+  it.each(["succeeded", "failed", "cancelled", "interrupted"])(
+    "disables refresh after a job is %s",
+    async (terminalStatus) => {
+      const { adapter, runCli } = await fixture();
+      runCli
+        .mockResolvedValueOnce({ status: terminalStatus })
+        .mockResolvedValueOnce({ notifications: [] });
+
+      const status = await adapter.status({ jobId: "job-1" }, ownerContext);
+
+      expect(status.presentation.blocks[1]).toMatchObject({
+        type: "buttons",
+        buttons: [{ label: "Refresh", disabled: true }],
+      });
+    },
+  );
 
   it("rediscovers jobs, edits one durable status card, and advances delivery once", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "prime-adapter-catchup-"));
