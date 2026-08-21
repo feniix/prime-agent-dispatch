@@ -248,7 +248,7 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     ).toEqual({ text: "Prime job job-1\nStatus: running" });
   });
 
-  it("registers five optional typed tools and Discord confirmation commands", () => {
+  it("registers six optional typed tools and Discord confirmation commands", () => {
     const tools: string[] = [];
     const commands: Array<{
       name: string;
@@ -278,6 +278,7 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     plugin.register(api as any);
     expect(tools).toEqual([
       "prime_start",
+      "prime_resume",
       "prime_status",
       "prime_steer",
       "prime_cancel",
@@ -285,6 +286,7 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     ]);
     expect(commands.map((command) => command.name)).toEqual([
       "prime-confirm",
+      "prime-resume-confirm",
       "prime-status",
     ]);
     expect(interactiveHandlers).toEqual([
@@ -296,6 +298,12 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     ]);
     expect(
       commands.find((command) => command.name === "prime-confirm"),
+    ).toMatchObject({
+      requiredScopes: ["operator.admin"],
+      exposeSenderIsOwner: true,
+    });
+    expect(
+      commands.find((command) => command.name === "prime-resume-confirm"),
     ).toMatchObject({
       requiredScopes: ["operator.admin"],
       exposeSenderIsOwner: true,

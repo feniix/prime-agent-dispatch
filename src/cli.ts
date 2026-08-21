@@ -2,7 +2,7 @@
 import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { PrimeDispatcher } from "./dispatcher.js";
-import { PrimeStartInputSchema } from "./schemas.js";
+import { AuthorizationSchema, PrimeStartInputSchema } from "./schemas.js";
 import { loadHostConfig, resolveHostRepositoryPolicy } from "./host-config.js";
 
 type CommonOptions = { stateRoot?: string };
@@ -28,6 +28,35 @@ function withStateRoot(command: Command): Command {
     "--state-root <path>",
     "durable state root (defaults to PRIME_DISPATCH_STATE_ROOT or .prime-dispatch)",
   );
+}
+
+function withResumeAuthorization(command: Command): Command {
+  return command
+    .requiredOption("--channel <id>")
+    .requiredOption("--sender <id>")
+    .requiredOption("--owner")
+    .option("--provider <id>")
+    .option("--account <id>")
+    .option("--thread <id>")
+    .option("--delivery <id>");
+}
+
+function resumeAuthorization(options: Record<string, unknown>) {
+  return AuthorizationSchema.parse({
+    ...(typeof options.provider === "string"
+      ? { provider: options.provider }
+      : {}),
+    channelId: options.channel,
+    senderId: options.sender,
+    senderIsOwner: options.owner === true,
+    ...(typeof options.account === "string"
+      ? { accountId: options.account }
+      : {}),
+    ...(typeof options.thread === "string" ? { threadId: options.thread } : {}),
+    ...(typeof options.delivery === "string"
+      ? { deliveryId: options.delivery }
+      : {}),
+  });
 }
 
 async function createDispatcher(
@@ -134,6 +163,42 @@ withStateRoot(
         ),
       );
     }),
+);
+
+withStateRoot(
+  withResumeAuthorization(
+    program
+      .command("resume-preview")
+      .description("preview a mechanically safe resume for an interrupted job")
+      .requiredOption("--job-id <id>"),
+  ).action(async (options) => {
+    const dispatcher = await createDispatcher(options);
+    print(
+      await dispatcher.previewResume(
+        options.jobId,
+        resumeAuthorization(options),
+      ),
+    );
+  }),
+);
+
+withStateRoot(
+  withResumeAuthorization(
+    program
+      .command("resume-confirm")
+      .description("launch one previously previewed safe resume")
+      .requiredOption("--job-id <id>")
+      .requiredOption("--confirmation-token <uuid>"),
+  ).action(async (options) => {
+    const dispatcher = await createDispatcher(options);
+    print(
+      await dispatcher.resumeConfirmed(
+        options.jobId,
+        options.confirmationToken,
+        resumeAuthorization(options),
+      ),
+    );
+  }),
 );
 
 for (const [name, description, action] of [

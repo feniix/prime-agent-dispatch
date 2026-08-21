@@ -95,6 +95,10 @@ type PreviewInput = {
 
 type ConfirmInput = { action: "confirm"; confirmationToken: string };
 
+type ResumeInput =
+  | { action: "preview"; jobId: string }
+  | { action: "confirm"; jobId: string; confirmationToken: string };
+
 export class PrimeDispatchAdapter {
   readonly config: PrimeDispatchPluginConfig;
   readonly runCli: CliRunner;
@@ -199,6 +203,59 @@ export class PrimeDispatchAdapter {
     return {
       ...response,
       notifications: sanitize(notifications, this.config.maxRenderedChars),
+    };
+  }
+
+  async resume(input: ResumeInput, context: TrustedToolContext): Promise<any> {
+    this.assertOwner(context);
+    const authorizationArgs = this.buildResumeAuthorizationArgs(context);
+    if (input.action === "preview") {
+      const raw = asRecord(
+        await this.runCli([
+          "resume-preview",
+          "--state-root",
+          this.config.stateRoot,
+          "--job-id",
+          input.jobId,
+          ...authorizationArgs,
+        ]),
+      );
+      const confirmationToken = stringField(raw, "confirmationToken");
+      const expiresAt = stringField(raw, "expiresAt");
+      const plan = sanitize(raw.plan, this.config.maxRenderedChars);
+      return {
+        operation: "prime_resume",
+        phase: "preview",
+        jobId: input.jobId,
+        confirmationToken,
+        expiresAt,
+        plan,
+        presentation: resumeConfirmationPresentation(
+          input.jobId,
+          plan,
+          confirmationToken,
+        ),
+      };
+    }
+    const launched = asRecord(
+      await this.runCli([
+        "resume-confirm",
+        "--state-root",
+        this.config.stateRoot,
+        "--job-id",
+        input.jobId,
+        "--confirmation-token",
+        input.confirmationToken,
+        ...authorizationArgs,
+      ]),
+    );
+    return {
+      operation: "prime_resume",
+      phase: "launched",
+      jobId: input.jobId,
+      attemptId: launched.attemptId,
+      state: sanitize(launched.state, this.config.maxRenderedChars),
+      presentation: statusPresentation(input.jobId, "queued"),
     };
   }
 
@@ -454,6 +511,22 @@ export class PrimeDispatchAdapter {
     return args;
   }
 
+  private buildResumeAuthorizationArgs(context: TrustedToolContext): string[] {
+    const args = [
+      "--channel",
+      requiredContext(context.to, "delivery channel"),
+      "--provider",
+      "discord",
+      "--sender",
+      requiredContext(context.senderId, "sender"),
+      "--owner",
+    ];
+    if (context.accountId) args.push("--account", context.accountId);
+    if (context.threadId) args.push("--thread", context.threadId);
+    if (context.deliveryId) args.push("--delivery", context.deliveryId);
+    return args;
+  }
+
   private assertOwner(context: TrustedToolContext): void {
     if (context.senderIsOwner !== true)
       throw new Error("Prime Dispatch is owner-only");
@@ -698,6 +771,48 @@ function confirmationPresentation(
           {
             label: "Confirm Prime job",
             action: { type: "command", command: `/prime-confirm ${token}` },
+            style: "danger",
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function resumeConfirmationPresentation(
+  jobId: string,
+  planValue: unknown,
+  token: string,
+): Presentation {
+  const plan = asRecord(planValue);
+  const preserved = Array.isArray(plan.preserved)
+    ? plan.preserved.map(String)
+    : [];
+  const willNotRepeat = Array.isArray(plan.willNotRepeat)
+    ? plan.willNotRepeat.map(String)
+    : [];
+  return {
+    title: `Resume Prime job ${jobId}`,
+    tone: "warning",
+    blocks: [
+      {
+        type: "text",
+        text: [
+          `Next safe stage: ${String(plan.nextStage ?? "unknown")}`,
+          `Preserved: ${preserved.join(", ") || "none"}`,
+          `Will not repeat: ${willNotRepeat.join(", ") || "none"}`,
+          String(plan.rationale ?? "Resume evidence requires review"),
+        ].join("\n"),
+      },
+      {
+        type: "buttons",
+        buttons: [
+          {
+            label: "Confirm safe resume",
+            action: {
+              type: "command",
+              command: `/prime-resume-confirm ${jobId} ${token}`,
+            },
             style: "danger",
           },
         ],

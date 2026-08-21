@@ -11,10 +11,10 @@ This is not production-ready. The default execution backend is intentionally nam
 - **Subscription feasibility gate:** [`spikes/001-codex-subscription`](spikes/001-codex-subscription/README.md) is **VALIDATED**. Real Prime Agent `0.7.2` completed a streamed tool-call fixture run with `gpt-5.6-sol` and high reasoning through OpenClaw-held Codex subscription authentication. Prime received only a scoped, revocable token.
 - **Beta Milestone 1:** **COMPLETE for the disposable-fixture CLI scope, with reviewed limitations.** It productionizes the broker seam, checks the pinned Prime release and entrypoint, adds immutable confirmation and trusted host policy, enforces one global job and finite budgets, and validates real Prime completion and cancellation. Complete dependency-tree integrity remains a follow-up.
 - **Worker reconnection:** detached workers now persist PID plus OS process-start identity, a random nonce, private socket path, and protocol version. CLI startup scans nonterminal jobs and accepts a worker only after both process identity and a nonce-bound socket handshake match.
-- **Beta Milestone 2:** **IMPLEMENTED for the operational Discord fixture path.** The package in [`openclaw-plugin`](openclaw-plugin/README.md) exposes five owner-only typed tools, hash-bound one-time confirmation, editable status-card delivery, terminal notification catch-up, and the standalone CLI/control boundary. See the [Beta Milestone 2 report](docs/beta-milestone-2.md).
+- **Beta Milestone 2:** **IMPLEMENTED for the operational Discord fixture path.** The package in [`openclaw-plugin`](openclaw-plugin/README.md) exposes owner-only typed tools, hash-bound one-time confirmation, editable status-card delivery, terminal notification catch-up, and the standalone CLI/control boundary. See the [Beta Milestone 2 report](docs/beta-milestone-2.md).
 - **OpenClaw deployment:** [`prime-dispatch-openclaw`](docs/openclaw-host-lifecycle.md) prepares versioned host-local releases, migrates durable state, validates the exact OpenClaw config delta, and provides idempotent upgrade, audit, rollback, and state-preserving uninstall operations.
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
-- **Beta Milestone 3:** **IN PROGRESS.** The transactional-authority slice uses Node 24's built-in SQLite with WAL, foreign keys, durable synchronization, transactional leases/results/cursors/usage, legacy JSON import, repairable projections, and immutable artifact digests. Checkpoint resume and bounded cleanup remain tracked separately.
+- **Beta Milestone 3:** **IN PROGRESS.** Node 24's built-in SQLite owns transactional state, attempts, checkpoints, confirmations, leases, results, cursors, usage, and artifact digests. Explicit owner-confirmed resume can continue only from mechanically proven safe evidence; uncertain Prime requests, gates, commits, and effects are preserved and rejected. Bounded lossless cleanup remains tracked separately.
 
 The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
 
@@ -22,7 +22,7 @@ The project uses **pnpm exclusively**. Do not create or commit `package-lock.jso
 
 The vertical slice now validates detached per-job workers, reconnectable Unix-socket control, JSON/Zod state, Git worktrees, structured verification gates, cancellation, local commits, result artifacts, path policy, a real Prime JSONL RPC subprocess, and Codex-subscription inference through a scoped host broker.
 
-Ordinary tests remain deterministic and use fake Prime/local upstreams. The opt-in real acceptance is fixture-only. This beta does not provide filesystem/network containment, automatic worker-death resume, or Apple containers. OpenClaw installation is now a separate, explicit operator lifecycle.
+Ordinary tests remain deterministic and use fake Prime/local upstreams. The opt-in real acceptance is fixture-only. This beta does not provide filesystem/network containment, silent automatic worker-death retry, or Apple containers. OpenClaw installation is now a separate, explicit operator lifecycle.
 
 Recommendation: keep live use limited to disposable fixtures until an operator explicitly selects a trusted repository. The next implementation step is the self-contained pinned runtime required before selected real-repository rollout. Containment remains deferred.
 
@@ -56,7 +56,7 @@ flowchart TD
     Worker --> Gates --> Commit --> Artifacts
 ```
 
-The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`), while the OpenClaw adapter and API schemas expose the explicit operations `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
+The CLI command names are short (`start`, `status`, `steer`, `cancel`, `result`, `resume-preview`, and `resume-confirm`), while the OpenClaw adapter exposes `prime_start`, `prime_resume`, `prime_status`, `prime_steer`, `prime_cancel`, and `prime_result`.
 
 Every CLI invocation scans nonterminal jobs before handling its requested
 operation. A matching live worker is reconnected without restarting Prime; a
@@ -68,11 +68,22 @@ events expose deterministic delivery keys and durable per-consumer cursors so
 the later OpenClaw adapter can catch up missed milestone and terminal
 notifications idempotently.
 
+Every worker attempt records ordered checkpoints around worktree creation,
+private model provisioning, Prime execution, process-tree quiescence, each
+verification gate, the local commit, and terminal materialization. A dead
+worker closes its attempt as interrupted and converts any started checkpoint
+to explicit uncertain evidence. Resume preview inspects the preserved Git
+worktree and checkpoint facts, rejects ambiguity, and states exactly what will
+and will not repeat. Its single-use token is bound to the owner route and the
+current authoritative state revision; confirmation creates a linked attempt
+instead of rewriting the interrupted history.
+
 The state root and each job have this layout:
 
 ```text
-<state-root>/control-plane.sqlite3  authoritative requests, state, events,
-                                    leases, cursors, results, usage and digests
+<state-root>/control-plane.sqlite3  authoritative requests, state, attempts,
+                                    checkpoints, confirmations, leases,
+                                    cursors, results, usage and digests
 <state-root>/jobs/<job-id>/
   request.json              immutable operator projection
   state.json                repairable schemaVersion + revision projection
@@ -244,9 +255,9 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 
 ## Known limitations
 
-- A surviving job worker is authenticated by process-start identity and a nonce-bound socket handshake. A dead or disproven worker is reconciled to `interrupted`; checkpoint recovery and explicit safe resume remain deferred to issue #11.
+- A surviving job worker is authenticated by process-start identity and a nonce-bound socket handshake. A dead or disproven worker is reconciled to `interrupted`. Resume is explicit and available only when checkpoint and repository evidence mechanically prove the next action safe; uncertain model requests, gates, quiescence, or unknown evidence cannot resume.
 - The dispatcher is not a resident scheduler. Nonterminal jobs are scanned whenever the CLI or future adapter starts, but no reconciliation occurs while no client is running.
-- Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`. Transaction-boundary fault injection proves rollback-before-commit and deterministic recovery-after-commit; checkpoint-specific worker recovery remains issue #11.
+- Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`. Transaction-boundary fault injection covers every checkpoint stage, and deterministic integration tests prove a resumed attempt skips completed Prime and gate work.
 - Token usage is observable only from structured terminal upstream events. The durable ledger labels completed, partial, and unknown usage explicitly; a single response can overshoot the observed admission ceiling, the transport rejects a hard `max_output_tokens` control, and monetary cost is unavailable. Wall-clock, turn, gate, output, and concurrency limits remain externally enforced.
 - The official Prime archive omits runtime dependencies. The archive and configured entrypoint are checked, but the complete loaded dependency tree is not yet represented by a self-contained pinned artifact.
 - Remote Git prevention and single-process/root enforcement are not hard security boundaries under `unsafe-local`; Prime has IPython and normal host networking. Current controls are defense in depth for trusted repositories.
@@ -257,6 +268,6 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 
 ## Production exit criteria
 
-Before adopting this design, add checkpoint recovery and explicit safe resume, bounded artifact storage and cleanup, and checkpoint-level crash tests across the worker lifecycle. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
+Before adopting this design, add bounded artifact storage and lossless cleanup. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 See the [deep-review catalog](docs/beta-milestone-1-review.md) for resolved findings and issue-ready deferred work.

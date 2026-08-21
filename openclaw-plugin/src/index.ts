@@ -134,6 +134,48 @@ const plugin = definePluginEntry({
       { names: ["prime_start"], optional: true },
     );
 
+    api.registerTool(
+      (context) => ({
+        name: "prime_resume",
+        label: "Prime Resume",
+        description:
+          "Preview or confirm an explicit owner-authorized safe resume for an interrupted job. Never replay uncertain model calls, gates, commits, or effects.",
+        parameters: Type.Object(
+          {
+            action: Type.Union([
+              Type.Literal("preview"),
+              Type.Literal("confirm"),
+            ]),
+            jobId: Type.String({ minLength: 1 }),
+            confirmationToken: Type.Optional(Type.String({ minLength: 1 })),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const input = params as {
+            action: "preview" | "confirm";
+            jobId: string;
+            confirmationToken?: string;
+          };
+          if (input.action === "confirm" && !input.confirmationToken)
+            throw new Error("resume confirmation requires confirmationToken");
+          return result(
+            await adapter.resume(
+              input.action === "preview"
+                ? { action: "preview", jobId: input.jobId }
+                : {
+                    action: "confirm",
+                    jobId: input.jobId,
+                    confirmationToken: input.confirmationToken!,
+                  },
+              trustedContext(context),
+            ),
+          );
+        },
+      }),
+      { names: ["prime_resume"], optional: true },
+    );
+
     registerSimpleTool(
       api,
       adapter,
@@ -197,6 +239,34 @@ const plugin = definePluginEntry({
             `Prime confirmation command failed: ${error instanceof Error ? error.message : String(error)}`,
           );
           return { text: confirmationCommandFailure(error, trusted) };
+        }
+      },
+    });
+    api.registerCommand({
+      name: "prime-resume-confirm",
+      description: "Confirm one immutable Prime Dispatch safe-resume preview",
+      acceptsArgs: true,
+      requireAuth: true,
+      requiredScopes: ["operator.admin"],
+      exposeSenderIsOwner: true,
+      channels: ["discord"],
+      async handler(context) {
+        try {
+          const [jobId, token, ...extra] =
+            context.args?.trim().split(/\s+/) ?? [];
+          if (!jobId || !token || extra.length > 0)
+            throw new Error("resume confirmation requires job id and token");
+          return resumeCommandResult(
+            await adapter.resume(
+              { action: "confirm", jobId, confirmationToken: token },
+              trustedCommandContext(context),
+            ),
+          );
+        } catch (error) {
+          api.logger.warn(
+            `Prime resume confirmation failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return { text: resumeCommandFailure(error) };
         }
       },
     });
@@ -645,6 +715,26 @@ export function confirmationCommandResult(value: any) {
       ? `Prime job ${jobId} launched. Status updates will follow in this thread.`
       : "Prime job launched. Status updates will follow in this thread.",
   };
+}
+
+export function resumeCommandResult(value: any) {
+  const jobId = typeof value?.jobId === "string" ? value.jobId : undefined;
+  return {
+    text: jobId
+      ? `Prime job ${jobId} safe resume launched. Status updates will follow in this thread.`
+      : "Prime safe resume launched. Status updates will follow in this thread.",
+  };
+}
+
+export function resumeCommandFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const safe =
+    /^(resume confirmation|only interrupted jobs|Prime Dispatch is owner-only|Prime Dispatch beta is Discord-only|trusted |original job|legacy job|unknown recovery checkpoint|worktree |Prime completed|verification |commit checkpoint|completed Prime result)/.test(
+      message,
+    );
+  return safe
+    ? `Prime resume failed: ${message}`
+    : "Prime resume failed before dispatch; inspect the gateway log";
 }
 
 function refreshJobId(payload: string): string {

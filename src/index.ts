@@ -10,6 +10,8 @@ export * from "./policy.js";
 export * from "./prime-runtime.js";
 export * from "./release.js";
 export * from "./repository.js";
+export * from "./recovery.js";
+export * from "./resume.js";
 export * from "./schemas.js";
 export * from "./sqlite.js";
 export * from "./state-machine.js";

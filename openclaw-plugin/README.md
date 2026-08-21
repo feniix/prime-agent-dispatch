@@ -1,9 +1,10 @@
 # Prime Dispatch OpenClaw adapter
 
 Thin owner-only Discord adapter for the standalone Prime Dispatch control plane.
-It exposes `prime_start`, `prime_status`, `prime_steer`, `prime_cancel`, and
-`prime_result`, and stores one-time hash-bound confirmations beneath the
-configured Prime Dispatch state root.
+It exposes `prime_start`, `prime_resume`, `prime_status`, `prime_steer`,
+`prime_cancel`, and `prime_result`. Start confirmations are durable beneath the
+configured state root; safe-resume confirmations are transactional, single-use,
+owner-route-bound, and invalidated by an authoritative state revision.
 
 The adapter accepts sender and delivery identity only from OpenClaw's trusted
 runtime context. Repository eligibility, fixture classification, gates, Prime

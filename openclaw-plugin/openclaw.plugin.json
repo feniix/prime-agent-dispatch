@@ -39,6 +39,7 @@
   "contracts": {
     "tools": [
       "prime_start",
+      "prime_resume",
       "prime_status",
       "prime_steer",
       "prime_cancel",
@@ -47,6 +48,7 @@
   },
   "toolMetadata": {
     "prime_start": { "optional": true },
+    "prime_resume": { "optional": true },
     "prime_status": { "optional": true },
     "prime_steer": { "optional": true },
     "prime_cancel": { "optional": true },
