@@ -46,9 +46,14 @@ type OversizedRpcLine = {
   bytes: number;
   hash: Hash;
   eventType: string;
-  droppable: boolean;
   toolCallId?: string;
   toolName?: string;
+};
+
+type RpcByteLimits = {
+  lineBytes: number;
+  discardedLineBytes: number;
+  totalDiscardedBytes: number;
 };
 
 const DROPPABLE_OVERSIZED_RPC_EVENTS = new Set([
@@ -62,6 +67,11 @@ const DROPPABLE_OVERSIZED_RPC_EVENTS = new Set([
 
 const MAX_RPC_EVIDENCE_RECORDS = 16;
 const MAX_RPC_CLASSIFICATION_PREFIX_BYTES = 8 * 1024;
+const DEFAULT_RPC_BYTE_LIMITS: RpcByteLimits = {
+  lineBytes: 256 * 1024,
+  discardedLineBytes: 32 * 1024 * 1024,
+  totalDiscardedBytes: 128 * 1024 * 1024,
+};
 
 export class AgentRpcLineLimitError extends Error {
   constructor(
@@ -106,9 +116,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
   private readonly environment: NodeJS.ProcessEnv | undefined;
   private readonly abortGraceMs: number;
   private readonly maxTurns: number;
-  private readonly maxRpcLineBytes: number;
-  private readonly maxDiscardedRpcLineBytes: number;
-  private readonly maxDiscardedRpcBytes: number;
+  private readonly rpcByteLimits: RpcByteLimits;
   private discardedRpcBytes = 0;
   private turnsUsed = 0;
   private aborting?: Promise<void>;
@@ -123,9 +131,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     environment?: NodeJS.ProcessEnv;
     abortGraceMs?: number;
     maxTurns?: number;
-    maxRpcLineBytes?: number;
-    maxDiscardedRpcLineBytes?: number;
-    maxDiscardedRpcBytes?: number;
+    rpcByteLimits?: Partial<RpcByteLimits>;
   }) {
     this.kind = options.kind;
     this.command = options.command;
@@ -134,20 +140,17 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     this.environment = options.environment;
     this.abortGraceMs = options.abortGraceMs ?? 1_000;
     this.maxTurns = options.maxTurns ?? 50;
-    this.maxRpcLineBytes = options.maxRpcLineBytes ?? 256 * 1024;
-    this.maxDiscardedRpcLineBytes =
-      options.maxDiscardedRpcLineBytes ?? 32 * 1024 * 1024;
-    this.maxDiscardedRpcBytes =
-      options.maxDiscardedRpcBytes ?? 128 * 1024 * 1024;
+    this.rpcByteLimits = {
+      ...DEFAULT_RPC_BYTE_LIMITS,
+      ...options.rpcByteLimits,
+    };
+    const { lineBytes, discardedLineBytes, totalDiscardedBytes } =
+      this.rpcByteLimits;
     if (
-      ![
-        this.maxRpcLineBytes,
-        this.maxDiscardedRpcLineBytes,
-        this.maxDiscardedRpcBytes,
-      ].every(Number.isSafeInteger) ||
-      this.maxRpcLineBytes < 1 ||
-      this.maxDiscardedRpcLineBytes <= this.maxRpcLineBytes ||
-      this.maxDiscardedRpcBytes < this.maxDiscardedRpcLineBytes
+      !Object.values(this.rpcByteLimits).every(Number.isSafeInteger) ||
+      lineBytes < 1 ||
+      discardedLineBytes <= lineBytes ||
+      totalDiscardedBytes < discardedLineBytes
     )
       throw new Error("invalid Prime RPC byte limits");
   }
@@ -281,18 +284,14 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     if (this.oversizedLine) {
       this.oversizedLine.bytes += segment.length;
       this.oversizedLine.hash.update(segment);
-      if (
-        this.oversizedLine.bytes > this.maxDiscardedRpcLineBytes ||
-        this.discardedRpcBytes + this.oversizedLine.bytes >
-          this.maxDiscardedRpcBytes
-      )
+      if (this.exceedsDiscardCeiling(this.oversizedLine))
         this.rejectOversizedLine(
           this.oversizedLine,
           "agent RPC discard ceiling exceeded",
         );
       return;
     }
-    if (this.buffer.length + segment.length <= this.maxRpcLineBytes) {
+    if (this.buffer.length + segment.length <= this.rpcByteLimits.lineBytes) {
       this.buffer = Buffer.concat([this.buffer, segment]);
       return;
     }
@@ -318,7 +317,6 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       bytes: this.buffer.length + segment.length,
       hash: createHash("sha256").update(this.buffer).update(segment),
       eventType,
-      droppable: DROPPABLE_OVERSIZED_RPC_EVENTS.has(eventType),
       ...(toolCallId ? { toolCallId } : {}),
       ...(toolName ? { toolName } : {}),
     };
@@ -331,10 +329,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
       return;
     }
     this.oversizedLine = oversizedLine;
-    if (
-      oversizedLine.bytes > this.maxDiscardedRpcLineBytes ||
-      this.discardedRpcBytes + oversizedLine.bytes > this.maxDiscardedRpcBytes
-    )
+    if (this.exceedsDiscardCeiling(oversizedLine))
       this.rejectOversizedLine(
         oversizedLine,
         "agent RPC discard ceiling exceeded",
@@ -343,7 +338,7 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
 
   private finishOversizedLine(): void {
     if (!this.oversizedLine) return;
-    if (!this.oversizedLine.droppable) {
+    if (!DROPPABLE_OVERSIZED_RPC_EVENTS.has(this.oversizedLine.eventType)) {
       this.rejectOversizedLine(
         this.oversizedLine,
         "agent RPC line exceeded input limit",
@@ -361,6 +356,14 @@ export class PrimeJsonlRpcBackend implements AgentBackend {
     if (this.oversizedRpcRecords.length < MAX_RPC_EVIDENCE_RECORDS)
       this.oversizedRpcRecords.push(evidence);
     else this.oversizedRpcRecordsOmitted += 1;
+  }
+
+  private exceedsDiscardCeiling(line: OversizedRpcLine): boolean {
+    return (
+      line.bytes > this.rpcByteLimits.discardedLineBytes ||
+      this.discardedRpcBytes + line.bytes >
+        this.rpcByteLimits.totalDiscardedBytes
+    );
   }
 
   private rejectOversizedLine(

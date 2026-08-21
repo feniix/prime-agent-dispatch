@@ -11,26 +11,37 @@ import {
   primeRpcLaunchArguments,
 } from "../dist/index.js";
 
-test("Prime RPC backend enforces the configured assistant-turn budget", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-turn-budget-"));
-  const executable = join(root, "turns.js");
+async function rpcFixture(name, source, options = {}) {
+  const root = await mkdtemp(join(tmpdir(), `prime-${name}-`));
+  const executable = join(root, "agent.js");
+  const resolved = typeof source === "function" ? source(root) : source;
   await writeFile(
     executable,
+    Array.isArray(resolved) ? resolved.join("\n") : resolved,
+  );
+  return {
+    root,
+    backend: new PrimeJsonlRpcBackend({
+      kind: `${name}-fixture`,
+      command: process.execPath,
+      args: [executable],
+      codingAgentDir: join(root, "agent"),
+      ...options,
+    }),
+  };
+}
+
+test("Prime RPC backend enforces the configured assistant-turn budget", async () => {
+  const { root, backend } = await rpcFixture(
+    "turn-budget",
     [
       'process.stdin.once("data", () => {',
       '  for (const type of ["agent_start", "turn_start", "turn_end", "turn_start", "agent_end"])',
       '    process.stdout.write(JSON.stringify({ type, data: { lastAssistantText: "too many turns" } }) + "\\n");',
       "});",
-    ].join("\n"),
+    ],
+    { maxTurns: 1, abortGraceMs: 50 },
   );
-  const backend = new PrimeJsonlRpcBackend({
-    kind: "turn-fixture",
-    command: process.execPath,
-    args: [executable],
-    codingAgentDir: join(root, "agent"),
-    maxTurns: 1,
-    abortGraceMs: 50,
-  });
   try {
     await assert.rejects(
       () => backend.start("task", root, new AbortController().signal),
@@ -42,27 +53,23 @@ test("Prime RPC backend enforces the configured assistant-turn budget", async ()
 });
 
 test("Prime RPC quiesces the process tree before returning and rejects late steering", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-quiescence-"));
-  const executable = join(root, "lingering.js");
-  const pidFile = join(root, "pid");
-  await writeFile(
-    executable,
-    [
-      'import { writeFileSync } from "node:fs";',
-      `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
-      'process.stdin.once("data", () => {',
-      '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "done" } }) + "\\n");',
-      "  setInterval(() => {}, 30_000);",
-      "});",
-    ].join("\n"),
+  const { root, backend } = await rpcFixture(
+    "quiescence",
+    (fixtureRoot) => {
+      const pidFile = join(fixtureRoot, "pid");
+      return [
+        'import { writeFileSync } from "node:fs";',
+        `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+        'process.stdin.once("data", () => {',
+        '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "done" } }) + "\\n");',
+        "  setInterval(() => {}, 30_000);",
+        "});",
+      ];
+    },
+    {
+      abortGraceMs: 20,
+    },
   );
-  const backend = new PrimeJsonlRpcBackend({
-    kind: "quiescence-fixture",
-    command: process.execPath,
-    args: [executable],
-    codingAgentDir: join(root, "agent"),
-    abortGraceMs: 20,
-  });
   const result = await backend.start(
     "task",
     root,
@@ -73,33 +80,29 @@ test("Prime RPC quiesces the process tree before returning and rejects late stee
     () => backend.steer("too late"),
     /not accepting steering/,
   );
-  const pid = Number(await readFile(pidFile, "utf8"));
+  const pid = Number(await readFile(join(root, "pid"), "utf8"));
   assert.throws(() => process.kill(pid, 0), /ESRCH/);
 });
 
 test("Prime RPC gives the model an edit-only execution contract", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-execution-contract-"));
-  const executable = join(root, "capture-prompt.js");
-  const promptFile = join(root, "prompt.txt");
-  await writeFile(
-    executable,
-    [
-      'import { writeFileSync } from "node:fs";',
-      'process.stdin.once("data", (chunk) => {',
-      "  const command = JSON.parse(String(chunk).trim());",
-      `  writeFileSync(${JSON.stringify(promptFile)}, command.message);`,
-      '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "done" } }) + "\\n");',
-      "  setInterval(() => {}, 30_000);",
-      "});",
-    ].join("\n"),
+  const { root, backend } = await rpcFixture(
+    "execution-contract",
+    (fixtureRoot) => {
+      const promptFile = join(fixtureRoot, "prompt.txt");
+      return [
+        'import { writeFileSync } from "node:fs";',
+        'process.stdin.once("data", (chunk) => {',
+        "  const command = JSON.parse(String(chunk).trim());",
+        `  writeFileSync(${JSON.stringify(promptFile)}, command.message);`,
+        '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "done" } }) + "\\n");',
+        "  setInterval(() => {}, 30_000);",
+        "});",
+      ];
+    },
+    {
+      abortGraceMs: 20,
+    },
   );
-  const backend = new PrimeJsonlRpcBackend({
-    kind: "contract-fixture",
-    command: process.execPath,
-    args: [executable],
-    codingAgentDir: join(root, "agent"),
-    abortGraceMs: 20,
-  });
   try {
     await backend.start(
       "change the file, discover and run the gate, then commit",
@@ -109,7 +112,7 @@ test("Prime RPC gives the model an edit-only execution contract", async () => {
   } finally {
     await backend.dispose();
   }
-  const prompt = await readFile(promptFile, "utf8");
+  const prompt = await readFile(join(root, "prompt.txt"), "utf8");
   assert.match(prompt, /Modify only files under the current working directory/);
   assert.match(prompt, /Do not inspect paths outside the current worktree/);
   assert.match(prompt, /Do not locate or run verification gates/);
@@ -121,10 +124,8 @@ test("Prime RPC gives the model an edit-only execution contract", async () => {
 });
 
 test("Prime RPC drains oversized observational events and accepts a later agent_end", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-rpc-observation-"));
-  const executable = join(root, "oversized-tool-event.js");
-  await writeFile(
-    executable,
+  const { root, backend } = await rpcFixture(
+    "oversized-observation",
     [
       'process.stdin.once("data", () => {',
       '  const stdout = "x".repeat(300_000);',
@@ -139,15 +140,9 @@ test("Prime RPC drains oversized observational events and accepts a later agent_
       '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "completed after large output" } }) + "\\n");',
       "  setInterval(() => {}, 30_000);",
       "});",
-    ].join("\n"),
+    ],
+    { abortGraceMs: 20 },
   );
-  const backend = new PrimeJsonlRpcBackend({
-    kind: "oversized-observation-fixture",
-    command: process.execPath,
-    args: [executable],
-    codingAgentDir: join(root, "agent"),
-    abortGraceMs: 20,
-  });
   const result = await backend.start(
     "task",
     root,
@@ -169,27 +164,23 @@ test("Prime RPC drains oversized observational events and accepts a later agent_
 });
 
 test("Prime RPC bounds the bytes drained from oversized observational events", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-rpc-drain-limit-"));
-  const executable = join(root, "unbounded-tool-event.js");
-  await writeFile(
-    executable,
+  const { root, backend } = await rpcFixture(
+    "drain-limit",
     [
       'process.stdin.once("data", () => {',
       '  process.stdout.write(JSON.stringify({ type: "tool_execution_end", result: { text: "x".repeat(5_000) } }) + "\\n");',
       "  setInterval(() => {}, 30_000);",
       "});",
-    ].join("\n"),
+    ],
+    {
+      abortGraceMs: 20,
+      rpcByteLimits: {
+        lineBytes: 1_024,
+        discardedLineBytes: 2_048,
+        totalDiscardedBytes: 4_096,
+      },
+    },
   );
-  const backend = new PrimeJsonlRpcBackend({
-    kind: "drain-limit-fixture",
-    command: process.execPath,
-    args: [executable],
-    codingAgentDir: join(root, "agent"),
-    abortGraceMs: 20,
-    maxRpcLineBytes: 1_024,
-    maxDiscardedRpcLineBytes: 2_048,
-    maxDiscardedRpcBytes: 4_096,
-  });
   await assert.rejects(
     () => backend.start("task", root, new AbortController().signal),
     /RPC discard ceiling exceeded.*type=tool_execution_end/,
@@ -198,28 +189,24 @@ test("Prime RPC bounds the bytes drained from oversized observational events", a
 });
 
 test("Prime RPC does not classify a nested event type as the record type", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-rpc-nested-type-"));
-  const executable = join(root, "nested-type.js");
-  await writeFile(
-    executable,
+  const { root, backend } = await rpcFixture(
+    "nested-type",
     [
       'process.stdin.once("data", () => {',
       '  process.stdout.write(JSON.stringify({ nested: { type: "tool_execution_end" }, type: "agent_end", data: { lastAssistantText: "x".repeat(5_000) } }) + "\\n");',
       '  process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "must not be reached" } }) + "\\n");',
       "  setInterval(() => {}, 30_000);",
       "});",
-    ].join("\n"),
+    ],
+    {
+      abortGraceMs: 20,
+      rpcByteLimits: {
+        lineBytes: 1_024,
+        discardedLineBytes: 8_192,
+        totalDiscardedBytes: 16_384,
+      },
+    },
   );
-  const backend = new PrimeJsonlRpcBackend({
-    kind: "nested-type-fixture",
-    command: process.execPath,
-    args: [executable],
-    codingAgentDir: join(root, "agent"),
-    abortGraceMs: 20,
-    maxRpcLineBytes: 1_024,
-    maxDiscardedRpcLineBytes: 8_192,
-    maxDiscardedRpcBytes: 16_384,
-  });
   await assert.rejects(
     () => backend.start("task", root, new AbortController().signal),
     /RPC line exceeded input limit.*type=unknown/,
@@ -228,40 +215,25 @@ test("Prime RPC does not classify a nested event type as the record type", async
 });
 
 test("Prime RPC rejects oversized lines and bounds terminal summaries", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-rpc-bounds-"));
-  const oversized = join(root, "oversized.js");
-  await writeFile(
-    oversized,
+  const { root: rejectedRoot, backend: rejected } = await rpcFixture(
+    "oversized-line",
     'process.stdin.once("data", () => process.stdout.write("x".repeat(300_000)));\n',
+    { abortGraceMs: 20 },
   );
-  const rejected = new PrimeJsonlRpcBackend({
-    kind: "oversized-fixture",
-    command: process.execPath,
-    args: [oversized],
-    codingAgentDir: join(root, "oversized-agent"),
-    abortGraceMs: 20,
-  });
   await assert.rejects(
-    () => rejected.start("task", root, new AbortController().signal),
+    () => rejected.start("task", rejectedRoot, new AbortController().signal),
     /RPC line exceeded input limit/,
   );
   await rejected.dispose();
 
-  const summary = join(root, "summary.js");
-  await writeFile(
-    summary,
+  const { root: boundedRoot, backend: bounded } = await rpcFixture(
+    "bounded-summary",
     'process.stdin.once("data", () => process.stdout.write(JSON.stringify({ type: "agent_end", data: { lastAssistantText: "s".repeat(100000), extra: "m".repeat(100000) } }) + "\\n"));\n',
+    { abortGraceMs: 20 },
   );
-  const bounded = new PrimeJsonlRpcBackend({
-    kind: "summary-fixture",
-    command: process.execPath,
-    args: [summary],
-    codingAgentDir: join(root, "summary-agent"),
-    abortGraceMs: 20,
-  });
   const result = await bounded.start(
     "task",
-    root,
+    boundedRoot,
     new AbortController().signal,
   );
   assert.ok(Buffer.byteLength(result.summary) <= 64 * 1024);
