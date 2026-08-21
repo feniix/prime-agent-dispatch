@@ -30,7 +30,7 @@ Prime emits `agent_end` when its logical run finishes, but that event does not i
 
 Chosen option: **close steering and quiesce the complete Prime process tree before entering verification**.
 
-On `agent_end`, the RPC backend stops accepting steering, requests abort, escalates through process-group termination when required, and awaits bounded process-tree exit before resolving the agent run. Signal-based exits count as terminal, stdin failures are handled, and oversized RPC lines or terminal fields abort the run instead of growing memory without bound.
+On `agent_end`, the RPC backend stops accepting steering, requests abort, escalates through process-group termination when required, and awaits bounded process-tree exit before resolving the agent run. Signal-based exits count as terminal and stdin failures are handled. The line reader keeps bounded memory: it hashes and drains recognized oversized observational events. Prime 0.7.2 repeats tool results in its terminal transcript, so a bounded oversized `agent_end` is retained, fully parsed, and reduced to bounded terminal fields; malformed, reclassified, or over-ceiling terminal records and all oversized control records fail closed.
 
 ### Consequences
 
@@ -42,7 +42,7 @@ On `agent_end`, the RPC backend stops accepting steering, requests abort, escala
 
 ### Confirmation
 
-Focused tests verify that the process tree exits before `start()` resolves, late steering is rejected, signal exits are recognized, oversized JSONL records fail, and terminal summaries and metadata are bounded. Integration tests verify gate cancellation and truthful terminal outcomes. Enforceable process containment remains tracked by [issue #3](https://github.com/feniix/prime-dispatch-prototype/issues/3).
+Focused tests verify that the process tree exits before `start()` resolves, late steering is rejected, signal exits are recognized, Prime's repeated large tool-result sequence reaches a valid `agent_end`, malformed and over-ceiling terminal records fail closed, oversized control records fail with bounded forensic evidence, and terminal summaries and metadata are bounded. Integration tests verify gate cancellation and truthful terminal outcomes. Enforceable process containment remains tracked by [issue #3](https://github.com/feniix/prime-dispatch-prototype/issues/3).
 
 ## More Information
 

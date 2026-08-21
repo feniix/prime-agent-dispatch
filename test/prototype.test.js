@@ -141,6 +141,80 @@ test("happy path creates a worktree, passes gates, commits, and records root-onl
   );
 });
 
+test("fatal oversized RPC control records retain bounded evidence", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const started = await startConfirmed(
+    dispatcher,
+    input(repo, root, "OVERSIZED_RPC_CONTROL"),
+  );
+  const state = await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "failed",
+  );
+  assert.match(state.error, /agent RPC line exceeded input limit/);
+  const events = await dispatcher.store.readEvents(started.jobId);
+  const rejected = events.find(
+    (event) => event.type === "agent_rpc_record_rejected",
+  );
+  assert.equal(rejected.data.eventType, "turn_start");
+  assert.ok(rejected.data.bytes > 256 * 1024);
+  assert.match(rejected.data.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(rejected.data.lineComplete, true);
+  assert.equal(rejected.data.disposition, "rejected");
+  assert.equal(JSON.stringify(rejected.data).length < 1_024, true);
+});
+
+test("dropped oversized RPC observations retain evidence and do not block the job", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const started = await startConfirmed(
+    dispatcher,
+    input(repo, root, "OVERSIZED_RPC_OBSERVATION"),
+  );
+  const state = await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "succeeded",
+  );
+  assert.match(state.commitSha, /^[0-9a-f]{40}$/);
+  const events = await dispatcher.store.readEvents(started.jobId);
+  const dropped = events.find(
+    (event) => event.type === "agent_rpc_records_bounded",
+  );
+  assert.equal(dropped.data.records.length, 1);
+  assert.equal(dropped.data.records[0].eventType, "tool_execution_end");
+  assert.equal(dropped.data.records[0].toolName, "ipython");
+  assert.equal(dropped.data.records[0].disposition, "dropped");
+});
+
+test("bounded RPC evidence survives cancellation after the agent returns", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const started = await startConfirmed(
+    dispatcher,
+    input(repo, root, "OVERSIZED_RPC_OBSERVATION SLOW"),
+  );
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "running",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await dispatcher.cancel(started.jobId);
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "cancelled",
+  );
+  const events = await dispatcher.store.readEvents(started.jobId);
+  const bounded = events.find(
+    (event) => event.type === "agent_rpc_records_bounded",
+  );
+  assert.equal(bounded.data.records[0].eventType, "tool_execution_end");
+});
+
 test("a fresh CLI process reconnects to a surviving worker for steer and cancel", async () => {
   const { root, repo, stateRoot } = await fixture();
   const start = await exec(process.execPath, [

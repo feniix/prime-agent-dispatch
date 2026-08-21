@@ -86,7 +86,7 @@ test(
       "--host-config",
       hostConfig,
       "--task",
-      "Use the IPython tool to create beta-milestone-1.txt containing exactly: Prime Dispatch Beta Milestone 1 operational\\n. Read it back and report completion. Do not change any other file and do not use Git remotes.",
+      "Use the IPython tool to create beta-milestone-1.txt containing exactly: Prime Dispatch Beta Milestone 1 operational\\n. Make no other changes, run the configured gate, and commit locally.",
       "--repo",
       repo,
       "--channel",

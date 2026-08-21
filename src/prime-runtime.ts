@@ -3,6 +3,14 @@ import { join } from "node:path";
 import { PRIME_MODEL, PRIME_REASONING_EFFORT } from "./policy.js";
 
 export const PRIME_BROKER_PROVIDER = "prime-dispatch-broker" as const;
+export const PRIME_EXECUTION_SYSTEM_PROMPT = [
+  "You are the repository-edit phase of a host-orchestrated job.",
+  "Modify only files under the current working directory.",
+  "Do not inspect paths outside the current worktree.",
+  "Do not locate or run verification gates; Prime Dispatch runs them after you finish.",
+  "Do not stage files or create a Git commit; Prime Dispatch commits after gates pass.",
+  "When the requested edits are complete, summarize them and end the agent run.",
+].join("\n");
 
 export async function writePrimeModelsConfig(options: {
   configDir: string;
@@ -51,6 +59,8 @@ export function primeRpcLaunchArguments(executablePath: string): string[] {
     PRIME_MODEL,
     "--thinking",
     PRIME_REASONING_EFFORT,
+    "--append-system-prompt",
+    PRIME_EXECUTION_SYSTEM_PROMPT,
     "--tools",
     "ipython",
   ];
