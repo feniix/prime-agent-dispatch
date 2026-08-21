@@ -99,6 +99,8 @@ export type OpenClawLifecycleDependencies = {
     replacePaths?: string[],
   ): Promise<void>;
   validateConfig(): Promise<void>;
+  refreshPluginRegistry(): Promise<void>;
+  readPluginSource(): Promise<string | undefined>;
   restartGateway(): Promise<void>;
   now(): Date;
 };
@@ -248,6 +250,17 @@ export async function installOpenClaw(
       )) &&
       rollbackReferenceIsVerified(existingManifest)
     ) {
+      await dependencies.refreshPluginRegistry();
+      if (options.restartGateway) {
+        try {
+          await dependencies.restartGateway();
+        } catch (error) {
+          throw new Error(
+            `repaired ${releaseId} registry but gateway restart failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+      }
       return {
         changed: false,
         currentRelease: releaseId,
@@ -295,6 +308,7 @@ export async function installOpenClaw(
       );
       await dependencies.applyConfigPatch(configPatch, CONFIG_REPLACE_PATHS);
       await dependencies.validateConfig();
+      await dependencies.refreshPluginRegistry();
 
       const now = dependencies.now().toISOString();
       const previousRelease = selectVerifiedRollbackRelease(
@@ -323,6 +337,7 @@ export async function installOpenClaw(
       await restoreConfigSnapshot(snapshot, dependencies, desiredEntry).catch(
         () => undefined,
       );
+      await dependencies.refreshPluginRegistry().catch(() => undefined);
       await hostConfigRestore().catch(() => undefined);
       throw error;
     }
@@ -401,6 +416,7 @@ export async function rollbackOpenClaw(
       );
       await dependencies.applyConfigPatch(configPatch, CONFIG_REPLACE_PATHS);
       await dependencies.validateConfig();
+      await dependencies.refreshPluginRegistry();
       next = {
         ...manifest,
         active: true,
@@ -415,6 +431,7 @@ export async function rollbackOpenClaw(
       await restoreConfigSnapshot(snapshot, dependencies).catch(
         () => undefined,
       );
+      await dependencies.refreshPluginRegistry().catch(() => undefined);
       throw error;
     }
     if (options.restartGateway) {
@@ -467,6 +484,7 @@ export async function uninstallOpenClaw(
         layout.extensionPath,
         layout.releasesRoot,
       );
+      await dependencies.refreshPluginRegistry();
       if (manifest) {
         await writeInstallManifest(layout, {
           ...manifest,
@@ -480,6 +498,7 @@ export async function uninstallOpenClaw(
       );
       await extensionRestore?.restore().catch(() => undefined);
       await currentRestore?.restore().catch(() => undefined);
+      await dependencies.refreshPluginRegistry().catch(() => undefined);
       if (manifest)
         await writeInstallManifest(layout, manifest).catch(() => undefined);
       throw error;
@@ -510,6 +529,7 @@ export async function uninstallOpenClaw(
 
 export async function auditOpenClawInstall(
   openclawStateDir: string,
+  dependencies?: Pick<OpenClawLifecycleDependencies, "readPluginSource">,
 ): Promise<string[]> {
   const layout = openClawLayout(openclawStateDir);
   const violations: string[] = [];
@@ -615,6 +635,34 @@ export async function auditOpenClawInstall(
       join(layout.releasesRoot, manifest.currentRelease, "plugin"),
       violations,
     );
+    if (dependencies) {
+      const expectedSource = join(
+        layout.releasesRoot,
+        manifest.currentRelease,
+        "plugin",
+        "dist",
+        "index.js",
+      );
+      const activeSource = await dependencies
+        .readPluginSource()
+        .catch((error: unknown) => {
+          violations.push(
+            `persisted plugin source could not be read: ${errorMessage(error)}`,
+          );
+          return undefined;
+        });
+      if (!activeSource) violations.push("persisted plugin source is missing");
+      else {
+        const [expectedCanonical, activeCanonical] = await Promise.all([
+          realpath(expectedSource).catch(() => resolve(expectedSource)),
+          realpath(activeSource).catch(() => resolve(activeSource)),
+        ]);
+        if (activeCanonical !== expectedCanonical)
+          violations.push(
+            `persisted plugin source targets another release: ${activeSource}`,
+          );
+      }
+    }
   }
   return violations;
 }

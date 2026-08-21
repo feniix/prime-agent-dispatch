@@ -224,7 +224,83 @@ describe("PrimeDispatchAdapter", () => {
     );
     expect(status.presentation.blocks[1]).toMatchObject({
       type: "buttons",
-      buttons: [{ label: "Refresh", disabled: false }],
+      buttons: [
+        {
+          label: "Refresh",
+          action: {
+            type: "callback",
+            value: "prime-dispatch:refresh:job-1",
+          },
+          disabled: false,
+        },
+      ],
+    });
+  });
+
+  it("authorizes interactive refresh from durable job ownership", async () => {
+    const { adapter, runCli } = await fixture();
+    runCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === "notifications")
+        return {
+          request: {
+            authorization: {
+              provider: "discord",
+              channelId: "channel-1",
+              senderId: "owner-1",
+              senderIsOwner: true,
+              accountId: "default",
+              threadId: "thread-1",
+            },
+          },
+          state: { status: "running" },
+          notifications: [],
+        };
+      if (args[0] === "status") return { status: "running" };
+      throw new Error(`unexpected CLI call: ${args[0]}`);
+    });
+
+    await expect(
+      adapter.interactiveStatus(
+        { jobId: "job-1" },
+        { senderId: "other-user", isAuthorizedSender: true },
+      ),
+    ).rejects.toThrow(/owner/);
+    await expect(
+      adapter.interactiveStatus(
+        { jobId: "job-1" },
+        { senderId: "owner-1", isAuthorizedSender: false },
+      ),
+    ).rejects.toThrow(/owner/);
+    await expect(
+      adapter.interactiveStatus(
+        { jobId: "job-1" },
+        { senderId: "owner-1", isAuthorizedSender: true },
+      ),
+    ).resolves.toMatchObject({
+      jobId: "job-1",
+      route: {
+        channel: "discord",
+        to: "channel-1",
+        accountId: "default",
+        threadId: "thread-1",
+      },
+      text: "Prime job job-1: running",
+      presentation: {
+        blocks: [
+          expect.anything(),
+          {
+            type: "buttons",
+            buttons: [
+              expect.objectContaining({
+                action: {
+                  type: "callback",
+                  value: "prime-dispatch:refresh:job-1",
+                },
+              }),
+            ],
+          },
+        ],
+      },
     });
   });
 

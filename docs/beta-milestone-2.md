@@ -24,6 +24,9 @@ state machine. Every operation invokes the standalone CLI/control plane.
 - The plugin polls the durable lifecycle journal, rediscovers jobs after restart,
   edits one persisted status card, emits a separate terminal outcome, and
   advances the per-consumer cursor only after delivery succeeds.
+- The status card's owner-only Refresh callback revalidates the durable job
+  owner and edits that originating card in place. Manual `/prime-status` is a
+  text-only snapshot, so neither path creates another stale status card.
 - Provider authentication remains outside Prime. The worker receives only its
   scoped broker endpoint and revocable per-job token.
 

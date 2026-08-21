@@ -166,6 +166,12 @@ const plugin = definePluginEntry({
       (p, c) => adapter.result({ jobId: p.jobId }, c),
     );
 
+    api.registerInteractiveHandler({
+      channel: "discord",
+      namespace: "prime-dispatch",
+      handler: createDiscordRefreshHandler(api, adapter),
+    });
+
     api.registerCommand({
       name: "prime-confirm",
       description: "Confirm one immutable Prime Dispatch preview",
@@ -180,7 +186,7 @@ const plugin = definePluginEntry({
           const token = context.args?.trim();
           if (!token) throw new Error("confirmation token is required");
           trusted = trustedCommandContext(context);
-          return commandResult(
+          return confirmationCommandResult(
             await adapter.start(
               { action: "confirm", confirmationToken: token },
               trusted,
@@ -204,8 +210,9 @@ const plugin = definePluginEntry({
       async handler(context) {
         const jobId = context.args?.trim();
         if (!jobId) throw new Error("job id is required");
-        return commandResult(
+        return statusCommandResult(
           await adapter.status({ jobId }, trustedCommandContext(context)),
+          jobId,
         );
       },
     });
@@ -255,6 +262,56 @@ type LoadedOutbound = NonNullable<
 type RenderPresentationInput = Parameters<
   NonNullable<LoadedOutbound["renderPresentation"]>
 >[0];
+
+type DiscordRefreshContext = {
+  interactionId: string;
+  senderId?: string;
+  auth: { isAuthorizedSender: boolean };
+  interaction: {
+    payload: string;
+    messageId?: string;
+  };
+  respond: {
+    followUp(input: { text: string; ephemeral?: boolean }): Promise<void>;
+  };
+};
+
+export function createDiscordRefreshHandler(
+  api: NotificationApi,
+  adapter: Pick<PrimeDispatchAdapter, "interactiveStatus">,
+  delivery: NotificationDelivery = createNotificationDelivery(api),
+) {
+  return async (rawContext: unknown) => {
+    const context = rawContext as DiscordRefreshContext;
+    try {
+      const jobId = refreshJobId(context.interaction.payload);
+      const messageId = context.interaction.messageId?.trim();
+      if (!messageId)
+        throw new Error("Discord refresh interaction omitted message id");
+      const status = await adapter.interactiveStatus(
+        { jobId },
+        {
+          ...(context.senderId ? { senderId: context.senderId } : {}),
+          isAuthorizedSender: context.auth.isAuthorizedSender,
+        },
+      );
+      await delivery.upsertStatusCard({
+        jobId,
+        route: status.route,
+        text: status.text,
+        presentation: status.presentation,
+        previousMessageId: messageId,
+        deliveryKey: `${jobId}:refresh:${context.interactionId}`,
+      });
+    } catch (error) {
+      await context.respond.followUp({
+        text: refreshFailure(error),
+        ephemeral: true,
+      });
+    }
+    return { handled: true };
+  };
+}
 
 export function createNotificationDelivery(
   api: NotificationApi,
@@ -325,7 +382,22 @@ export function createNotificationDelivery(
       return input.previousMessageId;
     },
     async deliverTerminal(input) {
-      await send(input);
+      if (input.route.channel !== "discord")
+        throw new Error("Prime Dispatch notification route must be Discord");
+      const outbound =
+        await api.runtime.channel.outbound.loadAdapter("discord");
+      if (!outbound?.sendPayload)
+        throw new Error("Discord outbound adapter lacks payload delivery");
+      const payload = { text: input.text };
+      await outbound.sendPayload({
+        cfg: api.config,
+        to: input.route.to,
+        text: input.text,
+        payload,
+        deliveryQueueId: input.deliveryKey,
+        ...(input.route.accountId ? { accountId: input.route.accountId } : {}),
+        ...(input.route.threadId ? { threadId: input.route.threadId } : {}),
+      });
     },
   };
 }
@@ -546,11 +618,54 @@ function result(value: any) {
   };
 }
 
-function commandResult(value: any) {
+export function statusCommandResult(value: any, jobId: string) {
+  const status =
+    typeof value?.state?.status === "string" ? value.state.status : "unknown";
+  const detail = Array.isArray(value?.presentation?.blocks)
+    ? value.presentation.blocks.find(
+        (block: unknown) =>
+          typeof block === "object" &&
+          block !== null &&
+          (block as { type?: unknown }).type === "text" &&
+          typeof (block as { text?: unknown }).text === "string",
+      )?.text
+    : undefined;
   return {
-    text: JSON.stringify(value.state ?? value.resolvedRequest ?? value),
-    presentation: value.presentation,
+    text:
+      typeof detail === "string" && detail.trim()
+        ? `Prime job ${jobId}\n${detail}`
+        : `Prime job ${jobId}: ${status}`,
   };
+}
+
+export function confirmationCommandResult(value: any) {
+  const jobId = typeof value?.jobId === "string" ? value.jobId : undefined;
+  return {
+    text: jobId
+      ? `Prime job ${jobId} launched. Status updates will follow in this thread.`
+      : "Prime job launched. Status updates will follow in this thread.",
+  };
+}
+
+function refreshJobId(payload: string): string {
+  const prefix = "refresh:";
+  if (!payload.startsWith(prefix))
+    throw new Error("invalid Prime refresh action");
+  const jobId = payload.slice(prefix.length).trim();
+  if (!/^[a-zA-Z0-9._-]+$/.test(jobId))
+    throw new Error("invalid Prime refresh job id");
+  return jobId;
+}
+
+function refreshFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return [
+    "Prime Dispatch is owner-only",
+    "invalid Prime refresh action",
+    "invalid Prime refresh job id",
+  ].includes(message)
+    ? `Prime refresh failed: ${message}`
+    : "Prime refresh failed; inspect the gateway log";
 }
 
 function messageIdFromDelivery(value: any): string {
