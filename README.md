@@ -14,7 +14,7 @@ This is not production-ready. The default execution backend is intentionally nam
 - **Beta Milestone 2:** **IMPLEMENTED for the operational Discord fixture path.** The package in [`openclaw-plugin`](openclaw-plugin/README.md) exposes five owner-only typed tools, hash-bound one-time confirmation, editable status-card delivery, terminal notification catch-up, and the standalone CLI/control boundary. See the [Beta Milestone 2 report](docs/beta-milestone-2.md).
 - **OpenClaw deployment:** [`prime-dispatch-openclaw`](docs/openclaw-host-lifecycle.md) prepares versioned host-local releases, migrates durable state, validates the exact OpenClaw config delta, and provides idempotent upgrade, audit, rollback, and state-preserving uninstall operations.
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
-- **Control-plane direction:** the current JSON/Zod store remains the Milestone 1 implementation. [ADR-0013](docs/adrs/0013-sqlite-authority-with-json-artifacts.md) supersedes it for future crash-consistent work: SQLite becomes authoritative while JSON, reports, diffs, and logs remain inspectable artifacts.
+- **Beta Milestone 3:** **IN PROGRESS.** The transactional-authority slice uses Node 24's built-in SQLite with WAL, foreign keys, durable synchronization, transactional leases/results/cursors/usage, legacy JSON import, repairable projections, and immutable artifact digests. Checkpoint resume and bounded cleanup remain tracked separately.
 
 The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
 
@@ -35,7 +35,7 @@ flowchart TD
     Discord["Discord owner"]
     Adapter["OpenClaw adapter<br/>preview · confirm · status card"]
     CLI["prime-dispatch CLI"]
-    ControlPlane["Durable control plane<br/>request.json · state.json · events.jsonl"]
+    ControlPlane["Durable control plane<br/>SQLite authority · inspectable projections"]
     Worker["Detached prime-job worker<br/>Unix socket per active job"]
     Execution{"ExecutionBackend"}
     UnsafeLocal["unsafe-local fixture worktree<br/>(implemented)"]
@@ -68,13 +68,15 @@ events expose deterministic delivery keys and durable per-consumer cursors so
 the later OpenClaw adapter can catch up missed milestone and terminal
 notifications idempotently.
 
-Each job has this layout:
+The state root and each job have this layout:
 
 ```text
+<state-root>/control-plane.sqlite3  authoritative requests, state, events,
+                                    leases, cursors, results, usage and digests
 <state-root>/jobs/<job-id>/
-  request.json              immutable; created with O_EXCL
-  state.json                authoritative snapshot, schemaVersion + revision
-  events.jsonl              append-only audit/progress journal
+  request.json              immutable operator projection
+  state.json                repairable schemaVersion + revision projection
+  events.jsonl              repairable audit/progress projection
   artifacts/
     result.json
     report.md
@@ -84,7 +86,7 @@ Each job has this layout:
     prime-agent/             dedicated Prime HOME/config/session directory
 ```
 
-Snapshots are written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Per-job `mkdir` locks serialize writers across processes, bind ownership to PID plus process-start identity, and serialize stale-lock reclamation before quarantining the abandoned directory. The event reader tolerates only a truncated final JSONL record; corruption in an earlier complete record fails closed.
+SQLite uses WAL mode, foreign keys, a five-second busy timeout, `synchronous=FULL`, and explicit immediate transactions. One transaction assigns each state revision and event sequence; terminal transactions also bind result metadata, the lease release, inference accounting, and the current artifact-digest inventory. JSON/JSONL files are projections written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Missing or stale projections regenerate from SQLite; contradictory projections and bulky evidence are quarantined with an authority-audit record. Existing schema-v1 JSON jobs import losslessly and idempotently, while corrupt or unknown schemas remain untouched and fail closed.
 
 The state machine is:
 
@@ -244,11 +246,10 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 
 - A surviving job worker is authenticated by process-start identity and a nonce-bound socket handshake. A dead or disproven worker is reconciled to `interrupted`; checkpoint recovery and explicit safe resume remain deferred to issue #11.
 - The dispatcher is not a resident scheduler. Nonterminal jobs are scanned whenever the CLI or future adapter starts, but no reconciliation occurs while no client is running.
-- Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`, but crash injection around every transition has not been exhaustively tested.
+- Cancellation escalates from RPC abort to process-group `SIGTERM` and `SIGKILL`. Transaction-boundary fault injection proves rollback-before-commit and deterministic recovery-after-commit; checkpoint-specific worker recovery remains issue #11.
 - Token usage is observable only from structured terminal upstream events. The durable ledger labels completed, partial, and unknown usage explicitly; a single response can overshoot the observed admission ceiling, the transport rejects a hard `max_output_tokens` control, and monetary cost is unavailable. Wall-clock, turn, gate, output, and concurrency limits remain externally enforced.
 - The official Prime archive omits runtime dependencies. The archive and configured entrypoint are checked, but the complete loaded dependency tree is not yet represented by a self-contained pinned artifact.
 - Remote Git prevention and single-process/root enforcement are not hard security boundaries under `unsafe-local`; Prime has IPython and normal host networking. Current controls are defense in depth for trusted repositories.
-- Event sequencing scans the journal and is suitable only for a small spike ledger.
 - Concurrent writers in separate worktrees of the same repository are not serialized; repository-local build services can still conflict.
 - Worktrees and branches are intentionally preserved. There is no cleanup command yet.
 - Container execution is not implemented. The installed OpenClaw adapter provides Discord confirmation and status components, but clean Gateway restart acceptance remains host-service-manager dependent.
@@ -256,6 +257,6 @@ The trusted job worker resolves Codex subscription OAuth through OpenClaw's publ
 
 ## Production exit criteria
 
-Before adopting this design, add transactional persistence, checkpoint recovery and explicit safe resume, bounded artifact storage and cleanup, plugin packaging, and crash/fault tests across every state transition. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
+Before adopting this design, add checkpoint recovery and explicit safe resume, bounded artifact storage and cleanup, and checkpoint-level crash tests across the worker lifecycle. Monetary cost reconciliation remains unavailable unless the subscription transport exposes a supported authoritative source. Container confinement remains a later hardening milestone. After the integration passes the disposable fixture again, smoke-test only a deliberately selected trusted local repository.
 
 See the [deep-review catalog](docs/beta-milestone-1-review.md) for resolved findings and issue-ready deferred work.
