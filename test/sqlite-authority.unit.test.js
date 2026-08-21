@@ -57,7 +57,7 @@ test("control database enables WAL, foreign keys, durable sync, and migrations",
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      2,
+      3,
     );
   } finally {
     database.close();

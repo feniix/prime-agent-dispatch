@@ -4,6 +4,7 @@ import { Command, Option } from "commander";
 import { PrimeDispatcher } from "./dispatcher.js";
 import { AuthorizationSchema, PrimeStartInputSchema } from "./schemas.js";
 import { loadHostConfig, resolveHostRepositoryPolicy } from "./host-config.js";
+import { CleanupManager } from "./cleanup.js";
 
 type CommonOptions = { stateRoot?: string };
 
@@ -162,6 +163,39 @@ withStateRoot(
           options.yes ? preview.summary.requestHash : options.confirmHash,
         ),
       );
+    }),
+);
+
+withStateRoot(
+  program
+    .command("cleanup-plan")
+    .description(
+      "create one immutable dry-run cleanup plan from trusted host policy",
+    )
+    .requiredOption("--host-config <path>")
+    .action(async (options) => {
+      const manager = new CleanupManager(stateRoot(options));
+      try {
+        const config = await loadHostConfig(options.hostConfig);
+        print(await manager.plan(config.retention));
+      } finally {
+        manager.close();
+      }
+    }),
+);
+
+withStateRoot(
+  program
+    .command("cleanup-apply")
+    .description("apply or resume one exact durable cleanup plan")
+    .requiredOption("--run-id <uuid>")
+    .action(async (options) => {
+      const manager = new CleanupManager(stateRoot(options));
+      try {
+        print(await manager.apply(options.runId));
+      } finally {
+        manager.close();
+      }
     }),
 );
 

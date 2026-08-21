@@ -139,7 +139,7 @@ function plan(state, attempt, overrides = {}) {
   };
 }
 
-test("schema v2 creates one auditable initial execution attempt", async () => {
+test("current schema creates one auditable initial execution attempt", async () => {
   const { root, store, request } = await initializedStore();
   const attempts = await store.readAttempts(request.jobId);
   assert.equal(attempts.length, 1);
@@ -151,7 +151,7 @@ test("schema v2 creates one auditable initial execution attempt", async () => {
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      2,
+      3,
     );
   } finally {
     database.close();
@@ -195,6 +195,15 @@ test("schema v1 upgrades in place and preserves terminal result evidence", async
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       imported_from_json INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    CREATE TABLE artifacts (
+      job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
+      relative_path TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      published_at TEXT NOT NULL,
+      PRIMARY KEY (job_id, relative_path)
     ) STRICT;
   `);
   database

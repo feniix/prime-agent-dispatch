@@ -1202,7 +1202,7 @@ export class JobStore {
     if (this.jobRow(jobId).result_json) await this.readResult(jobId);
     const rows = this.database
       .prepare(
-        "SELECT relative_path, kind, sha256, size_bytes FROM artifacts WHERE job_id = ? ORDER BY relative_path",
+        "SELECT relative_path, kind, sha256, size_bytes FROM artifacts WHERE job_id = ? AND retention_status = 'retained' ORDER BY relative_path",
       )
       .all(jobId) as {
       relative_path: string;
@@ -1607,13 +1607,18 @@ export class JobStore {
   ): void {
     this.database
       .prepare(
-        `INSERT INTO artifacts(job_id, relative_path, kind, sha256, size_bytes, published_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO artifacts(
+           job_id, relative_path, kind, sha256, size_bytes, published_at,
+           retention_status, deleted_at, cleanup_run_id
+         ) VALUES (?, ?, ?, ?, ?, ?, 'retained', NULL, NULL)
          ON CONFLICT(job_id, relative_path) DO UPDATE SET
            kind = excluded.kind,
            sha256 = excluded.sha256,
            size_bytes = excluded.size_bytes,
-           published_at = excluded.published_at`,
+           published_at = excluded.published_at,
+           retention_status = 'retained',
+           deleted_at = NULL,
+           cleanup_run_id = NULL`,
       )
       .run(jobId, relativePath, kind, digest, sizeBytes, publishedAt);
   }
