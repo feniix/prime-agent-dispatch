@@ -30,6 +30,7 @@ import {
   installRemoteInertGitGuard,
 } from "./policy.js";
 import { readProcessStartIdentity } from "./worker-identity.js";
+import { containWorkerSocketErrors } from "./ipc.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -64,6 +65,7 @@ let leaseToken: LeaseToken = {
 };
 
 function reply(socket: Socket, value: unknown, error?: unknown): void {
+  if (socket.destroyed || socket.writableEnded) return;
   socket.end(
     `${JSON.stringify(
       error
@@ -94,6 +96,7 @@ async function serveCommands(): Promise<void> {
   controlDir = await mkdtemp(join(tmpdir(), "pdc."));
   socketPath = join(controlDir, "control.sock");
   server = createServer((socket) => {
+    containWorkerSocketErrors(socket);
     socket.setEncoding("utf8");
     let buffer = "";
     let handled = false;

@@ -1,4 +1,4 @@
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 import {
   WorkerIdentitySchema,
   type WorkerCommand,
@@ -7,6 +7,17 @@ import {
 } from "./schemas.js";
 
 export class WorkerRejectedError extends Error {}
+
+export const WORKER_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+export function containWorkerSocketErrors(socket: Socket): void {
+  socket.on("error", () => {
+    // Control-plane callers have finite deadlines and may disconnect before a
+    // delayed worker reply is written. A reset is local to this connection and
+    // must never become an uncaught process-level error in the detached worker.
+    socket.destroy();
+  });
+}
 
 async function sendWorkerRequest(
   socketPath: string,
@@ -58,7 +69,7 @@ async function sendWorkerRequest(
 
 export async function handshakeWorker(
   identity: WorkerIdentity,
-  timeoutMs = 5_000,
+  timeoutMs = WORKER_HANDSHAKE_TIMEOUT_MS,
 ): Promise<WorkerIdentity> {
   return WorkerIdentitySchema.parse(
     await sendWorkerRequest(
