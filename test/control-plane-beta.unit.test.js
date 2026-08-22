@@ -134,6 +134,39 @@ test("missing worker for a nonterminal job reconciles to interrupted", async () 
   await replacement.release(token);
 });
 
+test("reconciling an orphan job never releases another job's lease", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-foreign-lease-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  const request = PrimeStartInputSchema.parse({
+    task: "fixture",
+    repoPath: repo,
+    repoRoots: [root],
+    fixture: true,
+    authorization: { channelId: "test", senderId: "test" },
+  });
+  const orphanJobId = "orphan-job";
+  const store = new JobStore(root);
+  await store.initialize({
+    ...request,
+    jobId: orphanJobId,
+    createdAt: new Date().toISOString(),
+    canonicalRepoPath: repo,
+    canonicalRepoRoot: root,
+    baseSha: "a".repeat(40),
+  });
+  await store.updateState(orphanJobId, "provisioning");
+  const activeLease = new GlobalJobLease(root);
+  const activeToken = await activeLease.acquire("active-job");
+
+  const state = await new PrimeDispatcher(root).status(orphanJobId);
+  assert.equal(state.status, "interrupted");
+  const inspection = await activeLease.inspect();
+  assert.equal(inspection.status, "live-launcher");
+  assert.equal(inspection.owner.jobId, "active-job");
+  await activeLease.release(activeToken);
+});
+
 test("caller budgets cannot exceed conservative host maximums", () => {
   assert.throws(
     () =>

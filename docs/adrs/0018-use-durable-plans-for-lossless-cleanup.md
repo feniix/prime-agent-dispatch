@@ -60,6 +60,12 @@ branches. Remote refs are never modified. Deleted artifact metadata and digests
 remain in SQLite with the cleanup run id and deletion time. Cleanup plans,
 actions, outcomes, audits, and per-job events remain authoritative.
 
+Before applying any delete action, the run transactionally reserves every
+target job at its reviewed terminal revision. Job lease acquisition and resume
+confirmation both reject that reservation. The reservation survives an
+interrupted deletion and is released only when the exact run completes, so a
+resume cannot become active between validation and filesystem deletion.
+
 ## Consequences
 
 - Dry-run and apply cannot disagree about selected targets for one run.

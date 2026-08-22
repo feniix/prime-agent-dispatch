@@ -1,18 +1,18 @@
-import { createHash, randomUUID } from "node:crypto";
-import {
-  lstat,
-  readdir,
-  readFile,
-  readlink,
-  realpath,
-  rm,
-} from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import canonicalize from "canonicalize";
+import {
+  digestContent,
+  digestFile,
+  DISPOSABLE_ARTIFACT_PREFIXES,
+  isSafeArtifactPath,
+} from "./artifacts.js";
 import type { RetentionPolicy } from "./host-config.js";
 import { RetentionPolicySchema } from "./host-config.js";
 import { git } from "./process.js";
-import type { JobState } from "./schemas.js";
+import { acquireProcessDirectoryLock } from "./process-lock.js";
+import { JobStateSchema, type JobState } from "./schemas.js";
 import {
   immediateTransaction,
   openControlDatabase,
@@ -21,13 +21,7 @@ import {
   type ControlDatabase,
 } from "./sqlite.js";
 import { JobStore } from "./store.js";
-
-const terminal = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
-const disposablePrefixes = [
-  "prime-agent/home/.cache",
-  "prime-agent/home/.local",
-  "prime-agent/home/.prime/agent/kernel-venv",
-];
+import { terminalStatuses } from "./state-machine.js";
 
 export type CleanupAction = {
   sequence: number;
@@ -58,10 +52,6 @@ type MutableAction = CleanupAction & {
   candidate: boolean;
 };
 
-function sha256(value: string | Buffer): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
 function snapshotDigest(
   policy: RetentionPolicy,
   actions: CleanupAction[],
@@ -81,7 +71,7 @@ function snapshotDigest(
     })),
   });
   if (!value) throw new Error("cleanup snapshot could not be canonicalized");
-  return sha256(value);
+  return digestContent(value);
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -106,13 +96,13 @@ async function inventoryPath(
       const target = await readlink(current);
       const size = Buffer.byteLength(target);
       bytes += size;
-      manifest.push(`l\0${name}\0${size}\0${sha256(target)}`);
+      manifest.push(`l\0${name}\0${size}\0${digestContent(target)}`);
       return;
     }
     if (metadata.isFile()) {
-      const content = await readFile(current);
-      bytes += content.length;
-      manifest.push(`f\0${name}\0${content.length}\0${sha256(content)}`);
+      const identity = await digestFile(current);
+      bytes += identity.sizeBytes;
+      manifest.push(`f\0${name}\0${identity.sizeBytes}\0${identity.digest}`);
       return;
     }
     if (!metadata.isDirectory())
@@ -123,7 +113,7 @@ async function inventoryPath(
       await visit(join(current, entry.name), `${name}/${entry.name}`);
   };
   await visit(path, ".");
-  return { bytes, digest: sha256(manifest.join("\n")) };
+  return { bytes, digest: digestContent(manifest.join("\n")) };
 }
 
 function missing(error: unknown): boolean {
@@ -161,7 +151,7 @@ export class CleanupManager {
       const request = await this.store.readRequest(jobId);
       let unsafe = await this.unsafeReason(jobId, state);
       const completedAtMs = Date.parse(state.updatedAt);
-      const retentionMs = terminal.has(state.status)
+      const retentionMs = terminalStatuses.has(state.status)
         ? policy.retainForMsByStatus[
             state.status as keyof RetentionPolicy["retainForMsByStatus"]
           ]
@@ -237,7 +227,7 @@ export class CleanupManager {
         });
       }
 
-      for (const prefix of disposablePrefixes) {
+      for (const prefix of DISPOSABLE_ARTIFACT_PREFIXES) {
         const target = join(this.store.jobDir(jobId), "artifacts", prefix);
         let inventory: { bytes: number; digest: string };
         try {
@@ -443,8 +433,24 @@ export class CleanupManager {
   }
 
   async apply(runId: string): Promise<CleanupPlan> {
+    const release = await acquireProcessDirectoryLock(
+      join(this.stateRoot, ".cleanup.apply.lock"),
+      {
+        staleMs: 30_000,
+        timeoutMs: 5_000,
+        busyError: "another cleanup apply is active",
+        identityError: "cleanup process identity is unavailable",
+      },
+    );
+    try {
+      return await this.applyWithLock(runId);
+    } finally {
+      await release();
+    }
+  }
+
+  private async applyWithLock(runId: string): Promise<CleanupPlan> {
     const run = this.runRow(runId);
-    if (run.status === "completed") return this.readPlan(runId);
     const actions = this.readActions(runId);
     const policy = RetentionPolicySchema.parse(
       parseSqliteJson(run.policy_json, "cleanup policy"),
@@ -453,6 +459,12 @@ export class CleanupManager {
       throw new Error(
         "cleanup plan no longer matches its authoritative snapshot",
       );
+    if (run.status === "completed") {
+      this.database
+        .prepare("DELETE FROM cleanup_job_reservations WHERE run_id = ?")
+        .run(runId);
+      return this.readPlan(runId);
+    }
     immediateTransaction(this.database, () => {
       this.database
         .prepare(
@@ -461,6 +473,7 @@ export class CleanupManager {
         .run(new Date().toISOString(), runId);
     });
     try {
+      this.reserveJobs(runId, actions);
       for (const action of actions) {
         if (action.decision === "keep") {
           if (action.status === "planned")
@@ -482,6 +495,9 @@ export class CleanupManager {
             "UPDATE cleanup_runs SET status = 'completed', completed_at = ?, reclaimed_bytes = ? WHERE run_id = ?",
           )
           .run(completedAt, reclaimed.bytes, runId);
+        this.database
+          .prepare("DELETE FROM cleanup_job_reservations WHERE run_id = ?")
+          .run(runId);
         this.audit(undefined, "cleanup_completed", {
           runId,
           reclaimedBytes: reclaimed.bytes,
@@ -498,6 +514,20 @@ export class CleanupManager {
       return this.readPlan(runId);
     } catch (error) {
       immediateTransaction(this.database, () => {
+        const started = this.database
+          .prepare(
+            `SELECT 1
+             FROM cleanup_actions
+             WHERE run_id = ?
+               AND decision = 'delete'
+               AND status IN ('applying', 'applied')
+             LIMIT 1`,
+          )
+          .get(runId);
+        if (!started)
+          this.database
+            .prepare("DELETE FROM cleanup_job_reservations WHERE run_id = ?")
+            .run(runId);
         this.database
           .prepare(
             "UPDATE cleanup_runs SET status = 'interrupted' WHERE run_id = ?",
@@ -530,8 +560,16 @@ export class CleanupManager {
     jobId: string,
     state: JobState,
   ): Promise<string | undefined> {
-    if (!terminal.has(state.status))
+    if (!terminalStatuses.has(state.status))
       return `job is nonterminal (${state.status})`;
+    const databaseUnsafe = this.databaseUnsafeReason(jobId);
+    if (databaseUnsafe) return databaseUnsafe;
+    if (await this.containsQuarantine(this.store.jobDir(jobId)))
+      return "quarantined content is present";
+    return undefined;
+  }
+
+  private databaseUnsafeReason(jobId: string): string | undefined {
     const lease = this.database
       .prepare("SELECT owner_json FROM leases")
       .all() as Array<{ owner_json: string }>;
@@ -545,7 +583,18 @@ export class CleanupManager {
       return "job still owns an active or reconciling lease";
     const checkpoint = this.database
       .prepare(
-        "SELECT status FROM recovery_checkpoints WHERE job_id = ? AND status IN ('started', 'uncertain', 'retryable') LIMIT 1",
+        `SELECT checkpoint.status
+         FROM recovery_checkpoints AS checkpoint
+         JOIN execution_attempts AS attempt
+           ON attempt.attempt_id = checkpoint.attempt_id
+         WHERE checkpoint.job_id = ?
+           AND attempt.ordinal = (
+             SELECT MAX(current.ordinal)
+             FROM execution_attempts AS current
+             WHERE current.job_id = checkpoint.job_id
+           )
+           AND checkpoint.status IN ('started', 'uncertain', 'retryable')
+         LIMIT 1`,
       )
       .get(jobId);
     if (checkpoint) return "recovery evidence is uncertain or incomplete";
@@ -556,9 +605,86 @@ export class CleanupManager {
       .get(jobId);
     if (corrupt)
       return "authority audit records corrupt or quarantined evidence";
-    if (await this.containsQuarantine(this.store.jobDir(jobId)))
-      return "quarantined content is present";
     return undefined;
+  }
+
+  private reserveJobs(runId: string, actions: CleanupAction[]): void {
+    const jobs = new Map<
+      string,
+      { stateRevision: number; status: JobState["status"] }
+    >();
+    for (const action of actions) {
+      if (action.decision !== "delete" || !action.jobId) continue;
+      const stateRevision = action.expected.stateRevision;
+      const status = action.expected.status;
+      if (
+        !Number.isSafeInteger(stateRevision) ||
+        !terminalStatuses.has(status as JobState["status"])
+      )
+        throw new Error("cleanup action has corrupt terminal state identity");
+      const identity = {
+        stateRevision: stateRevision as number,
+        status: status as JobState["status"],
+      };
+      const prior = jobs.get(action.jobId);
+      if (
+        prior &&
+        (prior.stateRevision !== identity.stateRevision ||
+          prior.status !== identity.status)
+      )
+        throw new Error(
+          `cleanup plan has inconsistent state identity for job ${action.jobId}`,
+        );
+      jobs.set(action.jobId, identity);
+    }
+    const acquiredAt = new Date().toISOString();
+    immediateTransaction(this.database, () => {
+      for (const [jobId, expected] of jobs) {
+        const row = this.database
+          .prepare("SELECT state_json FROM jobs WHERE job_id = ?")
+          .get(jobId) as { state_json: string } | undefined;
+        if (!row) throw new Error(`cleanup job ${jobId} no longer exists`);
+        const state = JobStateSchema.parse(
+          parseSqliteJson(row.state_json, "job state"),
+        );
+        if (
+          state.revision !== expected.stateRevision ||
+          state.status !== expected.status
+        )
+          throw new Error(`job ${jobId} changed after cleanup planning`);
+        const unsafe = this.databaseUnsafeReason(jobId);
+        if (unsafe)
+          throw new Error(`job ${jobId} is no longer cleanup-safe: ${unsafe}`);
+        const existing = this.database
+          .prepare(
+            `SELECT run_id, state_revision
+             FROM cleanup_job_reservations
+             WHERE job_id = ?`,
+          )
+          .get(jobId) as { run_id: string; state_revision: number } | undefined;
+        if (existing) {
+          if (
+            existing.run_id !== runId ||
+            existing.state_revision !== expected.stateRevision
+          )
+            throw new Error(
+              `job ${jobId} is reserved by cleanup run ${existing.run_id}`,
+            );
+          continue;
+        }
+        this.database
+          .prepare(
+            `INSERT INTO cleanup_job_reservations(
+               job_id, run_id, state_revision, acquired_at
+             ) VALUES (?, ?, ?, ?)`,
+          )
+          .run(jobId, runId, expected.stateRevision, acquiredAt);
+        this.audit(jobId, "cleanup_job_reserved", {
+          runId,
+          stateRevision: expected.stateRevision,
+        });
+      }
+    });
   }
 
   private async containsQuarantine(path: string): Promise<boolean> {
@@ -607,15 +733,20 @@ export class CleanupManager {
       const canonicalPath = await realpath(state.worktreePath);
       if (canonicalPath !== expectedPath || !isInside(ownedRoot, canonicalPath))
         throw new Error("worktree canonical path changed");
-      const [top, branchName, head, inventory] = await Promise.all([
-        git(canonicalPath, ["rev-parse", "--show-toplevel"]),
-        git(canonicalPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
-        git(canonicalPath, ["rev-parse", "HEAD"]),
-        inventoryPath(canonicalPath),
-      ]);
+      const [top, branchName, head, commonDir, repositoryCommonDir, inventory] =
+        await Promise.all([
+          git(canonicalPath, ["rev-parse", "--show-toplevel"]),
+          git(canonicalPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+          git(canonicalPath, ["rev-parse", "HEAD"]),
+          git(canonicalPath, ["rev-parse", "--git-common-dir"]),
+          git(repoPath, ["rev-parse", "--git-common-dir"]),
+          inventoryPath(canonicalPath),
+        ]);
       if (
         (await realpath(top)) !== canonicalPath ||
-        branchName !== state.branchName
+        branchName !== state.branchName ||
+        (await realpath(resolve(canonicalPath, commonDir))) !==
+          (await realpath(resolve(repoPath, repositoryCommonDir)))
       )
         throw new Error("worktree registration or branch identity changed");
       worktree = { canonicalPath, repoPath, branchName, head, ...inventory };
@@ -639,14 +770,11 @@ export class CleanupManager {
     const jobId = action.jobId;
     if (
       !Number.isSafeInteger(expected.stateRevision) ||
-      !terminal.has(String(expected.status))
+      !terminalStatuses.has(expected.status as JobState["status"])
     )
       throw new Error("cleanup action has corrupt terminal state identity");
     if (action.kind === "artifact") {
-      if (
-        action.target.startsWith("/") ||
-        action.target.split("/").includes("..")
-      )
+      if (!isSafeArtifactPath(action.target))
         throw new Error("cleanup artifact target is unsafe");
       if (
         !/^[a-f0-9]{64}$/.test(String(expected.sha256)) ||
@@ -656,7 +784,9 @@ export class CleanupManager {
     }
     if (
       action.kind === "disposable_cache" &&
-      !disposablePrefixes.includes(action.target)
+      !DISPOSABLE_ARTIFACT_PREFIXES.includes(
+        action.target as (typeof DISPOSABLE_ARTIFACT_PREFIXES)[number],
+      )
     )
       throw new Error(
         "cleanup cache target is not host-owned disposable content",
@@ -668,6 +798,11 @@ export class CleanupManager {
       throw new Error("cleanup worktree target is outside its owned job path");
     if (action.kind === "branch" && action.target !== `prime/${jobId}`)
       throw new Error("cleanup branch target is not owned by its job");
+    if (
+      action.kind === "branch" &&
+      !/^[a-f0-9]{40,64}$/.test(String(expected.head))
+    )
+      throw new Error("cleanup branch expectation is corrupt");
     const state = await this.store.readState(jobId);
     if (
       state.revision !== expected.stateRevision ||
@@ -678,6 +813,35 @@ export class CleanupManager {
     if (unsafe)
       throw new Error(
         `job ${action.jobId} is no longer cleanup-safe: ${unsafe}`,
+      );
+    const prior = this.database
+      .prepare(
+        `SELECT prior.run_id, prior.status
+         FROM cleanup_actions AS prior
+         JOIN cleanup_runs AS prior_run ON prior_run.run_id = prior.run_id
+         JOIN cleanup_runs AS current_run ON current_run.run_id = ?
+         WHERE prior.job_id = ?
+           AND prior.kind = ?
+           AND prior.target = ?
+           AND prior.decision = 'delete'
+           AND prior.run_id <> ?
+           AND prior_run.rowid < current_run.rowid
+           AND prior.status IN ('planned', 'applying', 'applied')
+         ORDER BY prior_run.rowid
+         LIMIT 1`,
+      )
+      .get(runId, jobId, action.kind, action.target, runId) as
+      | { run_id: string; status: CleanupAction["status"] }
+      | undefined;
+    if (prior?.status === "applied") {
+      this.finishAction(runId, action, "skipped", {
+        alreadyDeletedByRunId: prior.run_id,
+      });
+      return;
+    }
+    if (prior)
+      throw new Error(
+        `cleanup target is reserved by earlier run ${prior.run_id}`,
       );
     this.markApplying(runId, action.sequence);
     if (action.kind === "artifact") {
@@ -694,18 +858,23 @@ export class CleanupManager {
       )
         throw new Error("artifact cleanup target escaped its owned root");
       try {
-        const content =
+        const identity =
           expected.kind === "symlink"
-            ? Buffer.from(await readlink(path))
-            : await readFile(path);
+            ? await readlink(path).then((target) => ({
+                digest: digestContent(target),
+                sizeBytes: Buffer.byteLength(target),
+              }))
+            : await digestFile(path);
         if (
-          sha256(content) !== expected.sha256 ||
-          content.length !== expected.sizeBytes
+          identity.digest !== expected.sha256 ||
+          identity.sizeBytes !== expected.sizeBytes
         )
           throw new Error("artifact identity changed after cleanup planning");
         await rm(path);
       } catch (error) {
         if (!missing(error)) throw error;
+        if (action.status !== "applying")
+          throw new Error("artifact disappeared before cleanup started");
       }
       this.options.faultInjector?.(`cleanup:${action.sequence}:after_delete`);
       immediateTransaction(this.database, () => {
@@ -747,6 +916,10 @@ export class CleanupManager {
         await rm(path, { recursive: true });
       } catch (error) {
         if (!missing(error)) throw error;
+        if (action.status !== "applying")
+          throw new Error(
+            "disposable cache disappeared before cleanup started",
+          );
       }
     } else if (action.kind === "worktree") {
       let pathExists = true;
@@ -775,6 +948,8 @@ export class CleanupManager {
           action.target,
         ]);
       } else {
+        if (action.status !== "applying")
+          throw new Error("worktree disappeared before cleanup started");
         const registered = await git(String(expected.repoPath), [
           "worktree",
           "list",
@@ -796,15 +971,27 @@ export class CleanupManager {
       );
       if (worktree && worktree.status !== "applied")
         throw new Error("owned worktree must be removed before its branch");
-      const head = await git(String(expected.repoPath), [
-        "for-each-ref",
-        "--format=%(objectname)",
-        `refs/heads/${action.target}`,
-      ]);
-      if (head) {
-        if (head !== expected.head)
-          throw new Error("branch identity changed after cleanup planning");
-        await git(String(expected.repoPath), ["branch", "-D", action.target]);
+      try {
+        await git(String(expected.repoPath), [
+          "update-ref",
+          "-d",
+          `refs/heads/${action.target}`,
+          String(expected.head),
+        ]);
+      } catch (error) {
+        const currentHead = await git(String(expected.repoPath), [
+          "for-each-ref",
+          "--format=%(objectname)",
+          `refs/heads/${action.target}`,
+        ]);
+        if (currentHead)
+          throw new Error("branch identity changed after cleanup planning", {
+            cause: error,
+          });
+        if (action.status !== "applying")
+          throw new Error("branch disappeared before cleanup started", {
+            cause: error,
+          });
       }
     } else {
       throw new Error(`unsupported cleanup delete action ${action.kind}`);

@@ -1,17 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import {
+  assessSafeResume,
   CleanupManager,
   CONTROL_DATABASE_NAME,
+  GlobalJobLease,
   JobStore,
   PrimeStartInputSchema,
   RetentionPolicySchema,
+  resumeAuthorizationContextHash,
 } from "../dist/index.js";
 
 const now = new Date("2026-08-21T23:00:00.000Z");
@@ -153,14 +163,134 @@ test("an interrupted deletion resumes idempotently without losing its audit trai
       /injected cleanup crash/,
     );
     assert.equal(manager.readPlan(planned.runId).status, "interrupted");
+    const blocked = new GlobalJobLease(root);
+    await assert.rejects(
+      () => blocked.acquire("cleanup-job"),
+      /reserved by cleanup run/,
+    );
+    blocked.close();
     const resumed = await manager.apply(planned.runId);
     assert.equal(resumed.status, "completed");
+    const released = new GlobalJobLease(root);
+    const token = await released.acquire("cleanup-job");
+    await released.release(token);
+    released.close();
     assert.ok(
       manager.store
         .readAuthorityAudit()
         .some((record) => record.action === "cleanup_interrupted"),
     );
   } finally {
+    manager.close();
+  }
+});
+
+test("a target missing before first apply fails closed", async () => {
+  const { root, request } = await fixture();
+  const manager = new CleanupManager(root, { now: () => now });
+  try {
+    const planned = await manager.plan(policy());
+    await rm(join(root, "jobs", request.jobId, "artifacts", "debug/raw.jsonl"));
+    await assert.rejects(
+      () => manager.apply(planned.runId),
+      /artifact disappeared before cleanup started/,
+    );
+    assert.equal(manager.readPlan(planned.runId).status, "interrupted");
+  } finally {
+    manager.close();
+  }
+});
+
+test("overlapping cleanup plans account each deletion only once", async () => {
+  const { root } = await fixture();
+  const manager = new CleanupManager(root, { now: () => now });
+  try {
+    const first = await manager.plan(policy());
+    const second = await manager.plan(policy());
+    const firstApplied = await manager.apply(first.runId);
+    const secondApplied = await manager.apply(second.runId);
+    assert.ok(firstApplied.reclaimedBytes > 0);
+    assert.equal(secondApplied.reclaimedBytes, 0);
+    assert.ok(
+      secondApplied.actions.some(
+        (action) =>
+          action.status === "skipped" &&
+          typeof action.outcome?.alreadyDeletedByRunId === "string",
+      ),
+    );
+  } finally {
+    manager.close();
+  }
+});
+
+test("a cleanup reservation prevents resume until the exact plan completes", async () => {
+  const { root, request } = await fixture({ terminal: false });
+  const store = new JobStore(root);
+  await store.finalizeTerminal(
+    {
+      schemaVersion: 1,
+      jobId: request.jobId,
+      status: "interrupted",
+      summary: "worker stopped",
+      baseSha: request.baseSha,
+      noChanges: true,
+      gateResults: [],
+      completedAt: "2026-08-20T21:00:00.000Z",
+    },
+    { error: "worker stopped", summary: "worker stopped", noChanges: true },
+  );
+  const manager = new CleanupManager(root, { now: () => now });
+  try {
+    const planned = await manager.plan(policy());
+    const resumePlan = await assessSafeResume(store, request.jobId);
+    const contextHash = resumeAuthorizationContextHash(request.authorization);
+    const confirmation = await store.createResumeConfirmation(
+      resumePlan,
+      contextHash,
+    );
+    let reachedResolve;
+    let continueResolve;
+    const reached = new Promise((resolve) => (reachedResolve = resolve));
+    const proceed = new Promise((resolve) => (continueResolve = resolve));
+    const applyAction = manager.applyAction.bind(manager);
+    manager.applyAction = async (...args) => {
+      reachedResolve();
+      await proceed;
+      return await applyAction(...args);
+    };
+
+    const applying = manager.apply(planned.runId);
+    await reached;
+    const blockedLease = new GlobalJobLease(root);
+    await assert.rejects(
+      () => blockedLease.acquire(request.jobId),
+      /reserved by cleanup run/,
+    );
+    blockedLease.close();
+    await assert.rejects(
+      () =>
+        store.consumeResumeConfirmation(
+          confirmation.confirmationToken,
+          contextHash,
+          request.jobId,
+        ),
+      /reserved by cleanup run/,
+    );
+    continueResolve();
+    assert.equal((await applying).status, "completed");
+
+    const database = new DatabaseSync(join(root, CONTROL_DATABASE_NAME));
+    assert.equal(
+      database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM cleanup_job_reservations WHERE job_id = ?",
+        )
+        .get(request.jobId).count,
+      0,
+    );
+    database.close();
+  } finally {
+    store.close();
     manager.close();
   }
 });
@@ -204,6 +334,93 @@ test("nonterminal and corrupt jobs fail closed even under quota pressure", async
     assert.ok(plan.actions.some((action) => action.reason.includes("corrupt")));
   } finally {
     corruptManager.close();
+  }
+});
+
+test("cleanup ignores retryable checkpoints from a superseded attempt", async () => {
+  const { root, request } = await fixture({ terminal: false });
+  const store = new JobStore(root);
+  const firstAttempt = await store.currentAttempt(request.jobId);
+  await store.beginCheckpoint(
+    request.jobId,
+    firstAttempt.attemptId,
+    "model:provision",
+    "model_provisioning",
+  );
+  await store.updateState(request.jobId, "provisioning");
+  await store.finalizeTerminal(
+    {
+      schemaVersion: 1,
+      jobId: request.jobId,
+      status: "interrupted",
+      summary: "worker died",
+      baseSha: request.baseSha,
+      noChanges: true,
+      gateResults: [],
+      completedAt: "2026-08-20T20:30:00.000Z",
+    },
+    { error: "worker died", summary: "worker died", noChanges: true },
+  );
+  await store.reconcileCheckpoint(
+    request.jobId,
+    firstAttempt.attemptId,
+    "model:provision",
+    { localOnly: true },
+    "local provisioning is safe to retry",
+    "retryable",
+  );
+  const interrupted = await store.readState(request.jobId);
+  const resumePlan = {
+    schemaVersion: 1,
+    jobId: request.jobId,
+    sourceAttemptId: firstAttempt.attemptId,
+    expectedRevision: interrupted.revision,
+    nextStage: "model_provisioning",
+    preserved: ["evidence"],
+    willRepeat: ["model_provisioning"],
+    willNotRepeat: [],
+    gateResults: [],
+    rationale: "the local-only operation is safe to retry",
+  };
+  const contextHash = resumeAuthorizationContextHash(request.authorization);
+  const confirmation = await store.createResumeConfirmation(
+    resumePlan,
+    contextHash,
+  );
+  await store.consumeResumeConfirmation(
+    confirmation.confirmationToken,
+    contextHash,
+    request.jobId,
+  );
+  await store.updateState(request.jobId, "provisioning");
+  await store.updateState(request.jobId, "running");
+  await store.updateState(request.jobId, "verifying");
+  await store.updateState(request.jobId, "committing");
+  await store.finalizeTerminal(
+    {
+      schemaVersion: 1,
+      jobId: request.jobId,
+      status: "succeeded",
+      summary: "resumed successfully",
+      baseSha: request.baseSha,
+      noChanges: true,
+      gateResults: [],
+      completedAt: "2026-08-20T21:00:00.000Z",
+    },
+    { summary: "resumed successfully", noChanges: true },
+  );
+  store.close();
+
+  const manager = new CleanupManager(root, { now: () => now });
+  try {
+    const planned = await manager.plan(policy());
+    assert.equal(
+      planned.actions.find((action) => action.target === "debug/raw.jsonl")
+        .decision,
+      "delete",
+    );
+  } finally {
+    manager.close();
   }
 });
 
@@ -328,13 +545,12 @@ test("worktree removal is checkpointed before branch removal and resumes after a
   );
   store.close();
 
-  let worktreeSequence;
-  let crashed = false;
+  let crashSequence;
   const manager = new CleanupManager(stateRoot, {
     now: () => now,
     faultInjector(point) {
-      if (!crashed && point === `cleanup:${worktreeSequence}:after_delete`) {
-        crashed = true;
+      if (point === `cleanup:${crashSequence}:after_delete`) {
+        crashSequence = undefined;
         throw new Error("crash after worktree removal");
       }
     },
@@ -345,7 +561,7 @@ test("worktree removal is checkpointed before branch removal and resumes after a
       (action) => action.kind === "worktree",
     );
     const branch = planned.actions.find((action) => action.kind === "branch");
-    worktreeSequence = worktree.sequence;
+    crashSequence = worktree.sequence;
     assert.equal(worktree.decision, "delete");
     assert.equal(branch.decision, "delete");
     assert.ok(worktree.sequence < branch.sequence);
@@ -363,7 +579,11 @@ test("worktree removal is checkpointed before branch removal and resumes after a
       ),
       branchName,
     );
-    assert.equal((await manager.apply(planned.runId)).status, "completed");
+    crashSequence = branch.sequence;
+    await assert.rejects(
+      () => manager.apply(planned.runId),
+      /crash after worktree removal/,
+    );
     assert.equal(
       await git(
         repo,
@@ -373,6 +593,7 @@ test("worktree removal is checkpointed before branch removal and resumes after a
       ),
       "",
     );
+    assert.equal((await manager.apply(planned.runId)).status, "completed");
   } finally {
     manager.close();
   }

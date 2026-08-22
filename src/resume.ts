@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { lstat, readdir, readlink, realpath } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import canonicalize from "canonicalize";
 import { z } from "zod";
+import { digestContent, digestFile } from "./artifacts.js";
 import type { JobStore } from "./store.js";
 import type { Authorization, GateResult } from "./schemas.js";
 import {
   ResumePlanSchema,
+  STAGE_ORDER,
+  type ExecutionAttempt,
   type RecoveryCheckpoint,
   type ResumePlan,
 } from "./recovery.js";
@@ -84,6 +88,7 @@ export async function assessSafeResume(
   store: JobStore,
   jobId: string,
 ): Promise<ResumePlan> {
+  await store.assertNotReservedForCleanup(jobId);
   const [request, state, attempt] = await Promise.all([
     store.readRequest(jobId),
     store.readState(jobId),
@@ -95,7 +100,12 @@ export async function assessSafeResume(
     throw new ResumeUnavailableError(
       "legacy job has no versioned checkpoint evidence; evidence was preserved",
     );
-  let checkpoints = await store.readCheckpoints(jobId, attempt.attemptId);
+  const readEffectiveCheckpoints = async () =>
+    mergeResumeEvidence(
+      await store.readCheckpoints(jobId, attempt.attemptId),
+      attempt,
+    );
+  let checkpoints = await readEffectiveCheckpoints();
   let priorStage = -1;
   for (const checkpoint of checkpoints) {
     if (!knownOperation.test(checkpoint.operationKey))
@@ -106,15 +116,7 @@ export async function assessSafeResume(
       throw new ResumeUnavailableError(
         `checkpoint ${checkpoint.operationKey} has an invalid stage; evidence was preserved`,
       );
-    const stage = [
-      "worktree",
-      "model_provisioning",
-      "prime_execution",
-      "quiescence",
-      "verification",
-      "commit",
-      "terminal_materialization",
-    ].indexOf(checkpoint.stage);
+    const stage = STAGE_ORDER.indexOf(checkpoint.stage);
     if (stage < priorStage)
       throw new ResumeUnavailableError(
         "checkpoint stage ordering is invalid; evidence was preserved",
@@ -147,7 +149,7 @@ export async function assessSafeResume(
       resolution.decision,
       resolution.status,
     );
-    checkpoints = await store.readCheckpoints(jobId, attempt.attemptId);
+    checkpoints = await readEffectiveCheckpoints();
     checkpointMap = byKey();
   }
 
@@ -161,7 +163,7 @@ export async function assessSafeResume(
       "dead worker cannot retain usable private model provisioning; local setup is safe to recreate",
       "retryable",
     );
-    checkpoints = await store.readCheckpoints(jobId, attempt.attemptId);
+    checkpoints = await readEffectiveCheckpoints();
     checkpointMap = byKey();
   }
 
@@ -184,7 +186,7 @@ export async function assessSafeResume(
       resolution.decision,
       resolution.status,
     );
-    checkpoints = await store.readCheckpoints(jobId, attempt.attemptId);
+    checkpoints = await readEffectiveCheckpoints();
     checkpointMap = byKey();
   }
 
@@ -207,7 +209,7 @@ export async function assessSafeResume(
       "terminal SQLite transaction did not commit and is safe to materialize from completed evidence",
       "retryable",
     );
-    checkpoints = await store.readCheckpoints(jobId, attempt.attemptId);
+    checkpoints = await readEffectiveCheckpoints();
     checkpointMap = byKey();
   }
 
@@ -219,15 +221,23 @@ export async function assessSafeResume(
   }
 
   const completedWorktree = completed(checkpointMap.get("worktree:prepare"));
-  if (completedWorktree)
+  let worktreeSnapshotSha256: string | undefined;
+  if (completedWorktree) {
+    const completedCommit = completed(checkpointMap.get("git:commit"));
     await verifyPreservedWorktree(
+      request.canonicalRepoPath,
       request.baseSha,
       state.worktreePath,
       state.branchName,
-      completed(checkpointMap.get("git:commit")),
+      completedCommit
+        ? CommitFactsSchema.parse(completedCommit.facts).commitSha
+        : undefined,
     );
+    worktreeSnapshotSha256 = await snapshotWorktree(state.worktreePath!);
+  }
 
   const completedPrime = completed(checkpointMap.get("prime:execute"));
+  const completedProvisioning = completed(checkpointMap.get("model:provision"));
   const completedQuiescence = completed(checkpointMap.get("prime:quiesce"));
   if (completedPrime && !completedQuiescence)
     throw new ResumeUnavailableError(
@@ -264,9 +274,24 @@ export async function assessSafeResume(
     ? CommitFactsSchema.parse(completedCommit.facts)
     : undefined;
 
+  const hasLaterCompletedWork =
+    completedPrime ||
+    completedQuiescence ||
+    gates.length > 0 ||
+    completedCommit;
+  if (
+    (!completedWorktree && (completedProvisioning || hasLaterCompletedWork)) ||
+    (!completedProvisioning && hasLaterCompletedWork) ||
+    (!completedPrime && (gates.length > 0 || completedCommit)) ||
+    (completedCommit && gates.length !== request.gates.length)
+  )
+    throw new ResumeUnavailableError(
+      "completed checkpoint dependencies are inconsistent; evidence was preserved",
+    );
+
   const nextStage = !completedWorktree
     ? "worktree"
-    : !completed(checkpointMap.get("model:provision")) || !completedPrime
+    : !completedPrime
       ? "model_provisioning"
       : gates.length < request.gates.length
         ? "verification"
@@ -284,7 +309,14 @@ export async function assessSafeResume(
     );
 
   const willNotRepeat = checkpoints
-    .filter((checkpoint) => checkpoint.status === "completed")
+    .filter(
+      (checkpoint) =>
+        checkpoint.status === "completed" &&
+        !(
+          nextStage === "model_provisioning" &&
+          checkpoint.operationKey === "model:provision"
+        ),
+    )
     .map((checkpoint) => checkpoint.operationKey);
   const willRepeat = [nextStage];
   return ResumePlanSchema.parse({
@@ -305,12 +337,134 @@ export async function assessSafeResume(
     willNotRepeat,
     ...(state.worktreePath ? { worktreePath: state.worktreePath } : {}),
     ...(state.branchName ? { branchName: state.branchName } : {}),
+    ...(worktreeSnapshotSha256 ? { worktreeSnapshotSha256 } : {}),
     ...(agentResult ? { agentResult } : {}),
     gateResults,
     ...(commitFacts?.commitSha ? { commitSha: commitFacts.commitSha } : {}),
     ...(commitFacts ? { noChanges: commitFacts.noChanges } : {}),
     rationale: `next action ${nextStage} is mechanically safe; uncertain model calls, gates, and external effects are never replayed`,
   });
+}
+
+export async function assertResumePlanEvidence(
+  store: JobStore,
+  jobId: string,
+  plan: ResumePlan,
+): Promise<void> {
+  if (plan.jobId !== jobId)
+    throw new ResumeUnavailableError("resume plan job identity changed");
+  if (plan.nextStage === "worktree") return;
+  if (!plan.worktreePath || !plan.branchName || !plan.worktreeSnapshotSha256)
+    throw new ResumeUnavailableError(
+      "resume plan omitted the preserved worktree snapshot",
+    );
+  const [request, state] = await Promise.all([
+    store.readRequest(jobId),
+    store.readState(jobId),
+  ]);
+  if (
+    state.worktreePath !== plan.worktreePath ||
+    state.branchName !== plan.branchName
+  )
+    throw new ResumeUnavailableError("preserved worktree identity changed");
+  await verifyPreservedWorktree(
+    request.canonicalRepoPath,
+    request.baseSha,
+    plan.worktreePath,
+    plan.branchName,
+    plan.commitSha,
+  );
+  const currentSnapshot = await snapshotWorktree(plan.worktreePath);
+  if (currentSnapshot !== plan.worktreeSnapshotSha256)
+    throw new ResumeUnavailableError(
+      "preserved worktree contents changed after resume preview",
+    );
+}
+
+function mergeResumeEvidence(
+  checkpoints: RecoveryCheckpoint[],
+  attempt: ExecutionAttempt,
+): RecoveryCheckpoint[] {
+  const plan = attempt.resumePlan;
+  if (!plan) return checkpoints;
+  const inherited: Array<{
+    operationKey: string;
+    stage: RecoveryCheckpoint["stage"];
+    facts: Record<string, unknown>;
+  }> = [];
+  const precedesNextStage = (stage: RecoveryCheckpoint["stage"]) =>
+    STAGE_ORDER.indexOf(stage) < STAGE_ORDER.indexOf(plan.nextStage);
+  if (precedesNextStage("worktree"))
+    inherited.push({
+      operationKey: "worktree:prepare",
+      stage: "worktree",
+      facts: {
+        worktreePath: plan.worktreePath,
+        branchName: plan.branchName,
+      },
+    });
+  if (precedesNextStage("model_provisioning"))
+    inherited.push({
+      operationKey: "model:provision",
+      stage: "model_provisioning",
+      facts: { runtimeVerified: true },
+    });
+  if (precedesNextStage("prime_execution"))
+    inherited.push({
+      operationKey: "prime:execute",
+      stage: "prime_execution",
+      facts: { agentResult: plan.agentResult },
+    });
+  if (precedesNextStage("quiescence"))
+    inherited.push({
+      operationKey: "prime:quiesce",
+      stage: "quiescence",
+      facts: { processTreeExited: true },
+    });
+  for (const [gateIndex, gateResult] of plan.gateResults.entries())
+    inherited.push({
+      operationKey: `gate:${gateIndex}`,
+      stage: "verification",
+      facts: { gateIndex, gateResult },
+    });
+  if (precedesNextStage("commit"))
+    inherited.push({
+      operationKey: "git:commit",
+      stage: "commit",
+      facts: {
+        ...(plan.commitSha ? { commitSha: plan.commitSha } : {}),
+        noChanges: plan.noChanges,
+      },
+    });
+  const inheritedKeys = new Set(inherited.map((value) => value.operationKey));
+  const duplicate = checkpoints.find((value) =>
+    inheritedKeys.has(value.operationKey),
+  );
+  if (duplicate)
+    throw new ResumeUnavailableError(
+      `checkpoint ${duplicate.operationKey} duplicates inherited resume evidence`,
+    );
+  const inheritedAt = attempt.startedAt;
+  return [
+    ...inherited.map((value, index) => ({
+      attemptId: attempt.attemptId,
+      jobId: attempt.jobId,
+      operationKey: value.operationKey,
+      ordinal: index + 1,
+      stage: value.stage,
+      status: "completed" as const,
+      facts: {
+        ...value.facts,
+        inheritedFromAttemptId: attempt.resumedFromAttemptId,
+      },
+      startedAt: inheritedAt,
+      completedAt: inheritedAt,
+    })),
+    ...checkpoints.map((checkpoint) => ({
+      ...checkpoint,
+      ordinal: checkpoint.ordinal + inherited.length,
+    })),
+  ];
 }
 
 function completed(
@@ -334,7 +488,12 @@ async function inspectUncertainWorktree(
 > {
   if (!worktreePath || !branchName) return undefined;
   try {
-    await verifyPreservedWorktree(baseSha, worktreePath, branchName);
+    await verifyPreservedWorktree(
+      canonicalRepoPath,
+      baseSha,
+      worktreePath,
+      branchName,
+    );
     return {
       status: "completed",
       facts: { worktreePath, branchName },
@@ -404,30 +563,82 @@ async function inspectUncertainCommit(
 }
 
 async function verifyPreservedWorktree(
+  canonicalRepoPath: string,
   baseSha: string,
   worktreePath?: string,
   branchName?: string,
-  commitCheckpoint?: RecoveryCheckpoint,
+  expectedCommit?: string,
 ): Promise<void> {
   if (!worktreePath || !branchName)
     throw new ResumeUnavailableError("worktree identity is incomplete");
-  const [canonical, topLevel, branch, head] = await Promise.all([
-    realpath(worktreePath),
-    git(worktreePath, ["rev-parse", "--show-toplevel"]),
-    git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]),
-    git(worktreePath, ["rev-parse", "HEAD"]),
-  ]);
+  const [canonical, topLevel, branch, head, commonDir, repositoryCommonDir] =
+    await Promise.all([
+      realpath(worktreePath),
+      git(worktreePath, ["rev-parse", "--show-toplevel"]),
+      git(worktreePath, ["symbolic-ref", "--quiet", "HEAD"]),
+      git(worktreePath, ["rev-parse", "HEAD"]),
+      git(worktreePath, ["rev-parse", "--git-common-dir"]),
+      git(canonicalRepoPath, ["rev-parse", "--git-common-dir"]),
+    ]);
   if ((await realpath(topLevel)) !== canonical)
     throw new ResumeUnavailableError("worktree canonical path changed");
+  if (
+    (await realpath(resolve(worktreePath, commonDir))) !==
+    (await realpath(resolve(canonicalRepoPath, repositoryCommonDir)))
+  )
+    throw new ResumeUnavailableError("worktree repository identity changed");
   if (branch !== `refs/heads/${branchName}`)
     throw new ResumeUnavailableError("worktree branch identity changed");
-  const expectedCommit = commitCheckpoint
-    ? CommitFactsSchema.parse(commitCheckpoint.facts).commitSha
-    : undefined;
   if (expectedCommit && head !== expectedCommit)
     throw new ResumeUnavailableError(
       "worktree HEAD changed after commit checkpoint",
     );
-  if (!expectedCommit)
-    await git(worktreePath, ["merge-base", "--is-ancestor", baseSha, "HEAD"]);
+  if (!expectedCommit && head !== baseSha)
+    throw new ResumeUnavailableError(
+      "worktree HEAD changed before a commit checkpoint",
+    );
+}
+
+async function snapshotWorktree(worktreePath: string): Promise<string> {
+  const manifest: unknown[][] = [];
+  const visit = async (path: string, name: string, root = false) => {
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink()) {
+      const target = await readlink(path);
+      manifest.push([
+        "symlink",
+        name,
+        Buffer.byteLength(target),
+        digestContent(target),
+      ]);
+      return;
+    }
+    if (metadata.isFile()) {
+      const identity = await digestFile(path);
+      const executable = metadata.mode & 0o111 ? "x" : "-";
+      manifest.push([
+        "file",
+        name,
+        executable,
+        identity.sizeBytes,
+        identity.digest,
+      ]);
+      return;
+    }
+    if (!metadata.isDirectory())
+      throw new ResumeUnavailableError(
+        `unsupported worktree entry in resume snapshot: ${name}`,
+      );
+    manifest.push(["directory", name]);
+    const entries = await readdir(path, { withFileTypes: true });
+    entries.sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    );
+    for (const entry of entries) {
+      if (root && entry.name === ".git") continue;
+      await visit(join(path, entry.name), `${name}/${entry.name}`);
+    }
+  };
+  await visit(worktreePath, ".", true);
+  return digestContent(JSON.stringify(manifest));
 }

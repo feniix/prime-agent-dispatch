@@ -13,7 +13,10 @@ import {
   type PrimeStartInput,
 } from "./schemas.js";
 import { resolveRepository } from "./repository.js";
-import { sendAuthenticatedWorkerCommand } from "./ipc.js";
+import {
+  sendAuthenticatedWorkerCommand,
+  WORKER_HANDSHAKE_TIMEOUT_MS,
+} from "./ipc.js";
 import { terminalStatuses } from "./state-machine.js";
 import { GlobalJobLease, type LeaseOwner, type LeaseToken } from "./lease.js";
 import { buildConfirmationSummary } from "./policy.js";
@@ -23,7 +26,11 @@ import {
   workerIdentityFromState,
   type WorkerVerification,
 } from "./worker-identity.js";
-import { assessSafeResume, resumeAuthorizationContextHash } from "./resume.js";
+import {
+  assertResumePlanEvidence,
+  assessSafeResume,
+  resumeAuthorizationContextHash,
+} from "./resume.js";
 
 type VerifyWorkerIdentity = (
   identity: NonNullable<ReturnType<typeof workerIdentityFromState>>,
@@ -130,6 +137,8 @@ export class PrimeDispatcher {
         .release(workerToken)
         .catch(() => lease.release(launcherToken).catch(() => undefined));
       throw error;
+    } finally {
+      lease.close();
     }
   }
 
@@ -163,6 +172,12 @@ export class PrimeDispatcher {
       nonce: workerNonce,
     };
     try {
+      const pending = await this.store.readResumeConfirmation(
+        confirmationToken,
+        resumeAuthorizationContextHash(authorization),
+        jobId,
+      );
+      await assertResumePlanEvidence(this.store, jobId, pending.plan);
       const resumed = await this.store.consumeResumeConfirmation(
         confirmationToken,
         resumeAuthorizationContextHash(authorization),
@@ -179,6 +194,8 @@ export class PrimeDispatcher {
         .release(workerToken)
         .catch(() => lease.release(launcherToken).catch(() => undefined));
       throw error;
+    } finally {
+      lease.close();
     }
   }
 
@@ -216,7 +233,7 @@ export class PrimeDispatcher {
     let spawnError: Error | undefined;
     child.once("error", (error) => (spawnError = error));
     if (!child.pid) throw new Error("job worker did not receive a process id");
-    const startupDeadline = Date.now() + 5_000;
+    const startupDeadline = Date.now() + WORKER_HANDSHAKE_TIMEOUT_MS;
     let startupConfirmed = false;
     while (Date.now() < startupDeadline) {
       const current = await this.store.readState(jobId);
@@ -269,104 +286,112 @@ export class PrimeDispatcher {
     let state = await this.readReconciledState(jobId);
     if (terminalStatuses.has(state.status)) return state;
     const lease = new GlobalJobLease(this.stateRoot);
-    let identity = workerIdentityFromState(state);
-    if (!identity) {
-      const inspection = await lease.inspect();
-      if (
-        inspection.status === "verified-worker" &&
-        inspection.owner.kind === "worker" &&
-        inspection.owner.jobId === jobId
-      ) {
-        identity = inspection.owner.identity;
-        state = await this.store.updateState(jobId, state.status, {
-          workerPid: identity.pid,
-          workerStartIdentity: identity.processStartIdentity,
-          workerNonce: identity.nonce,
-          workerProtocolVersion: identity.protocolVersion,
-          socketPath: identity.socketPath,
-        });
-        await this.store.appendEventOnce(
-          jobId,
-          "worker_identity_recovered",
-          `worker:${identity.nonce}`,
-          {
+    try {
+      let identity = workerIdentityFromState(state);
+      if (!identity) {
+        const inspection = await lease.inspect();
+        if (
+          inspection.status === "verified-worker" &&
+          inspection.owner.kind === "worker" &&
+          inspection.owner.jobId === jobId
+        ) {
+          identity = inspection.owner.identity;
+          state = await this.store.updateState(jobId, state.status, {
             workerPid: identity.pid,
-            protocolVersion: identity.protocolVersion,
-          },
-        );
-      } else if (
-        inspection.status === "live-launcher" &&
-        inspection.owner.kind === "launcher" &&
-        inspection.owner.jobId === jobId &&
-        state.status === "queued"
-      ) {
-        await this.store.appendEventOnce(
-          jobId,
-          "worker_launch_observed",
-          `launcher:${inspection.owner.nonce}`,
-          { launcherPid: inspection.owner.pid },
-        );
-        return state;
-      } else if (
-        inspection.status === "unreachable-worker" &&
-        inspection.owner.kind === "worker" &&
-        inspection.owner.jobId === jobId
-      ) {
+            workerStartIdentity: identity.processStartIdentity,
+            workerNonce: identity.nonce,
+            workerProtocolVersion: identity.protocolVersion,
+            socketPath: identity.socketPath,
+          });
+          await this.store.appendEventOnce(
+            jobId,
+            "worker_identity_recovered",
+            `worker:${identity.nonce}`,
+            {
+              workerPid: identity.pid,
+              protocolVersion: identity.protocolVersion,
+            },
+          );
+        } else if (
+          inspection.status === "live-launcher" &&
+          inspection.owner.kind === "launcher" &&
+          inspection.owner.jobId === jobId &&
+          state.status === "queued"
+        ) {
+          await this.store.appendEventOnce(
+            jobId,
+            "worker_launch_observed",
+            `launcher:${inspection.owner.nonce}`,
+            { launcherPid: inspection.owner.pid },
+          );
+          return state;
+        } else if (
+          inspection.status === "unreachable-worker" &&
+          inspection.owner.kind === "worker" &&
+          inspection.owner.jobId === jobId
+        ) {
+          const completed = await this.readReconciledState(jobId);
+          if (terminalStatuses.has(completed.status)) return completed;
+          await this.store.appendEventOnce(
+            jobId,
+            "worker_reconciliation_deferred",
+            `worker:${inspection.owner.identity.nonce}:${inspection.error}`,
+            { error: inspection.error },
+          );
+          throw new Error(
+            `worker identity could not be verified: ${inspection.error}`,
+          );
+        } else {
+          const ownedLease =
+            "owner" in inspection && inspection.owner.jobId === jobId
+              ? inspection.owner
+              : undefined;
+          return await this.interruptUnverifiedWorker(
+            state,
+            "worker identity is missing or stale; preserved job evidence",
+            ownedLease,
+          );
+        }
+      }
+      const verification = await verifyWorkerIdentity(identity);
+      if (verification.status === "unreachable") {
         const completed = await this.readReconciledState(jobId);
         if (terminalStatuses.has(completed.status)) return completed;
         await this.store.appendEventOnce(
           jobId,
           "worker_reconciliation_deferred",
-          `worker:${inspection.owner.identity.nonce}:${inspection.error}`,
-          { error: inspection.error },
+          `worker:${identity.nonce}:${verification.error}`,
+          { error: verification.error },
         );
         throw new Error(
-          `worker identity could not be verified: ${inspection.error}`,
-        );
-      } else {
-        return await this.interruptUnverifiedWorker(
-          state,
-          "worker identity is missing or stale; preserved job evidence",
-          "owner" in inspection ? inspection.owner : undefined,
+          `worker identity could not be verified: ${verification.error}`,
         );
       }
-    }
-    const verification = await verifyWorkerIdentity(identity);
-    if (verification.status === "unreachable") {
-      const completed = await this.readReconciledState(jobId);
-      if (terminalStatuses.has(completed.status)) return completed;
+      if (verification.status !== "verified")
+        return await this.interruptUnverifiedWorker(
+          state,
+          `worker identity ${verification.status}; preserved job evidence`,
+          {
+            kind: "worker",
+            jobId,
+            identity,
+            acquiredAt: state.createdAt,
+          },
+        );
       await this.store.appendEventOnce(
         jobId,
-        "worker_reconciliation_deferred",
-        `worker:${identity.nonce}:${verification.error}`,
-        { error: verification.error },
-      );
-      throw new Error(
-        `worker identity could not be verified: ${verification.error}`,
-      );
-    }
-    if (verification.status !== "verified")
-      return await this.interruptUnverifiedWorker(
-        state,
-        `worker identity ${verification.status}; preserved job evidence`,
+        "worker_reconnected",
+        `worker:${identity.nonce}`,
         {
-          kind: "worker",
-          jobId,
-          identity,
-          acquiredAt: state.createdAt,
+          workerPid: identity.pid,
+          processStartIdentity: identity.processStartIdentity,
+          protocolVersion: identity.protocolVersion,
         },
       );
-    await this.store.appendEventOnce(
-      jobId,
-      "worker_reconnected",
-      `worker:${identity.nonce}`,
-      {
-        workerPid: identity.pid,
-        processStartIdentity: identity.processStartIdentity,
-        protocolVersion: identity.protocolVersion,
-      },
-    );
-    return state;
+      return state;
+    } finally {
+      lease.close();
+    }
   }
 
   private async readReconciledState(jobId: string): Promise<JobState> {

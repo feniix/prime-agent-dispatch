@@ -50,6 +50,13 @@ revision. Confirmation consumes that token transactionally, creates a new
 attempt linked to the interrupted attempt, clears the current terminal view,
 and launches a worker that skips completed operations.
 
+When a resume preserves an existing worktree, the preview also binds a
+canonical snapshot of its files, symlinks, executable bits, branch, repository,
+and HEAD. Confirmation revalidates that snapshot after acquiring the job lease,
+and the worker validates it again before skipping any completed stage. A
+worktree changed after preview is preserved and rejected rather than committed
+under stale authorization.
+
 ## Consequences
 
 - Good, because a known model request, completed gate, commit, or terminal

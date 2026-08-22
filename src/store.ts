@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -9,6 +9,12 @@ import {
   rename,
 } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
+import {
+  digestContent,
+  digestFile,
+  DISPOSABLE_ARTIFACT_PREFIXES,
+  isSafeArtifactPath,
+} from "./artifacts.js";
 import {
   EventSchema,
   InferenceRequestUsageSchema,
@@ -47,11 +53,6 @@ import {
 
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
 const projectionQueues = new Map<string, Promise<void>>();
-const DISPOSABLE_ARTIFACT_PREFIXES = [
-  "prime-agent/home/.cache",
-  "prime-agent/home/.local",
-  "prime-agent/home/.prime/agent/kernel-venv",
-];
 
 export type LifecycleNotification = {
   deliveryKey: string;
@@ -120,6 +121,16 @@ type CheckpointRow = {
   completed_at: string | null;
 };
 
+type ResumeConfirmationRow = {
+  job_id: string;
+  source_attempt_id: string;
+  expected_revision: number;
+  context_hash: string;
+  plan_json: string;
+  expires_at: string;
+  used_at: string | null;
+};
+
 export type JobStoreOptions = {
   faultInjector?: (point: string) => void;
 };
@@ -150,9 +161,7 @@ export async function atomicWriteFile(
   await fsyncDirectory(dirname(path));
 }
 
-function sha256(content: string | Buffer): string {
-  return createHash("sha256").update(content).digest("hex");
-}
+const sha256 = digestContent;
 
 function notFound(path: string): NodeJS.ErrnoException {
   const error = new Error(
@@ -595,6 +604,7 @@ export class JobStore {
     const createdAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + ttlMs).toISOString();
     this.transaction("create_resume_confirmation", () => {
+      this.assertNotReservedForCleanupInTransaction(plan.jobId);
       const state = this.readStateFromDatabase(plan.jobId);
       const attempt = this.currentAttemptFromDatabase(plan.jobId);
       if (state.status !== "interrupted" || attempt.status !== "interrupted")
@@ -634,6 +644,49 @@ export class JobStore {
     return { confirmationToken, expiresAt, plan };
   }
 
+  async assertNotReservedForCleanup(jobId: string): Promise<void> {
+    await this.ensureImported(jobId);
+    this.assertNotReservedForCleanupInTransaction(jobId);
+  }
+
+  async readResumeConfirmation(
+    confirmationToken: string,
+    contextHash: string,
+    expectedJobId?: string,
+  ): Promise<{ plan: ResumePlan; expiresAt: string }> {
+    if (!/^[a-f0-9]{64}$/.test(contextHash))
+      throw new Error("invalid resume confirmation context hash");
+    const tokenHash = sha256(confirmationToken);
+    const row = this.database
+      .prepare(
+        `SELECT job_id, source_attempt_id, expected_revision, context_hash,
+                plan_json, expires_at, used_at
+         FROM resume_confirmations WHERE token_hash = ?`,
+      )
+      .get(tokenHash) as ResumeConfirmationRow | undefined;
+    if (!row) throw new Error("resume confirmation is invalid");
+    if (expectedJobId && row.job_id !== expectedJobId)
+      throw new Error("resume confirmation job mismatch");
+    if (row.used_at) throw new Error("resume confirmation was already used");
+    if (row.expires_at <= new Date().toISOString())
+      throw new Error("resume confirmation expired");
+    if (row.context_hash !== contextHash)
+      throw new Error("resume confirmation context mismatch");
+    await this.ensureImported(row.job_id);
+    this.assertNotReservedForCleanupInTransaction(row.job_id);
+    const plan = this.resumePlanFromConfirmationRow(row);
+    const current = this.readStateFromDatabase(row.job_id);
+    const source = this.currentAttemptFromDatabase(row.job_id);
+    if (
+      current.status !== "interrupted" ||
+      current.revision !== row.expected_revision ||
+      source.attemptId !== row.source_attempt_id ||
+      source.status !== "interrupted"
+    )
+      throw new Error("resume confirmation is stale");
+    return { plan, expiresAt: row.expires_at };
+  }
+
   async consumeResumeConfirmation(
     confirmationToken: string,
     contextHash: string,
@@ -654,17 +707,7 @@ export class JobStore {
                   plan_json, expires_at, used_at
            FROM resume_confirmations WHERE token_hash = ?`,
         )
-        .get(tokenHash) as
-        | {
-            job_id: string;
-            source_attempt_id: string;
-            expected_revision: number;
-            context_hash: string;
-            plan_json: string;
-            expires_at: string;
-            used_at: string | null;
-          }
-        | undefined;
+        .get(tokenHash) as ResumeConfirmationRow | undefined;
       if (!row) throw new Error("resume confirmation is invalid");
       if (expectedJobId && row.job_id !== expectedJobId)
         throw new Error("resume confirmation job mismatch");
@@ -672,9 +715,8 @@ export class JobStore {
       if (row.expires_at <= now) throw new Error("resume confirmation expired");
       if (row.context_hash !== contextHash)
         throw new Error("resume confirmation context mismatch");
-      const plan = ResumePlanSchema.parse(
-        parseSqliteJson(row.plan_json, "resume plan"),
-      );
+      this.assertNotReservedForCleanupInTransaction(row.job_id);
+      const plan = this.resumePlanFromConfirmationRow(row);
       const current = this.readStateFromDatabase(row.job_id);
       const source = this.currentAttemptFromDatabase(row.job_id);
       if (
@@ -1211,20 +1253,22 @@ export class JobStore {
       size_bytes: number;
     }[];
     for (const row of rows) {
-      if (
-        row.relative_path.startsWith("/") ||
-        row.relative_path.split("/").includes("..")
-      )
+      if (!isSafeArtifactPath(row.relative_path))
         throw new Error(
           `invalid authoritative artifact path: ${row.relative_path}`,
         );
       const path = join(this.jobDir(jobId), "artifacts", row.relative_path);
-      let content: Buffer;
+      let identity: { digest: string; sizeBytes: number };
       try {
-        content =
-          row.kind === "symlink"
-            ? Buffer.from(await readlink(path), "utf8")
-            : await readFile(path);
+        if (row.kind === "symlink") {
+          const target = await readlink(path);
+          identity = {
+            digest: digestContent(target),
+            sizeBytes: Buffer.byteLength(target),
+          };
+        } else {
+          identity = await digestFile(path);
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
           this.recordAudit(jobId, "artifact_missing", {
@@ -1237,16 +1281,19 @@ export class JobStore {
         }
         throw error;
       }
-      const digest = sha256(content);
-      if (digest === row.sha256 && content.length === row.size_bytes) continue;
+      if (
+        identity.digest === row.sha256 &&
+        identity.sizeBytes === row.size_bytes
+      )
+        continue;
       const quarantinePath = `${path}.quarantine-${Date.now()}-${randomUUID()}`;
       await rename(path, quarantinePath);
       this.recordAudit(jobId, "artifact_quarantined", {
         relativePath: row.relative_path,
         expectedSha256: row.sha256,
-        actualSha256: digest,
+        actualSha256: identity.digest,
         expectedSizeBytes: row.size_bytes,
-        actualSizeBytes: content.length,
+        actualSizeBytes: identity.sizeBytes,
         quarantinePath,
       });
       throw new Error(
@@ -1362,7 +1409,41 @@ export class JobStore {
     return this.attemptFromRow(row);
   }
 
+  private resumePlanFromConfirmationRow(
+    row: ResumeConfirmationRow,
+  ): ResumePlan {
+    const plan = ResumePlanSchema.parse(
+      parseSqliteJson(row.plan_json, "resume plan"),
+    );
+    if (
+      plan.jobId !== row.job_id ||
+      plan.sourceAttemptId !== row.source_attempt_id ||
+      plan.expectedRevision !== row.expected_revision
+    )
+      throw new Error("resume plan identity mismatch");
+    return plan;
+  }
+
+  private assertNotReservedForCleanupInTransaction(jobId: string): void {
+    const reservation = this.database
+      .prepare("SELECT run_id FROM cleanup_job_reservations WHERE job_id = ?")
+      .get(jobId) as { run_id: string } | undefined;
+    if (reservation)
+      throw new Error(`job is reserved by cleanup run ${reservation.run_id}`);
+  }
+
   private attemptFromRow(row: AttemptRow): ExecutionAttempt {
+    const resumePlan = row.resume_plan_json
+      ? ResumePlanSchema.parse(
+          parseSqliteJson(row.resume_plan_json, "resume plan"),
+        )
+      : undefined;
+    if (
+      resumePlan &&
+      (resumePlan.jobId !== row.job_id ||
+        resumePlan.sourceAttemptId !== row.resumed_from_attempt_id)
+    )
+      throw new Error("execution attempt resume plan identity mismatch");
     return ExecutionAttemptSchema.parse({
       attemptId: row.attempt_id,
       jobId: row.job_id,
@@ -1373,13 +1454,7 @@ export class JobStore {
       status: row.status,
       startedAt: row.started_at,
       ...(row.completed_at ? { completedAt: row.completed_at } : {}),
-      ...(row.resume_plan_json
-        ? {
-            resumePlan: ResumePlanSchema.parse(
-              parseSqliteJson(row.resume_plan_json, "resume plan"),
-            ),
-          }
-        : {}),
+      ...(resumePlan ? { resumePlan } : {}),
     });
   }
 
@@ -1845,12 +1920,12 @@ export class JobStore {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) await visit(path);
         else if (entry.isFile()) {
-          const content = await readFile(path);
           const metadata = await lstat(path);
+          const identity = await digestFile(path);
           output.push({
             relativePath: relative(root, path),
-            digest: sha256(content),
-            sizeBytes: content.length,
+            digest: identity.digest,
+            sizeBytes: identity.sizeBytes,
             publishedAt: metadata.mtime.toISOString(),
             kind: "file",
           });
@@ -1907,7 +1982,7 @@ export class JobStore {
     jobId: string,
     cursor: NotificationCursor,
   ): Promise<void> {
-    const digest = createHash("sha256").update(cursor.consumerId).digest("hex");
+    const digest = digestContent(cursor.consumerId);
     await this.repairProjection(
       jobId,
       join(this.jobDir(jobId), "notifications", `${digest}.json`),
