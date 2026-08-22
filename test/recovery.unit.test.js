@@ -12,6 +12,7 @@ import {
   JobStore,
   PrimeDispatcher,
   PrimeStartInputSchema,
+  resumeAuthorizationContextHash,
 } from "../dist/index.js";
 
 const exec = promisify(execFile);
@@ -156,6 +157,204 @@ test("current schema creates one auditable initial execution attempt", async () 
   } finally {
     database.close();
   }
+});
+
+test("resume recreates local provisioning before an incomplete Prime run", async () => {
+  const { store, request, worktreePath, branchName } = await repositoryStore(
+    "resume-after-provisioning",
+  );
+  const attempt = await store.currentAttempt(request.jobId);
+  await store.beginCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "worktree:prepare",
+    "worktree",
+    { worktreePath, branchName },
+  );
+  await store.completeCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "worktree:prepare",
+    { worktreePath, branchName },
+  );
+  await store.beginCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "model:provision",
+    "model_provisioning",
+  );
+  await store.completeCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "model:provision",
+    { runtimeVerified: true },
+  );
+  await interrupt(store, request);
+
+  const resume = await assessSafeResume(store, request.jobId);
+  assert.equal(resume.nextStage, "model_provisioning");
+  assert.deepEqual(resume.willRepeat, ["model_provisioning"]);
+  assert.ok(!resume.willNotRepeat.includes("model:provision"));
+});
+
+test("resume confirmation revalidates the stored plan identity", async () => {
+  const { root, store, request } = await initializedStore("bound-resume-plan");
+  await interrupt(store, request);
+  const state = await store.readState(request.jobId);
+  const attempt = await store.currentAttempt(request.jobId);
+  const contextHash = resumeAuthorizationContextHash(request.authorization);
+  const confirmation = await store.createResumeConfirmation(
+    plan(state, attempt),
+    contextHash,
+  );
+  const database = new DatabaseSync(join(root, CONTROL_DATABASE_NAME));
+  const row = database
+    .prepare("SELECT plan_json FROM resume_confirmations")
+    .get();
+  const stored = JSON.parse(row.plan_json);
+  database
+    .prepare("UPDATE resume_confirmations SET plan_json = ?")
+    .run(JSON.stringify({ ...stored, jobId: "another-job" }));
+  database.close();
+
+  await assert.rejects(
+    () =>
+      store.consumeResumeConfirmation(
+        confirmation.confirmationToken,
+        contextHash,
+        request.jobId,
+      ),
+    /resume plan identity mismatch/,
+  );
+
+  const repaired = new DatabaseSync(join(root, CONTROL_DATABASE_NAME));
+  repaired
+    .prepare("UPDATE resume_confirmations SET plan_json = ?")
+    .run(JSON.stringify(stored));
+  repaired.close();
+  await store.consumeResumeConfirmation(
+    confirmation.confirmationToken,
+    contextHash,
+    request.jobId,
+  );
+  const tampered = new DatabaseSync(join(root, CONTROL_DATABASE_NAME));
+  tampered
+    .prepare(
+      "UPDATE execution_attempts SET resume_plan_json = ? WHERE job_id = ? AND ordinal = 2",
+    )
+    .run(JSON.stringify({ ...stored, jobId: "another-job" }), request.jobId);
+  tampered.close();
+  await assert.rejects(
+    () => store.currentAttempt(request.jobId),
+    /execution attempt resume plan identity mismatch/,
+  );
+});
+
+test("resume rejects completed work with an incomplete dependency", async () => {
+  const { stateRoot, store, request, worktreePath, branchName } =
+    await repositoryStore("inconsistent-resume-evidence");
+  const attempt = await store.currentAttempt(request.jobId);
+  for (const [operationKey, stage, facts] of [
+    ["worktree:prepare", "worktree", { worktreePath, branchName }],
+    ["model:provision", "model_provisioning", { runtimeVerified: true }],
+    [
+      "prime:execute",
+      "prime_execution",
+      { agentResult: { summary: "done", metadata: {} } },
+    ],
+    ["prime:quiesce", "quiescence", { processTreeExited: true }],
+  ]) {
+    await store.beginCheckpoint(
+      request.jobId,
+      attempt.attemptId,
+      operationKey,
+      stage,
+      facts,
+    );
+    await store.completeCheckpoint(
+      request.jobId,
+      attempt.attemptId,
+      operationKey,
+      facts,
+    );
+  }
+  await interrupt(store, request);
+  const database = new DatabaseSync(join(stateRoot, CONTROL_DATABASE_NAME));
+  database
+    .prepare(
+      "UPDATE recovery_checkpoints SET status = 'retryable' WHERE attempt_id = ? AND operation_key = 'model:provision'",
+    )
+    .run(attempt.attemptId);
+  database.close();
+
+  await assert.rejects(
+    () => assessSafeResume(store, request.jobId),
+    /checkpoint dependencies are inconsistent/,
+  );
+});
+
+test("resume rejects an uncheckpointed worktree commit", async () => {
+  const { store, request, worktreePath, branchName } = await repositoryStore(
+    "uncheckpointed-commit",
+  );
+  const attempt = await store.currentAttempt(request.jobId);
+  await store.beginCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "worktree:prepare",
+    "worktree",
+  );
+  await store.completeCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "worktree:prepare",
+    { worktreePath, branchName },
+  );
+  await writeFile(join(worktreePath, "foreign.txt"), "foreign commit\n");
+  await git(worktreePath, "add", "foreign.txt");
+  await git(
+    worktreePath,
+    "-c",
+    "user.name=Foreign",
+    "-c",
+    "user.email=foreign@local.invalid",
+    "commit",
+    "-m",
+    "uncheckpointed",
+  );
+  await interrupt(store, request);
+
+  await assert.rejects(
+    () => assessSafeResume(store, request.jobId),
+    /HEAD changed before a commit checkpoint/,
+  );
+});
+
+test("resume rejects a replacement repository at the owned worktree path", async () => {
+  const { repo, store, request, worktreePath, branchName } =
+    await repositoryStore("replacement-repository");
+  const attempt = await store.currentAttempt(request.jobId);
+  await store.beginCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "worktree:prepare",
+    "worktree",
+  );
+  await store.completeCheckpoint(
+    request.jobId,
+    attempt.attemptId,
+    "worktree:prepare",
+    { worktreePath, branchName },
+  );
+  await git(repo, "worktree", "remove", "--force", worktreePath);
+  await exec("git", ["clone", repo, worktreePath]);
+  await git(worktreePath, "checkout", "-b", branchName, request.baseSha);
+  await interrupt(store, request);
+
+  await assert.rejects(
+    () => assessSafeResume(store, request.jobId),
+    /worktree repository identity changed/,
+  );
 });
 
 test("schema v1 upgrades in place and preserves terminal result evidence", async () => {
@@ -506,6 +705,25 @@ test("safe resume skips completed Prime work and completed gates", async () => {
   );
   assert.ok(resume.willNotRepeat.includes("prime:execute"));
   assert.ok(resume.willNotRepeat.includes("gate:0"));
+
+  const contextHash = resumeAuthorizationContextHash(request.authorization);
+  const confirmation = await store.createResumeConfirmation(
+    resume,
+    contextHash,
+  );
+  await store.consumeResumeConfirmation(
+    confirmation.confirmationToken,
+    contextHash,
+    request.jobId,
+  );
+  await interrupt(store, request);
+  const retried = await assessSafeResume(store, request.jobId);
+  assert.equal(retried.nextStage, "verification");
+  assert.equal(retried.agentResult.summary, "done");
+  assert.deepEqual(
+    retried.gateResults.map((gate) => gate.name),
+    ["first"],
+  );
 });
 
 test("an uncertain Prime request is preserved and never offered for replay", async () => {

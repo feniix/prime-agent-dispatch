@@ -31,7 +31,11 @@ import {
 } from "./policy.js";
 import { readProcessStartIdentity } from "./worker-identity.js";
 import { containWorkerSocketErrors } from "./ipc.js";
-import type { RecoveryStage, ResumePlan } from "./recovery.js";
+import {
+  STAGE_ORDER,
+  type RecoveryStage,
+  type ResumePlan,
+} from "./recovery.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -234,21 +238,9 @@ async function finalizeTerminalOutcome(
   );
 }
 
-const resumeStageOrder: readonly RecoveryStage[] = [
-  "worktree",
-  "model_provisioning",
-  "prime_execution",
-  "quiescence",
-  "verification",
-  "commit",
-  "terminal_materialization",
-];
-
 function shouldRunStage(plan: ResumePlan | undefined, stage: RecoveryStage) {
   if (!plan) return true;
-  return (
-    resumeStageOrder.indexOf(stage) >= resumeStageOrder.indexOf(plan.nextStage)
-  );
+  return STAGE_ORDER.indexOf(stage) >= STAGE_ORDER.indexOf(plan.nextStage);
 }
 
 async function syncInferenceUsage(current: JobState): Promise<JobState> {

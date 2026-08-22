@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -9,6 +9,12 @@ import {
   rename,
 } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
+import {
+  digestContent,
+  digestFile,
+  DISPOSABLE_ARTIFACT_PREFIXES,
+  isSafeArtifactPath,
+} from "./artifacts.js";
 import {
   EventSchema,
   InferenceRequestUsageSchema,
@@ -47,11 +53,6 @@ import {
 
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
 const projectionQueues = new Map<string, Promise<void>>();
-const DISPOSABLE_ARTIFACT_PREFIXES = [
-  "prime-agent/home/.cache",
-  "prime-agent/home/.local",
-  "prime-agent/home/.prime/agent/kernel-venv",
-];
 
 export type LifecycleNotification = {
   deliveryKey: string;
@@ -150,9 +151,7 @@ export async function atomicWriteFile(
   await fsyncDirectory(dirname(path));
 }
 
-function sha256(content: string | Buffer): string {
-  return createHash("sha256").update(content).digest("hex");
-}
+const sha256 = digestContent;
 
 function notFound(path: string): NodeJS.ErrnoException {
   const error = new Error(
@@ -675,6 +674,12 @@ export class JobStore {
       const plan = ResumePlanSchema.parse(
         parseSqliteJson(row.plan_json, "resume plan"),
       );
+      if (
+        plan.jobId !== row.job_id ||
+        plan.sourceAttemptId !== row.source_attempt_id ||
+        plan.expectedRevision !== row.expected_revision
+      )
+        throw new Error("resume plan identity mismatch");
       const current = this.readStateFromDatabase(row.job_id);
       const source = this.currentAttemptFromDatabase(row.job_id);
       if (
@@ -1211,20 +1216,22 @@ export class JobStore {
       size_bytes: number;
     }[];
     for (const row of rows) {
-      if (
-        row.relative_path.startsWith("/") ||
-        row.relative_path.split("/").includes("..")
-      )
+      if (!isSafeArtifactPath(row.relative_path))
         throw new Error(
           `invalid authoritative artifact path: ${row.relative_path}`,
         );
       const path = join(this.jobDir(jobId), "artifacts", row.relative_path);
-      let content: Buffer;
+      let identity: { digest: string; sizeBytes: number };
       try {
-        content =
-          row.kind === "symlink"
-            ? Buffer.from(await readlink(path), "utf8")
-            : await readFile(path);
+        if (row.kind === "symlink") {
+          const target = await readlink(path);
+          identity = {
+            digest: digestContent(target),
+            sizeBytes: Buffer.byteLength(target),
+          };
+        } else {
+          identity = await digestFile(path);
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
           this.recordAudit(jobId, "artifact_missing", {
@@ -1237,16 +1244,19 @@ export class JobStore {
         }
         throw error;
       }
-      const digest = sha256(content);
-      if (digest === row.sha256 && content.length === row.size_bytes) continue;
+      if (
+        identity.digest === row.sha256 &&
+        identity.sizeBytes === row.size_bytes
+      )
+        continue;
       const quarantinePath = `${path}.quarantine-${Date.now()}-${randomUUID()}`;
       await rename(path, quarantinePath);
       this.recordAudit(jobId, "artifact_quarantined", {
         relativePath: row.relative_path,
         expectedSha256: row.sha256,
-        actualSha256: digest,
+        actualSha256: identity.digest,
         expectedSizeBytes: row.size_bytes,
-        actualSizeBytes: content.length,
+        actualSizeBytes: identity.sizeBytes,
         quarantinePath,
       });
       throw new Error(
@@ -1363,6 +1373,17 @@ export class JobStore {
   }
 
   private attemptFromRow(row: AttemptRow): ExecutionAttempt {
+    const resumePlan = row.resume_plan_json
+      ? ResumePlanSchema.parse(
+          parseSqliteJson(row.resume_plan_json, "resume plan"),
+        )
+      : undefined;
+    if (
+      resumePlan &&
+      (resumePlan.jobId !== row.job_id ||
+        resumePlan.sourceAttemptId !== row.resumed_from_attempt_id)
+    )
+      throw new Error("execution attempt resume plan identity mismatch");
     return ExecutionAttemptSchema.parse({
       attemptId: row.attempt_id,
       jobId: row.job_id,
@@ -1373,13 +1394,7 @@ export class JobStore {
       status: row.status,
       startedAt: row.started_at,
       ...(row.completed_at ? { completedAt: row.completed_at } : {}),
-      ...(row.resume_plan_json
-        ? {
-            resumePlan: ResumePlanSchema.parse(
-              parseSqliteJson(row.resume_plan_json, "resume plan"),
-            ),
-          }
-        : {}),
+      ...(resumePlan ? { resumePlan } : {}),
     });
   }
 
@@ -1845,12 +1860,12 @@ export class JobStore {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) await visit(path);
         else if (entry.isFile()) {
-          const content = await readFile(path);
           const metadata = await lstat(path);
+          const identity = await digestFile(path);
           output.push({
             relativePath: relative(root, path),
-            digest: sha256(content),
-            sizeBytes: content.length,
+            digest: identity.digest,
+            sizeBytes: identity.sizeBytes,
             publishedAt: metadata.mtime.toISOString(),
             kind: "file",
           });
@@ -1907,7 +1922,7 @@ export class JobStore {
     jobId: string,
     cursor: NotificationCursor,
   ): Promise<void> {
-    const digest = createHash("sha256").update(cursor.consumerId).digest("hex");
+    const digest = digestContent(cursor.consumerId);
     await this.repairProjection(
       jobId,
       join(this.jobDir(jobId), "notifications", `${digest}.json`),
