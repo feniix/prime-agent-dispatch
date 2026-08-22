@@ -36,6 +36,7 @@ import {
   type RecoveryStage,
   type ResumePlan,
 } from "./recovery.js";
+import { assertResumePlanEvidence } from "./resume.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -327,6 +328,7 @@ async function main(): Promise<void> {
       workerProtocolVersion: workerIdentity!.protocolVersion,
       socketPath: workerIdentity!.socketPath,
     });
+    if (resumePlan) await assertResumePlanEvidence(store, jobId, resumePlan);
     assertJobActive();
     const executionBackend = new UnsafeLocalExecutionBackend();
     const executionPlan = executionBackend.plan(request, stateRoot);

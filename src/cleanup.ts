@@ -12,7 +12,7 @@ import type { RetentionPolicy } from "./host-config.js";
 import { RetentionPolicySchema } from "./host-config.js";
 import { git } from "./process.js";
 import { acquireProcessDirectoryLock } from "./process-lock.js";
-import type { JobState } from "./schemas.js";
+import { JobStateSchema, type JobState } from "./schemas.js";
 import {
   immediateTransaction,
   openControlDatabase,
@@ -459,7 +459,12 @@ export class CleanupManager {
       throw new Error(
         "cleanup plan no longer matches its authoritative snapshot",
       );
-    if (run.status === "completed") return this.readPlan(runId);
+    if (run.status === "completed") {
+      this.database
+        .prepare("DELETE FROM cleanup_job_reservations WHERE run_id = ?")
+        .run(runId);
+      return this.readPlan(runId);
+    }
     immediateTransaction(this.database, () => {
       this.database
         .prepare(
@@ -468,6 +473,7 @@ export class CleanupManager {
         .run(new Date().toISOString(), runId);
     });
     try {
+      this.reserveJobs(runId, actions);
       for (const action of actions) {
         if (action.decision === "keep") {
           if (action.status === "planned")
@@ -489,6 +495,9 @@ export class CleanupManager {
             "UPDATE cleanup_runs SET status = 'completed', completed_at = ?, reclaimed_bytes = ? WHERE run_id = ?",
           )
           .run(completedAt, reclaimed.bytes, runId);
+        this.database
+          .prepare("DELETE FROM cleanup_job_reservations WHERE run_id = ?")
+          .run(runId);
         this.audit(undefined, "cleanup_completed", {
           runId,
           reclaimedBytes: reclaimed.bytes,
@@ -505,6 +514,20 @@ export class CleanupManager {
       return this.readPlan(runId);
     } catch (error) {
       immediateTransaction(this.database, () => {
+        const started = this.database
+          .prepare(
+            `SELECT 1
+             FROM cleanup_actions
+             WHERE run_id = ?
+               AND decision = 'delete'
+               AND status IN ('applying', 'applied')
+             LIMIT 1`,
+          )
+          .get(runId);
+        if (!started)
+          this.database
+            .prepare("DELETE FROM cleanup_job_reservations WHERE run_id = ?")
+            .run(runId);
         this.database
           .prepare(
             "UPDATE cleanup_runs SET status = 'interrupted' WHERE run_id = ?",
@@ -539,6 +562,14 @@ export class CleanupManager {
   ): Promise<string | undefined> {
     if (!terminalStatuses.has(state.status))
       return `job is nonterminal (${state.status})`;
+    const databaseUnsafe = this.databaseUnsafeReason(jobId);
+    if (databaseUnsafe) return databaseUnsafe;
+    if (await this.containsQuarantine(this.store.jobDir(jobId)))
+      return "quarantined content is present";
+    return undefined;
+  }
+
+  private databaseUnsafeReason(jobId: string): string | undefined {
     const lease = this.database
       .prepare("SELECT owner_json FROM leases")
       .all() as Array<{ owner_json: string }>;
@@ -574,9 +605,86 @@ export class CleanupManager {
       .get(jobId);
     if (corrupt)
       return "authority audit records corrupt or quarantined evidence";
-    if (await this.containsQuarantine(this.store.jobDir(jobId)))
-      return "quarantined content is present";
     return undefined;
+  }
+
+  private reserveJobs(runId: string, actions: CleanupAction[]): void {
+    const jobs = new Map<
+      string,
+      { stateRevision: number; status: JobState["status"] }
+    >();
+    for (const action of actions) {
+      if (action.decision !== "delete" || !action.jobId) continue;
+      const stateRevision = action.expected.stateRevision;
+      const status = action.expected.status;
+      if (
+        !Number.isSafeInteger(stateRevision) ||
+        !terminalStatuses.has(status as JobState["status"])
+      )
+        throw new Error("cleanup action has corrupt terminal state identity");
+      const identity = {
+        stateRevision: stateRevision as number,
+        status: status as JobState["status"],
+      };
+      const prior = jobs.get(action.jobId);
+      if (
+        prior &&
+        (prior.stateRevision !== identity.stateRevision ||
+          prior.status !== identity.status)
+      )
+        throw new Error(
+          `cleanup plan has inconsistent state identity for job ${action.jobId}`,
+        );
+      jobs.set(action.jobId, identity);
+    }
+    const acquiredAt = new Date().toISOString();
+    immediateTransaction(this.database, () => {
+      for (const [jobId, expected] of jobs) {
+        const row = this.database
+          .prepare("SELECT state_json FROM jobs WHERE job_id = ?")
+          .get(jobId) as { state_json: string } | undefined;
+        if (!row) throw new Error(`cleanup job ${jobId} no longer exists`);
+        const state = JobStateSchema.parse(
+          parseSqliteJson(row.state_json, "job state"),
+        );
+        if (
+          state.revision !== expected.stateRevision ||
+          state.status !== expected.status
+        )
+          throw new Error(`job ${jobId} changed after cleanup planning`);
+        const unsafe = this.databaseUnsafeReason(jobId);
+        if (unsafe)
+          throw new Error(`job ${jobId} is no longer cleanup-safe: ${unsafe}`);
+        const existing = this.database
+          .prepare(
+            `SELECT run_id, state_revision
+             FROM cleanup_job_reservations
+             WHERE job_id = ?`,
+          )
+          .get(jobId) as { run_id: string; state_revision: number } | undefined;
+        if (existing) {
+          if (
+            existing.run_id !== runId ||
+            existing.state_revision !== expected.stateRevision
+          )
+            throw new Error(
+              `job ${jobId} is reserved by cleanup run ${existing.run_id}`,
+            );
+          continue;
+        }
+        this.database
+          .prepare(
+            `INSERT INTO cleanup_job_reservations(
+               job_id, run_id, state_revision, acquired_at
+             ) VALUES (?, ?, ?, ?)`,
+          )
+          .run(jobId, runId, expected.stateRevision, acquiredAt);
+        this.audit(jobId, "cleanup_job_reserved", {
+          runId,
+          stateRevision: expected.stateRevision,
+        });
+      }
+    });
   }
 
   private async containsQuarantine(path: string): Promise<boolean> {

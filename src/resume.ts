@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, readdir, readlink, realpath } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import canonicalize from "canonicalize";
 import { z } from "zod";
+import { digestContent, digestFile } from "./artifacts.js";
 import type { JobStore } from "./store.js";
 import type { Authorization, GateResult } from "./schemas.js";
 import {
@@ -87,6 +88,7 @@ export async function assessSafeResume(
   store: JobStore,
   jobId: string,
 ): Promise<ResumePlan> {
+  await store.assertNotReservedForCleanup(jobId);
   const [request, state, attempt] = await Promise.all([
     store.readRequest(jobId),
     store.readState(jobId),
@@ -219,14 +221,20 @@ export async function assessSafeResume(
   }
 
   const completedWorktree = completed(checkpointMap.get("worktree:prepare"));
-  if (completedWorktree)
+  let worktreeSnapshotSha256: string | undefined;
+  if (completedWorktree) {
+    const completedCommit = completed(checkpointMap.get("git:commit"));
     await verifyPreservedWorktree(
       request.canonicalRepoPath,
       request.baseSha,
       state.worktreePath,
       state.branchName,
-      completed(checkpointMap.get("git:commit")),
+      completedCommit
+        ? CommitFactsSchema.parse(completedCommit.facts).commitSha
+        : undefined,
     );
+    worktreeSnapshotSha256 = await snapshotWorktree(state.worktreePath!);
+  }
 
   const completedPrime = completed(checkpointMap.get("prime:execute"));
   const completedProvisioning = completed(checkpointMap.get("model:provision"));
@@ -329,12 +337,48 @@ export async function assessSafeResume(
     willNotRepeat,
     ...(state.worktreePath ? { worktreePath: state.worktreePath } : {}),
     ...(state.branchName ? { branchName: state.branchName } : {}),
+    ...(worktreeSnapshotSha256 ? { worktreeSnapshotSha256 } : {}),
     ...(agentResult ? { agentResult } : {}),
     gateResults,
     ...(commitFacts?.commitSha ? { commitSha: commitFacts.commitSha } : {}),
     ...(commitFacts ? { noChanges: commitFacts.noChanges } : {}),
     rationale: `next action ${nextStage} is mechanically safe; uncertain model calls, gates, and external effects are never replayed`,
   });
+}
+
+export async function assertResumePlanEvidence(
+  store: JobStore,
+  jobId: string,
+  plan: ResumePlan,
+): Promise<void> {
+  if (plan.jobId !== jobId)
+    throw new ResumeUnavailableError("resume plan job identity changed");
+  if (plan.nextStage === "worktree") return;
+  if (!plan.worktreePath || !plan.branchName || !plan.worktreeSnapshotSha256)
+    throw new ResumeUnavailableError(
+      "resume plan omitted the preserved worktree snapshot",
+    );
+  const [request, state] = await Promise.all([
+    store.readRequest(jobId),
+    store.readState(jobId),
+  ]);
+  if (
+    state.worktreePath !== plan.worktreePath ||
+    state.branchName !== plan.branchName
+  )
+    throw new ResumeUnavailableError("preserved worktree identity changed");
+  await verifyPreservedWorktree(
+    request.canonicalRepoPath,
+    request.baseSha,
+    plan.worktreePath,
+    plan.branchName,
+    plan.commitSha,
+  );
+  const currentSnapshot = await snapshotWorktree(plan.worktreePath);
+  if (currentSnapshot !== plan.worktreeSnapshotSha256)
+    throw new ResumeUnavailableError(
+      "preserved worktree contents changed after resume preview",
+    );
 }
 
 function mergeResumeEvidence(
@@ -523,7 +567,7 @@ async function verifyPreservedWorktree(
   baseSha: string,
   worktreePath?: string,
   branchName?: string,
-  commitCheckpoint?: RecoveryCheckpoint,
+  expectedCommit?: string,
 ): Promise<void> {
   if (!worktreePath || !branchName)
     throw new ResumeUnavailableError("worktree identity is incomplete");
@@ -545,9 +589,6 @@ async function verifyPreservedWorktree(
     throw new ResumeUnavailableError("worktree repository identity changed");
   if (branch !== `refs/heads/${branchName}`)
     throw new ResumeUnavailableError("worktree branch identity changed");
-  const expectedCommit = commitCheckpoint
-    ? CommitFactsSchema.parse(commitCheckpoint.facts).commitSha
-    : undefined;
   if (expectedCommit && head !== expectedCommit)
     throw new ResumeUnavailableError(
       "worktree HEAD changed after commit checkpoint",
@@ -556,4 +597,48 @@ async function verifyPreservedWorktree(
     throw new ResumeUnavailableError(
       "worktree HEAD changed before a commit checkpoint",
     );
+}
+
+async function snapshotWorktree(worktreePath: string): Promise<string> {
+  const manifest: unknown[][] = [];
+  const visit = async (path: string, name: string, root = false) => {
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink()) {
+      const target = await readlink(path);
+      manifest.push([
+        "symlink",
+        name,
+        Buffer.byteLength(target),
+        digestContent(target),
+      ]);
+      return;
+    }
+    if (metadata.isFile()) {
+      const identity = await digestFile(path);
+      const executable = metadata.mode & 0o111 ? "x" : "-";
+      manifest.push([
+        "file",
+        name,
+        executable,
+        identity.sizeBytes,
+        identity.digest,
+      ]);
+      return;
+    }
+    if (!metadata.isDirectory())
+      throw new ResumeUnavailableError(
+        `unsupported worktree entry in resume snapshot: ${name}`,
+      );
+    manifest.push(["directory", name]);
+    const entries = await readdir(path, { withFileTypes: true });
+    entries.sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    );
+    for (const entry of entries) {
+      if (root && entry.name === ".git") continue;
+      await visit(join(path, entry.name), `${name}/${entry.name}`);
+    }
+  };
+  await visit(worktreePath, ".", true);
+  return digestContent(JSON.stringify(manifest));
 }

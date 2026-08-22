@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export const CONTROL_DATABASE_NAME = "control-plane.sqlite3";
-export const CONTROL_SCHEMA_VERSION = 3;
+export const CONTROL_SCHEMA_VERSION = 4;
 
 export type ControlDatabase = DatabaseSync;
 
@@ -334,6 +334,45 @@ function migrate(database: ControlDatabase): void {
         .run(
           3,
           "checkpointed bounded evidence retention",
+          new Date().toISOString(),
+        );
+    });
+
+  const afterCleanup = database
+    .prepare(
+      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+    )
+    .get() as { version: number };
+  if (afterCleanup.version < 4)
+    immediateTransaction(database, () => {
+      const locked = database
+        .prepare(
+          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+        )
+        .get() as { version: number };
+      if (locked.version >= 4) return;
+      if (locked.version !== 3)
+        throw new Error(
+          `unsupported control database schema ${locked.version}`,
+        );
+      database.exec(`
+        CREATE TABLE cleanup_job_reservations (
+          job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE RESTRICT,
+          run_id TEXT NOT NULL REFERENCES cleanup_runs(run_id) ON DELETE RESTRICT,
+          state_revision INTEGER NOT NULL CHECK (state_revision >= 0),
+          acquired_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX cleanup_job_reservations_run
+          ON cleanup_job_reservations(run_id, job_id);
+      `);
+      database
+        .prepare(
+          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+        )
+        .run(
+          4,
+          "durable per-job cleanup reservations",
           new Date().toISOString(),
         );
     });

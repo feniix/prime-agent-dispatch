@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import {
   assessSafeResume,
   CONTROL_DATABASE_NAME,
+  GlobalJobLease,
   JobStore,
   PrimeDispatcher,
   PrimeStartInputSchema,
@@ -152,7 +153,7 @@ test("current schema creates one auditable initial execution attempt", async () 
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      3,
+      4,
     );
   } finally {
     database.close();
@@ -972,4 +973,80 @@ test("an owner-confirmed resume creates a linked attempt and skips completed wor
       .map((checkpoint) => checkpoint.operationKey),
     ["gate:1"],
   );
+});
+
+test("resume confirmation rejects worktree changes made after preview", async () => {
+  const { stateRoot, store, request, worktreePath, branchName } =
+    await repositoryStore("resume-snapshot-binding");
+  const source = await store.currentAttempt(request.jobId);
+  for (const [operationKey, stage, facts] of [
+    ["worktree:prepare", "worktree", { worktreePath, branchName }],
+    ["model:provision", "model_provisioning", { runtimeVerified: true }],
+    [
+      "prime:execute",
+      "prime_execution",
+      { agentResult: { summary: "preserved result", metadata: {} } },
+    ],
+    ["prime:quiesce", "quiescence", { processTreeExited: true }],
+  ]) {
+    await store.beginCheckpoint(
+      request.jobId,
+      source.attemptId,
+      operationKey,
+      stage,
+    );
+    await store.completeCheckpoint(
+      request.jobId,
+      source.attemptId,
+      operationKey,
+      facts,
+    );
+  }
+  await store.updateState(request.jobId, "running");
+  await store.updateState(request.jobId, "verifying");
+  await store.beginCheckpoint(
+    request.jobId,
+    source.attemptId,
+    "gate:0",
+    "verification",
+  );
+  await store.completeCheckpoint(request.jobId, source.attemptId, "gate:0", {
+    gateIndex: 0,
+    gateResult: {
+      name: "first",
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      output: "",
+    },
+  });
+  await interrupt(store, request);
+
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const preview = await dispatcher.previewResume(
+    request.jobId,
+    request.authorization,
+  );
+  assert.match(preview.plan.worktreeSnapshotSha256, /^[a-f0-9]{64}$/);
+  await writeFile(
+    join(worktreePath, "injected-after-preview.txt"),
+    "not reviewed\n",
+  );
+
+  await assert.rejects(
+    () =>
+      dispatcher.resumeConfirmed(
+        request.jobId,
+        preview.confirmationToken,
+        request.authorization,
+      ),
+    /worktree contents changed after resume preview/,
+  );
+  assert.equal((await store.readState(request.jobId)).status, "interrupted");
+  const replacement = new GlobalJobLease(stateRoot);
+  const token = await replacement.acquire("replacement");
+  await replacement.release(token);
+  replacement.close();
+  dispatcher.store.close();
+  store.close();
 });

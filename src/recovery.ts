@@ -36,6 +36,10 @@ export const ResumePlanSchema = z.object({
   willNotRepeat: z.array(z.string()),
   worktreePath: z.string().optional(),
   branchName: z.string().optional(),
+  worktreeSnapshotSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   agentResult: z
     .object({
       summary: z.string(),

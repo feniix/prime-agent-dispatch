@@ -122,6 +122,15 @@ export class GlobalJobLease {
     });
     while (true) {
       const acquired = immediateTransaction(this.database, () => {
+        const cleanupReservation = this.database
+          .prepare(
+            "SELECT run_id FROM cleanup_job_reservations WHERE job_id = ?",
+          )
+          .get(jobId) as { run_id: string } | undefined;
+        if (cleanupReservation)
+          throw new Error(
+            `job is reserved by cleanup run ${cleanupReservation.run_id}`,
+          );
         if (this.readRow()) return false;
         this.database
           .prepare(

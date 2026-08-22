@@ -26,7 +26,11 @@ import {
   workerIdentityFromState,
   type WorkerVerification,
 } from "./worker-identity.js";
-import { assessSafeResume, resumeAuthorizationContextHash } from "./resume.js";
+import {
+  assertResumePlanEvidence,
+  assessSafeResume,
+  resumeAuthorizationContextHash,
+} from "./resume.js";
 
 type VerifyWorkerIdentity = (
   identity: NonNullable<ReturnType<typeof workerIdentityFromState>>,
@@ -168,6 +172,12 @@ export class PrimeDispatcher {
       nonce: workerNonce,
     };
     try {
+      const pending = await this.store.readResumeConfirmation(
+        confirmationToken,
+        resumeAuthorizationContextHash(authorization),
+        jobId,
+      );
+      await assertResumePlanEvidence(this.store, jobId, pending.plan);
       const resumed = await this.store.consumeResumeConfirmation(
         confirmationToken,
         resumeAuthorizationContextHash(authorization),

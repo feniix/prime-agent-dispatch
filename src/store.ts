@@ -121,6 +121,16 @@ type CheckpointRow = {
   completed_at: string | null;
 };
 
+type ResumeConfirmationRow = {
+  job_id: string;
+  source_attempt_id: string;
+  expected_revision: number;
+  context_hash: string;
+  plan_json: string;
+  expires_at: string;
+  used_at: string | null;
+};
+
 export type JobStoreOptions = {
   faultInjector?: (point: string) => void;
 };
@@ -594,6 +604,7 @@ export class JobStore {
     const createdAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + ttlMs).toISOString();
     this.transaction("create_resume_confirmation", () => {
+      this.assertNotReservedForCleanupInTransaction(plan.jobId);
       const state = this.readStateFromDatabase(plan.jobId);
       const attempt = this.currentAttemptFromDatabase(plan.jobId);
       if (state.status !== "interrupted" || attempt.status !== "interrupted")
@@ -633,6 +644,49 @@ export class JobStore {
     return { confirmationToken, expiresAt, plan };
   }
 
+  async assertNotReservedForCleanup(jobId: string): Promise<void> {
+    await this.ensureImported(jobId);
+    this.assertNotReservedForCleanupInTransaction(jobId);
+  }
+
+  async readResumeConfirmation(
+    confirmationToken: string,
+    contextHash: string,
+    expectedJobId?: string,
+  ): Promise<{ plan: ResumePlan; expiresAt: string }> {
+    if (!/^[a-f0-9]{64}$/.test(contextHash))
+      throw new Error("invalid resume confirmation context hash");
+    const tokenHash = sha256(confirmationToken);
+    const row = this.database
+      .prepare(
+        `SELECT job_id, source_attempt_id, expected_revision, context_hash,
+                plan_json, expires_at, used_at
+         FROM resume_confirmations WHERE token_hash = ?`,
+      )
+      .get(tokenHash) as ResumeConfirmationRow | undefined;
+    if (!row) throw new Error("resume confirmation is invalid");
+    if (expectedJobId && row.job_id !== expectedJobId)
+      throw new Error("resume confirmation job mismatch");
+    if (row.used_at) throw new Error("resume confirmation was already used");
+    if (row.expires_at <= new Date().toISOString())
+      throw new Error("resume confirmation expired");
+    if (row.context_hash !== contextHash)
+      throw new Error("resume confirmation context mismatch");
+    await this.ensureImported(row.job_id);
+    this.assertNotReservedForCleanupInTransaction(row.job_id);
+    const plan = this.resumePlanFromConfirmationRow(row);
+    const current = this.readStateFromDatabase(row.job_id);
+    const source = this.currentAttemptFromDatabase(row.job_id);
+    if (
+      current.status !== "interrupted" ||
+      current.revision !== row.expected_revision ||
+      source.attemptId !== row.source_attempt_id ||
+      source.status !== "interrupted"
+    )
+      throw new Error("resume confirmation is stale");
+    return { plan, expiresAt: row.expires_at };
+  }
+
   async consumeResumeConfirmation(
     confirmationToken: string,
     contextHash: string,
@@ -653,17 +707,7 @@ export class JobStore {
                   plan_json, expires_at, used_at
            FROM resume_confirmations WHERE token_hash = ?`,
         )
-        .get(tokenHash) as
-        | {
-            job_id: string;
-            source_attempt_id: string;
-            expected_revision: number;
-            context_hash: string;
-            plan_json: string;
-            expires_at: string;
-            used_at: string | null;
-          }
-        | undefined;
+        .get(tokenHash) as ResumeConfirmationRow | undefined;
       if (!row) throw new Error("resume confirmation is invalid");
       if (expectedJobId && row.job_id !== expectedJobId)
         throw new Error("resume confirmation job mismatch");
@@ -671,15 +715,8 @@ export class JobStore {
       if (row.expires_at <= now) throw new Error("resume confirmation expired");
       if (row.context_hash !== contextHash)
         throw new Error("resume confirmation context mismatch");
-      const plan = ResumePlanSchema.parse(
-        parseSqliteJson(row.plan_json, "resume plan"),
-      );
-      if (
-        plan.jobId !== row.job_id ||
-        plan.sourceAttemptId !== row.source_attempt_id ||
-        plan.expectedRevision !== row.expected_revision
-      )
-        throw new Error("resume plan identity mismatch");
+      this.assertNotReservedForCleanupInTransaction(row.job_id);
+      const plan = this.resumePlanFromConfirmationRow(row);
       const current = this.readStateFromDatabase(row.job_id);
       const source = this.currentAttemptFromDatabase(row.job_id);
       if (
@@ -1370,6 +1407,29 @@ export class JobStore {
       .get(jobId) as AttemptRow | undefined;
     if (!row) throw new Error(`job ${jobId} has no execution attempt`);
     return this.attemptFromRow(row);
+  }
+
+  private resumePlanFromConfirmationRow(
+    row: ResumeConfirmationRow,
+  ): ResumePlan {
+    const plan = ResumePlanSchema.parse(
+      parseSqliteJson(row.plan_json, "resume plan"),
+    );
+    if (
+      plan.jobId !== row.job_id ||
+      plan.sourceAttemptId !== row.source_attempt_id ||
+      plan.expectedRevision !== row.expected_revision
+    )
+      throw new Error("resume plan identity mismatch");
+    return plan;
+  }
+
+  private assertNotReservedForCleanupInTransaction(jobId: string): void {
+    const reservation = this.database
+      .prepare("SELECT run_id FROM cleanup_job_reservations WHERE job_id = ?")
+      .get(jobId) as { run_id: string } | undefined;
+    if (reservation)
+      throw new Error(`job is reserved by cleanup run ${reservation.run_id}`);
   }
 
   private attemptFromRow(row: AttemptRow): ExecutionAttempt {

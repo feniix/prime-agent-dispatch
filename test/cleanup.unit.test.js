@@ -14,8 +14,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import {
+  assessSafeResume,
   CleanupManager,
   CONTROL_DATABASE_NAME,
+  GlobalJobLease,
   JobStore,
   PrimeStartInputSchema,
   RetentionPolicySchema,
@@ -161,8 +163,18 @@ test("an interrupted deletion resumes idempotently without losing its audit trai
       /injected cleanup crash/,
     );
     assert.equal(manager.readPlan(planned.runId).status, "interrupted");
+    const blocked = new GlobalJobLease(root);
+    await assert.rejects(
+      () => blocked.acquire("cleanup-job"),
+      /reserved by cleanup run/,
+    );
+    blocked.close();
     const resumed = await manager.apply(planned.runId);
     assert.equal(resumed.status, "completed");
+    const released = new GlobalJobLease(root);
+    const token = await released.acquire("cleanup-job");
+    await released.release(token);
+    released.close();
     assert.ok(
       manager.store
         .readAuthorityAudit()
@@ -207,6 +219,78 @@ test("overlapping cleanup plans account each deletion only once", async () => {
       ),
     );
   } finally {
+    manager.close();
+  }
+});
+
+test("a cleanup reservation prevents resume until the exact plan completes", async () => {
+  const { root, request } = await fixture({ terminal: false });
+  const store = new JobStore(root);
+  await store.finalizeTerminal(
+    {
+      schemaVersion: 1,
+      jobId: request.jobId,
+      status: "interrupted",
+      summary: "worker stopped",
+      baseSha: request.baseSha,
+      noChanges: true,
+      gateResults: [],
+      completedAt: "2026-08-20T21:00:00.000Z",
+    },
+    { error: "worker stopped", summary: "worker stopped", noChanges: true },
+  );
+  const manager = new CleanupManager(root, { now: () => now });
+  try {
+    const planned = await manager.plan(policy());
+    const resumePlan = await assessSafeResume(store, request.jobId);
+    const contextHash = resumeAuthorizationContextHash(request.authorization);
+    const confirmation = await store.createResumeConfirmation(
+      resumePlan,
+      contextHash,
+    );
+    let reachedResolve;
+    let continueResolve;
+    const reached = new Promise((resolve) => (reachedResolve = resolve));
+    const proceed = new Promise((resolve) => (continueResolve = resolve));
+    const applyAction = manager.applyAction.bind(manager);
+    manager.applyAction = async (...args) => {
+      reachedResolve();
+      await proceed;
+      return await applyAction(...args);
+    };
+
+    const applying = manager.apply(planned.runId);
+    await reached;
+    const blockedLease = new GlobalJobLease(root);
+    await assert.rejects(
+      () => blockedLease.acquire(request.jobId),
+      /reserved by cleanup run/,
+    );
+    blockedLease.close();
+    await assert.rejects(
+      () =>
+        store.consumeResumeConfirmation(
+          confirmation.confirmationToken,
+          contextHash,
+          request.jobId,
+        ),
+      /reserved by cleanup run/,
+    );
+    continueResolve();
+    assert.equal((await applying).status, "completed");
+
+    const database = new DatabaseSync(join(root, CONTROL_DATABASE_NAME));
+    assert.equal(
+      database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM cleanup_job_reservations WHERE job_id = ?",
+        )
+        .get(request.jobId).count,
+      0,
+    );
+    database.close();
+  } finally {
+    store.close();
     manager.close();
   }
 });
