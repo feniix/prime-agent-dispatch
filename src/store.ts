@@ -50,6 +50,28 @@ import {
   type RecoveryStage,
   type ResumePlan,
 } from "./recovery.js";
+import {
+  ChildAttemptSchema,
+  ChildSpawnEnvelopeSchema,
+  ChildTerminalEvidenceSchema,
+  ChildTreePolicySchema,
+  ChildTreeSnapshotSchema,
+  DEFAULT_CHILD_TREE_POLICY,
+  LogicalChildSchema,
+  canonicalDigest,
+  childEnvelopeDigest,
+  terminalChildStatuses,
+  type ChildAttempt,
+  type ChildDecision,
+  type ChildSpawnEnvelope,
+  type ChildStatus,
+  type ChildTerminalEvidence,
+  type ChildTreePolicy,
+  type ChildTreeSnapshot,
+  type LogicalChild,
+  NativeRlmSpawnHandleSchema,
+  type NativeRlmSpawnHandle,
+} from "./children.js";
 
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
 const projectionQueues = new Map<string, Promise<void>>();
@@ -129,6 +151,60 @@ type ResumeConfirmationRow = {
   plan_json: string;
   expires_at: string;
   used_at: string | null;
+};
+
+type ChildTreeRow = {
+  job_id: string;
+  policy_json: string;
+  policy_sha256: string;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type LogicalChildRow = {
+  child_id: string;
+  job_id: string;
+  envelope_json: string;
+  envelope_sha256: string;
+  decision: ChildDecision;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type ChildAttemptRow = {
+  attempt_id: string;
+  child_id: string;
+  job_id: string;
+  ordinal: number;
+  previous_attempt_id: string | null;
+  status: ChildStatus;
+  inference_json: string;
+  native_child_id: string | null;
+  native_handle_json: string | null;
+  started_at: string;
+  completed_at: string | null;
+  terminal_evidence_json: string | null;
+};
+
+export type CompleteChildAttemptInput = {
+  childId: string;
+  attemptId: string;
+  expectedChildRevision: number;
+  envelopeDigest: string;
+  evidence: ChildTerminalEvidence;
+};
+
+export type ChildMutationInput = {
+  childId: string;
+  expectedChildRevision: number;
+  envelopeDigest: string;
+};
+
+export type BindChildRuntimeInput = ChildMutationInput & {
+  attemptId: string;
+  nativeHandle: NativeRlmSpawnHandle;
 };
 
 export type JobStoreOptions = {
@@ -794,6 +870,414 @@ export class JobStore {
     return result;
   }
 
+  async enableChildTree(
+    jobId: string,
+    policyValue: ChildTreePolicy = DEFAULT_CHILD_TREE_POLICY,
+  ): Promise<ChildTreeSnapshot> {
+    await this.ensureImported(jobId);
+    const policy = ChildTreePolicySchema.parse(policyValue);
+    const policyDigest = canonicalDigest(policy);
+    const now = new Date().toISOString();
+    const event = this.transaction("enable_child_tree", () => {
+      const state = this.readStateFromDatabase(jobId);
+      if (
+        state.status !== "queued" &&
+        state.status !== "provisioning" &&
+        state.status !== "running"
+      )
+        throw new Error(
+          "child execution policy must be enabled before verification",
+        );
+      const existing = this.childTreeRow(jobId, false);
+      if (existing) {
+        if (existing.policy_sha256 !== policyDigest)
+          throw new Error("child tree policy is immutable");
+        return undefined;
+      }
+      this.database
+        .prepare(
+          `INSERT INTO child_trees(
+             job_id, policy_json, policy_sha256, revision, created_at, updated_at
+           ) VALUES (?, ?, ?, 0, ?, ?)`,
+        )
+        .run(jobId, sqliteJson(policy), policyDigest, now, now);
+      const created = this.newEvent(jobId, "child_tree_enabled", {
+        policyDigest,
+        maxChildren: policy.maxChildren,
+        maxActiveChildren: policy.maxActiveChildren,
+        maxDepth: policy.maxDepth,
+      });
+      this.insertEvent(created);
+      return created;
+    });
+    if (event) await this.projectEvents(jobId);
+    return this.childTreeFromDatabase(jobId);
+  }
+
+  async readChildTree(jobId: string): Promise<ChildTreeSnapshot | undefined> {
+    await this.ensureImported(jobId);
+    if (!this.childTreeRow(jobId, false)) return undefined;
+    return this.childTreeFromDatabase(jobId);
+  }
+
+  async admitChild(
+    jobId: string,
+    expectedTreeRevision: number,
+    envelopeValue: ChildSpawnEnvelope,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const envelope = ChildSpawnEnvelopeSchema.parse(envelopeValue);
+    const envelopeDigest = childEnvelopeDigest(envelope);
+    const now = new Date().toISOString();
+    const child = this.transaction("admit_child", () => {
+      const tree = this.assertChildTreeRevision(jobId, expectedTreeRevision);
+      const state = this.readStateFromDatabase(jobId);
+      if (state.status !== "running")
+        throw new Error(
+          "children may only be admitted while the root is running",
+        );
+      if (envelope.parentJobId !== jobId)
+        throw new Error("child parent must be the root job");
+      const total = (
+        this.database
+          .prepare(
+            "SELECT COUNT(*) AS count FROM logical_children WHERE job_id = ?",
+          )
+          .get(jobId) as { count: number }
+      ).count;
+      if (total >= tree.policy.maxChildren)
+        throw new Error("child total admission limit reached");
+      this.assertChildActiveSlot(jobId, tree.policy.maxActiveChildren);
+      if (
+        this.database
+          .prepare(
+            "SELECT 1 FROM logical_children WHERE job_id = ? AND name = ?",
+          )
+          .get(jobId, envelope.name)
+      )
+        throw new Error(`duplicate child name: ${envelope.name}`);
+      const dependencies = envelope.dependencyChildIds.map((dependencyId) => {
+        const dependency = this.logicalChildRow(dependencyId, false);
+        if (!dependency || dependency.job_id !== jobId)
+          throw new Error("child dependency has the wrong parent");
+        const dependencyEnvelope = ChildSpawnEnvelopeSchema.parse(
+          parseSqliteJson(dependency.envelope_json, "child spawn envelope"),
+        );
+        if (dependencyEnvelope.wave >= envelope.wave)
+          throw new Error("child dependency cycle or invalid dependency wave");
+        if (
+          this.currentChildAttemptFromDatabase(dependency.child_id).status !==
+          "succeeded"
+        )
+          throw new Error("child dependencies must succeed before admission");
+        return dependency;
+      });
+      const attemptId = randomUUID();
+      this.database
+        .prepare(
+          `INSERT INTO logical_children(
+             child_id, job_id, name, envelope_json, envelope_sha256,
+             criticality, wave, decision, revision, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`,
+        )
+        .run(
+          envelope.childId,
+          jobId,
+          envelope.name,
+          sqliteJson(envelope),
+          envelopeDigest,
+          envelope.criticality,
+          envelope.wave,
+          now,
+          now,
+        );
+      const insertDependency = this.database.prepare(
+        `INSERT INTO child_dependencies(job_id, child_id, dependency_child_id)
+         VALUES (?, ?, ?)`,
+      );
+      for (const dependency of dependencies)
+        insertDependency.run(jobId, envelope.childId, dependency.child_id);
+      this.database
+        .prepare(
+          `INSERT INTO child_attempts(
+             attempt_id, child_id, job_id, ordinal, previous_attempt_id,
+             status, inference_json, started_at, completed_at,
+             terminal_evidence_json
+           ) VALUES (?, ?, ?, 1, NULL, 'active', ?, ?, NULL, NULL)`,
+        )
+        .run(
+          attemptId,
+          envelope.childId,
+          jobId,
+          sqliteJson(envelope.inference),
+          now,
+        );
+      this.advanceChildTreeRevision(jobId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_admitted", {
+          childId: envelope.childId,
+          attemptId,
+          name: envelope.name,
+          role: envelope.role,
+          criticality: envelope.criticality,
+          wave: envelope.wave,
+          envelopeDigest,
+        }),
+      );
+      return this.logicalChildFromDatabase(envelope.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async retryChild(
+    jobId: string,
+    input: ChildMutationInput & {
+      inference?: ChildSpawnEnvelope["inference"];
+    },
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const now = new Date().toISOString();
+    const child = this.transaction("retry_child", () => {
+      const policy = this.childTreePolicy(jobId);
+      if (this.readStateFromDatabase(jobId).status !== "running")
+        throw new Error(
+          "children may only be retried while the root is running",
+        );
+      const row = this.assertChildMutation(jobId, input);
+      const prior = this.currentChildAttemptFromDatabase(input.childId);
+      if (prior.status !== "failed" && prior.status !== "interrupted")
+        throw new Error("only failed or interrupted children may be retried");
+      this.assertChildActiveSlot(jobId, policy.maxActiveChildren);
+      if (prior.ordinal >= policy.maxAttemptsPerChild)
+        throw new Error("child retry limit reached");
+      const envelope = ChildSpawnEnvelopeSchema.parse(
+        parseSqliteJson(row.envelope_json, "child spawn envelope"),
+      );
+      const inference = ChildSpawnEnvelopeSchema.shape.inference.parse(
+        input.inference ?? envelope.inference,
+      );
+      const attemptId = randomUUID();
+      this.database
+        .prepare(
+          `INSERT INTO child_attempts(
+             attempt_id, child_id, job_id, ordinal, previous_attempt_id,
+             status, inference_json, started_at, completed_at,
+             terminal_evidence_json
+           ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+        )
+        .run(
+          attemptId,
+          input.childId,
+          jobId,
+          prior.ordinal + 1,
+          prior.attempt_id,
+          sqliteJson(inference),
+          now,
+        );
+      this.database
+        .prepare(
+          `UPDATE logical_children
+           SET decision = 'pending', revision = revision + 1,
+               updated_at = ? WHERE child_id = ?`,
+        )
+        .run(now, input.childId);
+      this.advanceChildTreeRevision(jobId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_retry_started", {
+          childId: input.childId,
+          attemptId,
+          previousAttemptId: prior.attempt_id,
+          attemptNumber: prior.ordinal + 1,
+          model: inference.model,
+          reasoning: inference.reasoning,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async requestChildCancellation(
+    jobId: string,
+    input: ChildMutationInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const now = new Date().toISOString();
+    const child = this.transaction("cancel_child", () => {
+      this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.status !== "active")
+        throw new Error("only an active child may enter cancellation");
+      this.database
+        .prepare(
+          "UPDATE child_attempts SET status = 'cancelling' WHERE attempt_id = ?",
+        )
+        .run(attempt.attempt_id);
+      this.database
+        .prepare(
+          `UPDATE logical_children SET revision = revision + 1,
+             updated_at = ? WHERE child_id = ?`,
+        )
+        .run(now, input.childId);
+      this.advanceChildTreeRevision(jobId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_cancellation_requested", {
+          childId: input.childId,
+          attemptId: attempt.attempt_id,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async bindChildRuntime(
+    jobId: string,
+    input: BindChildRuntimeInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const nativeHandle = NativeRlmSpawnHandleSchema.parse(input.nativeHandle);
+    const now = new Date().toISOString();
+    const child = this.transaction("bind_child_runtime", () => {
+      const row = this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child attempt is stale");
+      if (attempt.status !== "active")
+        throw new Error("native runtime may only bind to an active child");
+      if (attempt.native_handle_json)
+        throw new Error("child attempt already has a native runtime handle");
+      const envelope = ChildSpawnEnvelopeSchema.parse(
+        parseSqliteJson(row.envelope_json, "child spawn envelope"),
+      );
+      if (nativeHandle.name !== envelope.name)
+        throw new Error("native child name does not match admitted child");
+      if (
+        nativeHandle.model !==
+        `${envelope.inference.provider}/${envelope.inference.model}`
+      )
+        throw new Error("native child model does not match admitted child");
+      this.database
+        .prepare(
+          `UPDATE child_attempts SET native_child_id = ?, native_handle_json = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(
+          nativeHandle.rlmChildId,
+          sqliteJson(nativeHandle),
+          input.attemptId,
+        );
+      this.database
+        .prepare(
+          `UPDATE logical_children SET revision = revision + 1, updated_at = ?
+           WHERE child_id = ?`,
+        )
+        .run(now, input.childId);
+      this.advanceChildTreeRevision(jobId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_runtime_bound", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          rlmChildId: nativeHandle.rlmChildId,
+          sessionDir: nativeHandle.sessionDir,
+          model: nativeHandle.model,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async completeChildAttempt(
+    jobId: string,
+    input: CompleteChildAttemptInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const evidence = ChildTerminalEvidenceSchema.parse(input.evidence);
+    const child = this.transaction("complete_child_attempt", () => {
+      const row = this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child attempt is stale");
+      if (attempt.status !== "active" && attempt.status !== "cancelling")
+        throw new Error("child attempt is already terminal");
+      if (attempt.status === "cancelling" && evidence.outcome !== "cancelled")
+        throw new Error("a cancelling child must finish as cancelled");
+      if (evidence.outcome === "cancelled" && attempt.status !== "cancelling")
+        throw new Error(
+          "child cancellation must be requested before terminal cancellation",
+        );
+      this.database
+        .prepare(
+          `UPDATE child_attempts
+           SET status = ?, completed_at = ?, terminal_evidence_json = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(
+          evidence.outcome,
+          evidence.completedAt,
+          sqliteJson(evidence),
+          attempt.attempt_id,
+        );
+      this.database
+        .prepare(
+          `UPDATE logical_children SET revision = revision + 1,
+             updated_at = ? WHERE child_id = ?`,
+        )
+        .run(evidence.completedAt, input.childId);
+      this.advanceChildTreeRevision(jobId, evidence.completedAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_attempt_completed", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          outcome: evidence.outcome,
+          criticality: ChildSpawnEnvelopeSchema.parse(
+            parseSqliteJson(row.envelope_json, "child spawn envelope"),
+          ).criticality,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async decideChildResult(
+    jobId: string,
+    input: ChildMutationInput & { decision: Exclude<ChildDecision, "pending"> },
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const now = new Date().toISOString();
+    const child = this.transaction("decide_child_result", () => {
+      this.assertChildMutation(jobId, input);
+      const status = this.currentChildAttemptFromDatabase(input.childId).status;
+      if (input.decision === "selected" && status !== "succeeded")
+        throw new Error("only a successful child result may be selected");
+      if (input.decision === "discarded" && status !== "cancelled")
+        throw new Error("discarded children require terminal cancellation");
+      this.database
+        .prepare(
+          `UPDATE logical_children SET decision = ?, revision = revision + 1,
+             updated_at = ? WHERE child_id = ?`,
+        )
+        .run(input.decision, now, input.childId);
+      this.advanceChildTreeRevision(jobId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_result_decided", {
+          childId: input.childId,
+          decision: input.decision,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
   async updateState(
     jobId: string,
     status: JobStatus,
@@ -805,6 +1289,7 @@ export class JobStore {
       assertTransition(current.status, status);
       if (terminalStatuses.has(status))
         throw new Error("terminal transitions require finalizeTerminal");
+      if (status === "verifying") this.assertChildrenJoined(jobId);
       const next = JobStateSchema.parse({
         ...current,
         ...patch,
@@ -861,6 +1346,7 @@ export class JobStore {
       if (result.baseSha !== request.baseSha)
         throw new Error("terminal result base SHA does not match request");
       assertTransition(current.status, result.status);
+      this.assertChildrenTerminalForRoot(result.jobId, result.status);
       if (
         result.status !== "succeeded" &&
         result.status !== "failed" &&
@@ -1368,6 +1854,262 @@ export class JobStore {
         unknown
       >,
     }));
+  }
+
+  private childTreeRow(
+    jobId: string,
+    required = true,
+  ): ChildTreeRow | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT job_id, policy_json, policy_sha256, revision, created_at, updated_at
+         FROM child_trees WHERE job_id = ?`,
+      )
+      .get(jobId) as ChildTreeRow | undefined;
+    if (!row && required)
+      throw new Error("experimental child tree is not enabled for this job");
+    return row;
+  }
+
+  private logicalChildRow(
+    childId: string,
+    required = true,
+  ): LogicalChildRow | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT child_id, job_id, envelope_json, envelope_sha256,
+                decision, revision, created_at, updated_at
+         FROM logical_children WHERE child_id = ?`,
+      )
+      .get(childId) as LogicalChildRow | undefined;
+    if (!row && required) throw new Error(`unknown child: ${childId}`);
+    return row;
+  }
+
+  private childAttemptFromRow(row: ChildAttemptRow): ChildAttempt {
+    const nativeHandle = row.native_handle_json
+      ? NativeRlmSpawnHandleSchema.parse(
+          parseSqliteJson(
+            row.native_handle_json,
+            "native child runtime handle",
+          ),
+        )
+      : undefined;
+    if ((nativeHandle?.rlmChildId ?? null) !== row.native_child_id)
+      throw new Error("stored native child runtime identity mismatch");
+    return ChildAttemptSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      attemptId: row.attempt_id,
+      childId: row.child_id,
+      jobId: row.job_id,
+      ordinal: row.ordinal,
+      ...(row.previous_attempt_id
+        ? { previousAttemptId: row.previous_attempt_id }
+        : {}),
+      status: row.status,
+      inference: parseSqliteJson(row.inference_json, "child inference policy"),
+      startedAt: row.started_at,
+      ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+      ...(nativeHandle ? { nativeHandle } : {}),
+      ...(row.terminal_evidence_json
+        ? {
+            terminalEvidence: parseSqliteJson(
+              row.terminal_evidence_json,
+              "child terminal evidence",
+            ),
+          }
+        : {}),
+    });
+  }
+
+  private childAttemptsFromDatabase(childId: string): ChildAttempt[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT attempt_id, child_id, job_id, ordinal, previous_attempt_id,
+                  status, inference_json, native_child_id, native_handle_json,
+                  started_at, completed_at,
+                  terminal_evidence_json
+           FROM child_attempts WHERE child_id = ? ORDER BY ordinal`,
+        )
+        .all(childId) as ChildAttemptRow[]
+    ).map((row) => this.childAttemptFromRow(row));
+  }
+
+  private currentChildAttemptFromDatabase(childId: string): ChildAttemptRow {
+    const row = this.database
+      .prepare(
+        `SELECT attempt_id, child_id, job_id, ordinal, previous_attempt_id,
+                status, inference_json, native_child_id, native_handle_json,
+                started_at, completed_at,
+                terminal_evidence_json
+         FROM child_attempts WHERE child_id = ? ORDER BY ordinal DESC LIMIT 1`,
+      )
+      .get(childId) as ChildAttemptRow | undefined;
+    if (!row) throw new Error(`child ${childId} has no attempt`);
+    return row;
+  }
+
+  private logicalChildFromDatabase(childId: string): LogicalChild {
+    const row = this.logicalChildRow(childId) as LogicalChildRow;
+    const envelope = ChildSpawnEnvelopeSchema.parse(
+      parseSqliteJson(row.envelope_json, "child spawn envelope"),
+    );
+    if (childEnvelopeDigest(envelope) !== row.envelope_sha256)
+      throw new Error("stored child spawn envelope digest mismatch");
+    const attempts = this.childAttemptsFromDatabase(childId);
+    const current = attempts.at(-1);
+    if (!current) throw new Error(`child ${childId} has no attempt`);
+    return LogicalChildSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      envelope,
+      envelopeDigest: row.envelope_sha256,
+      status: current.status,
+      decision: row.decision,
+      revision: row.revision,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      attempts,
+    });
+  }
+
+  private childTreeFromDatabase(jobId: string): ChildTreeSnapshot {
+    const row = this.childTreeRow(jobId) as ChildTreeRow;
+    const policy = ChildTreePolicySchema.parse(
+      parseSqliteJson(row.policy_json, "child tree policy"),
+    );
+    if (canonicalDigest(policy) !== row.policy_sha256)
+      throw new Error("stored child tree policy digest mismatch");
+    const children = (
+      this.database
+        .prepare(
+          `SELECT child_id FROM logical_children
+           WHERE job_id = ? ORDER BY wave, name, child_id`,
+        )
+        .all(jobId) as { child_id: string }[]
+    ).map((child) => this.logicalChildFromDatabase(child.child_id));
+    return ChildTreeSnapshotSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      jobId,
+      policy,
+      policyDigest: row.policy_sha256,
+      revision: row.revision,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      children,
+    });
+  }
+
+  private assertChildTreeRevision(
+    jobId: string,
+    expectedRevision: number,
+  ): { row: ChildTreeRow; policy: ChildTreePolicy } {
+    const row = this.childTreeRow(jobId) as ChildTreeRow;
+    if (row.revision !== expectedRevision)
+      throw new Error(
+        `stale child tree revision: expected ${expectedRevision}, current ${row.revision}`,
+      );
+    return {
+      row,
+      policy: this.childTreePolicy(jobId),
+    };
+  }
+
+  private childTreePolicy(jobId: string): ChildTreePolicy {
+    const row = this.childTreeRow(jobId) as ChildTreeRow;
+    return ChildTreePolicySchema.parse(
+      parseSqliteJson(row.policy_json, "child tree policy"),
+    );
+  }
+
+  private assertChildMutation(
+    jobId: string,
+    input: ChildMutationInput,
+  ): LogicalChildRow {
+    const row = this.logicalChildRow(input.childId) as LogicalChildRow;
+    if (row.job_id !== jobId) throw new Error("child has the wrong parent");
+    if (row.revision !== input.expectedChildRevision)
+      throw new Error(
+        `stale child revision: expected ${input.expectedChildRevision}, current ${row.revision}`,
+      );
+    if (row.envelope_sha256 !== input.envelopeDigest)
+      throw new Error("child spawn envelope changed after admission");
+    const envelope = ChildSpawnEnvelopeSchema.parse(
+      parseSqliteJson(row.envelope_json, "child spawn envelope"),
+    );
+    if (childEnvelopeDigest(envelope) !== row.envelope_sha256)
+      throw new Error("stored child spawn envelope digest mismatch");
+    return row;
+  }
+
+  private assertChildActiveSlot(jobId: string, maximum: number): void {
+    const active = (
+      this.database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM child_attempts
+           WHERE job_id = ? AND status IN ('active', 'cancelling')`,
+        )
+        .get(jobId) as { count: number }
+    ).count;
+    if (active >= maximum)
+      throw new Error("child active admission limit reached");
+  }
+
+  private advanceChildTreeRevision(jobId: string, updatedAt: string): void {
+    this.database
+      .prepare(
+        `UPDATE child_trees SET revision = revision + 1, updated_at = ?
+         WHERE job_id = ?`,
+      )
+      .run(updatedAt, jobId);
+  }
+
+  private assertChildrenJoined(jobId: string): void {
+    if (!this.childTreeRow(jobId, false)) return;
+    const active = (
+      this.database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM child_attempts
+           WHERE job_id = ? AND status IN ('active', 'cancelling')`,
+        )
+        .get(jobId) as { count: number }
+    ).count;
+    if (active > 0)
+      throw new Error(
+        "trusted verification requires every child attempt to be terminal",
+      );
+  }
+
+  private assertChildrenTerminalForRoot(
+    jobId: string,
+    rootStatus: JobStatus,
+  ): void {
+    if (!this.childTreeRow(jobId, false)) return;
+    this.assertChildrenJoined(jobId);
+    const children = this.database
+      .prepare(
+        `SELECT attempt.status, child.criticality
+         FROM logical_children AS child
+         JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+         WHERE child.job_id = ?
+           AND attempt.ordinal = (
+             SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+             WHERE latest.child_id = child.child_id
+           )`,
+      )
+      .all(jobId) as { status: ChildStatus; criticality: string }[];
+    if (children.some((child) => !terminalChildStatuses.has(child.status)))
+      throw new Error(
+        "a root job cannot finish before every child is terminal",
+      );
+    if (
+      rootStatus === "succeeded" &&
+      children.some(
+        (child) =>
+          child.criticality === "required" && child.status !== "succeeded",
+      )
+    )
+      throw new Error("required child failure prevents root success");
   }
 
   private transaction<T>(label: string, operation: () => T): T {

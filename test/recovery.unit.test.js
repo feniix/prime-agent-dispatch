@@ -153,7 +153,7 @@ test("current schema creates one auditable initial execution attempt", async () 
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      4,
+      5,
     );
   } finally {
     database.close();
