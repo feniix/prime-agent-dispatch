@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Command, Option } from "commander";
@@ -9,8 +8,7 @@ import { loadHostConfig, resolveHostRepositoryPolicy } from "./host-config.js";
 import { CleanupManager } from "./cleanup.js";
 import {
   CONTROL_DATABASE_NAME,
-  CONTROL_SCHEMA_VERSION,
-  inspectOpenControlDatabase,
+  inspectControlMigrations,
   openControlDatabase,
 } from "./sqlite.js";
 
@@ -89,7 +87,7 @@ withStateRoot(
     .action((options) => {
       const database = openControlDatabase(stateRoot(options));
       try {
-        print(inspectOpenControlDatabase(database));
+        print(inspectControlMigrations(database));
       } finally {
         database.close();
       }
@@ -108,36 +106,12 @@ withStateRoot(
         { readOnly: true },
       );
       try {
-        print(inspectOpenControlDatabase(database));
+        print(inspectControlMigrations(database));
       } finally {
         database.close();
       }
     }),
 );
-
-program
-  .command("migration-create")
-  .description("create a fail-closed TypeScript migration scaffold")
-  .requiredOption("--name <name>")
-  .option("--directory <path>", "migration source directory", "src/migrations")
-  .action(async (options) => {
-    const slug = String(options.name)
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "");
-    if (!slug) throw new Error("migration name must contain letters or digits");
-    const version = CONTROL_SCHEMA_VERSION + 1;
-    const padded = String(version).padStart(3, "0");
-    const variable = `migration${padded}`;
-    const destination = resolve(options.directory, `${padded}-${slug}.ts`);
-    const source = `import { defineControlMigration, sqlStep } from "./framework.js";\n\nexport const ${variable} = defineControlMigration({\n  version: ${version},\n  name: ${JSON.stringify(String(options.name).trim())},\n  steps: [\n    sqlStep("MIGRATION ${padded} MUST BE IMPLEMENTED WITH A KYSLEY OR SQL STEP"),\n  ],\n});\n`;
-    await writeFile(destination, source, { encoding: "utf8", flag: "wx" });
-    print({
-      created: destination,
-      next: "replace the fail-closed step with typed Kysely steps, then add it to migrations/index.ts",
-    });
-  });
 
 withStateRoot(
   program

@@ -21,7 +21,7 @@ import { acquireProcessDirectoryLock } from "./process-lock.js";
 import {
   CONTROL_DATABASE_NAME,
   CONTROL_SCHEMA_VERSION,
-  inspectOpenControlDatabase,
+  inspectControlMigrations,
 } from "./sqlite.js";
 
 const PLUGIN_ID = "prime-dispatch";
@@ -695,7 +695,7 @@ async function auditControlDatabase(
     const foreignKeys = database.prepare("PRAGMA foreign_key_check").all();
     if (foreignKeys.length > 0)
       violations.push("control database foreign-key check failed");
-    const migration = inspectOpenControlDatabase(database);
+    const migration = inspectControlMigrations(database);
     if (migration.currentVersion !== CONTROL_SCHEMA_VERSION)
       violations.push(
         `control database schema is ${migration.currentVersion}; expected ${CONTROL_SCHEMA_VERSION}`,

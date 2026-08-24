@@ -1,5 +1,9 @@
 import type { ControlDatabase } from "../sqlite.js";
-import { CONTROL_MIGRATIONS } from "./index.js";
+import {
+  CHECKSUM_MIGRATION_VERSION,
+  CONTROL_MIGRATIONS,
+  CONTROL_SCHEMA_VERSION,
+} from "./index.js";
 import {
   applyMigrationSteps,
   runImmediateTransaction,
@@ -26,10 +30,6 @@ export interface ControlMigrationState {
   applied: readonly SchemaMigrationRow[];
 }
 
-export function latestControlSchemaVersion(): number {
-  return CONTROL_MIGRATIONS.at(-1)?.version ?? 0;
-}
-
 function hasChecksumColumn(database: ControlDatabase): boolean {
   return database
     .prepare("PRAGMA table_info(schema_migrations)")
@@ -37,27 +37,30 @@ function hasChecksumColumn(database: ControlDatabase): boolean {
     .some((column) => (column as { name?: unknown }).name === "checksum");
 }
 
-function readMigrationRows(database: ControlDatabase): SchemaMigrationRow[] {
-  const checksum = hasChecksumColumn(database);
-  return database
+function readMigrationRows(database: ControlDatabase): {
+  applied: SchemaMigrationRow[];
+  checksumsPresent: boolean;
+} {
+  const checksumsPresent = hasChecksumColumn(database);
+  const applied = database
     .prepare(
-      checksum
+      checksumsPresent
         ? "SELECT version, name, applied_at, checksum FROM schema_migrations ORDER BY version"
         : "SELECT version, name, applied_at FROM schema_migrations ORDER BY version",
     )
     .all() as unknown as SchemaMigrationRow[];
+  return { applied, checksumsPresent };
 }
 
 function validateHistory(database: ControlDatabase): ControlMigrationState {
-  const applied = readMigrationRows(database);
-  const latestVersion = latestControlSchemaVersion();
+  const { applied, checksumsPresent } = readMigrationRows(database);
+  const latestVersion = CONTROL_SCHEMA_VERSION;
   const currentVersion = applied.at(-1)?.version ?? 0;
   if (currentVersion > latestVersion)
     throw new Error(
       `unsupported control database schema ${currentVersion}; expected at most ${latestVersion}`,
     );
-  const checksumsPresent = hasChecksumColumn(database);
-  if (currentVersion >= 6 && !checksumsPresent)
+  if (currentVersion >= CHECKSUM_MIGRATION_VERSION && !checksumsPresent)
     throw new Error(
       "control migration history is missing checksum integrity metadata",
     );
@@ -89,7 +92,7 @@ export function migrateControlDatabase(
   options: MigrationRunnerOptions = {},
 ): ControlMigrationState {
   database.exec(CREATE_MIGRATION_TABLE);
-  const latestVersion = latestControlSchemaVersion();
+  const latestVersion = CONTROL_SCHEMA_VERSION;
   const targetVersion = options.targetVersion ?? latestVersion;
   if (
     !Number.isSafeInteger(targetVersion) ||

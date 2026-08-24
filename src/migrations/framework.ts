@@ -1,11 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SQLInputValue } from "node:sqlite";
-import {
-  Kysely,
-  SqliteDialect,
-  type Compilable,
-  type CompiledQuery,
-} from "kysely";
+import { Kysely, SqliteDialect, type Compilable } from "kysely";
 import type { SqliteDatabase } from "kysely";
 import type { ControlDatabase } from "../sqlite.js";
 
@@ -29,7 +24,7 @@ export type MigrationFaultInjector = (point: string) => void;
 
 export interface MigrationStep {
   readonly checksumSource: string;
-  apply(context: MigrationContext): void;
+  apply(database: ControlDatabase): void;
 }
 
 export interface ControlMigration {
@@ -37,11 +32,6 @@ export interface ControlMigration {
   readonly name: string;
   readonly checksum: string;
   readonly steps: readonly MigrationStep[];
-}
-
-export interface MigrationContext {
-  readonly database: ControlDatabase;
-  execute(query: CompiledQuery): void;
 }
 
 const compilerDatabase: SqliteDatabase = {
@@ -55,17 +45,22 @@ const migrationCompiler = new Kysely<MigrationSchema>({
   dialect: new SqliteDialect({ database: compilerDatabase }),
 });
 
-export function kyselyStep(build: (db: Kysely<MigrationSchema>) => Compilable) {
-  const compiled = build(migrationCompiler).compile();
+export function kyselyStep<Database = MigrationSchema>(
+  build: (db: Kysely<Database>) => Compilable,
+) {
+  const compiled = build(
+    migrationCompiler as unknown as Kysely<Database>,
+  ).compile();
+  const parameters = sqliteParameters(compiled.parameters);
   const checksumSource = JSON.stringify({
     kind: "kysely",
     sql: compiled.sql,
-    parameters: compiled.parameters,
+    parameters: parameters.map(checksumParameter),
   });
   return Object.freeze<MigrationStep>({
     checksumSource,
-    apply(context) {
-      context.execute(compiled);
+    apply(database) {
+      database.prepare(compiled.sql).run(...parameters);
     },
   });
 }
@@ -73,8 +68,8 @@ export function kyselyStep(build: (db: Kysely<MigrationSchema>) => Compilable) {
 export function sqlStep(statement: string): MigrationStep {
   return Object.freeze({
     checksumSource: JSON.stringify({ kind: "sql", statement }),
-    apply(context: MigrationContext) {
-      context.database.exec(statement);
+    apply(database: ControlDatabase) {
+      database.exec(statement);
     },
   });
 }
@@ -86,16 +81,22 @@ export function defineControlMigration(definition: {
 }): ControlMigration {
   if (!Number.isSafeInteger(definition.version) || definition.version < 1)
     throw new Error(`invalid control migration version ${definition.version}`);
+  const steps = Object.freeze([...definition.steps]);
   const checksum = createHash("sha256")
     .update(
       JSON.stringify({
         version: definition.version,
         name: definition.name,
-        steps: definition.steps.map((step) => step.checksumSource),
+        steps: steps.map((step) => step.checksumSource),
       }),
     )
     .digest("hex");
-  return Object.freeze({ ...definition, checksum });
+  return Object.freeze({
+    version: definition.version,
+    name: definition.name,
+    steps,
+    checksum,
+  });
 }
 
 export function runImmediateTransaction<T>(
@@ -122,17 +123,44 @@ export function applyMigrationSteps(
   migration: ControlMigration,
   faultInjector?: MigrationFaultInjector,
 ): void {
-  let operation = 0;
-  const context: MigrationContext = {
-    database,
-    execute(query) {
-      const parameters = [...query.parameters] as SQLInputValue[];
-      database.prepare(query.sql).run(...parameters);
-    },
-  };
-  for (const step of migration.steps) {
-    step.apply(context);
-    operation += 1;
-    faultInjector?.(`migration:${migration.version}:operation:${operation}`);
+  for (const [index, step] of migration.steps.entries()) {
+    step.apply(database);
+    faultInjector?.(`migration:${migration.version}:operation:${index + 1}`);
   }
+}
+
+function sqliteParameters(parameters: readonly unknown[]): SQLInputValue[] {
+  return parameters.map((parameter, index) => {
+    if (
+      parameter === null ||
+      typeof parameter === "number" ||
+      typeof parameter === "bigint" ||
+      typeof parameter === "string" ||
+      isSqliteArrayBufferView(parameter)
+    )
+      return parameter;
+    throw new Error(
+      `Kysely migration parameter ${index + 1} is not supported by node:sqlite`,
+    );
+  });
+}
+
+function isSqliteArrayBufferView(
+  value: unknown,
+): value is NodeJS.ArrayBufferView {
+  return ArrayBuffer.isView(value);
+}
+
+function checksumParameter(parameter: SQLInputValue): unknown {
+  if (parameter === null) return ["null"];
+  if (typeof parameter === "number")
+    return ["number", Object.is(parameter, -0) ? "-0" : String(parameter)];
+  if (typeof parameter === "bigint") return ["bigint", String(parameter)];
+  if (typeof parameter === "string") return ["string", parameter];
+  const bytes = new Uint8Array(
+    parameter.buffer,
+    parameter.byteOffset,
+    parameter.byteLength,
+  );
+  return ["bytes", Buffer.from(bytes).toString("base64")];
 }

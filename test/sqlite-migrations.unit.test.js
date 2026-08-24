@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,8 +10,8 @@ import { promisify } from "node:util";
 import {
   CONTROL_DATABASE_NAME,
   CONTROL_SCHEMA_VERSION,
-  inspectOpenControlDatabase,
-  migrateOpenControlDatabase,
+  inspectControlMigrations,
+  migrateControlDatabase,
   openControlDatabase,
 } from "../dist/index.js";
 
@@ -47,7 +47,7 @@ test("fresh databases apply the immutable migration manifest through latest", as
   const root = await temporaryRoot("fresh");
   const database = openControlDatabase(root);
   try {
-    const state = inspectOpenControlDatabase(database);
+    const state = inspectControlMigrations(database);
     assert.equal(state.currentVersion, CONTROL_SCHEMA_VERSION);
     assert.equal(state.latestVersion, CONTROL_SCHEMA_VERSION);
     assert.deepEqual(
@@ -70,17 +70,17 @@ for (let fixtureVersion = 1; fixtureVersion <= 5; fixtureVersion += 1) {
   test(`schema v${fixtureVersion} upgrades to latest with authority data preserved`, async () => {
     const root = await temporaryRoot(`v${fixtureVersion}`);
     const fixture = databaseAt(root);
-    migrateOpenControlDatabase(fixture, { targetVersion: 1 });
+    migrateControlDatabase(fixture, { targetVersion: 1 });
     const jobId = `fixture-v${fixtureVersion}`;
     insertSentinelJob(fixture, jobId);
     if (fixtureVersion > 1)
-      migrateOpenControlDatabase(fixture, { targetVersion: fixtureVersion });
+      migrateControlDatabase(fixture, { targetVersion: fixtureVersion });
     fixture.close();
 
     const migrated = openControlDatabase(root);
     try {
       assert.equal(
-        inspectOpenControlDatabase(migrated).currentVersion,
+        inspectControlMigrations(migrated).currentVersion,
         CONTROL_SCHEMA_VERSION,
       );
       assert.equal(
@@ -134,7 +134,7 @@ test("concurrent startup records each migration exactly once", async () => {
       CONTROL_SCHEMA_VERSION,
     );
     assert.equal(
-      inspectOpenControlDatabase(database).currentVersion,
+      inspectControlMigrations(database).currentVersion,
       CONTROL_SCHEMA_VERSION,
     );
   } finally {
@@ -142,13 +142,37 @@ test("concurrent startup records each migration exactly once", async () => {
   }
 });
 
+test("legacy null job state fails closed and leaves schema v1 intact", async () => {
+  const root = await temporaryRoot("invalid-v1-state");
+  const database = databaseAt(root);
+  migrateControlDatabase(database, { targetVersion: 1 });
+  insertSentinelJob(database, "invalid-v1-state");
+  database
+    .prepare("UPDATE jobs SET state_json = 'null' WHERE job_id = ?")
+    .run("invalid-v1-state");
+  assert.throws(
+    () => migrateControlDatabase(database, { targetVersion: 2 }),
+    /malformed JSON/,
+  );
+  assert.equal(inspectControlMigrations(database).currentVersion, 1);
+  assert.equal(
+    database
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_attempts'",
+      )
+      .get(),
+    undefined,
+  );
+  database.close();
+});
+
 test("a mid-migration failure rolls back and later startup retries", async () => {
   const root = await temporaryRoot("rollback");
   const database = databaseAt(root);
-  migrateOpenControlDatabase(database, { targetVersion: 2 });
+  migrateControlDatabase(database, { targetVersion: 2 });
   assert.throws(
     () =>
-      migrateOpenControlDatabase(database, {
+      migrateControlDatabase(database, {
         targetVersion: 3,
         faultInjector(point) {
           if (point === "migration:3:operation:1")
@@ -157,7 +181,7 @@ test("a mid-migration failure rolls back and later startup retries", async () =>
       }),
     /injected migration failure/,
   );
-  assert.equal(inspectOpenControlDatabase(database).currentVersion, 2);
+  assert.equal(inspectControlMigrations(database).currentVersion, 2);
   assert.equal(
     database
       .prepare("PRAGMA table_info(artifacts)")
@@ -166,7 +190,7 @@ test("a mid-migration failure rolls back and later startup retries", async () =>
     false,
   );
   assert.equal(
-    migrateOpenControlDatabase(database).currentVersion,
+    migrateControlDatabase(database).currentVersion,
     CONTROL_SCHEMA_VERSION,
   );
   database.close();
@@ -179,11 +203,25 @@ test("tampered applied migration checksums fail closed", async () => {
     .prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 3")
     .run("0".repeat(64));
   assert.throws(
-    () => inspectOpenControlDatabase(database),
+    () => inspectControlMigrations(database),
     /migration 3 checksum drift/,
   );
   database.close();
   assert.throws(() => openControlDatabase(root), /migration 3 checksum drift/);
+});
+
+test("renamed applied migrations fail closed", async () => {
+  const root = await temporaryRoot("name-drift");
+  const database = openControlDatabase(root);
+  database
+    .prepare("UPDATE schema_migrations SET name = ? WHERE version = 3")
+    .run("renamed migration");
+  assert.throws(
+    () => inspectControlMigrations(database),
+    /migration 3 name drift/,
+  );
+  database.close();
+  assert.throws(() => openControlDatabase(root), /migration 3 name drift/);
 });
 
 test("missing applied migrations fail closed", async () => {
@@ -191,7 +229,7 @@ test("missing applied migrations fail closed", async () => {
   const database = openControlDatabase(root);
   database.prepare("DELETE FROM schema_migrations WHERE version = 3").run();
   assert.throws(
-    () => inspectOpenControlDatabase(database),
+    () => inspectControlMigrations(database),
     /not a contiguous prefix/,
   );
   database.close();
@@ -210,7 +248,7 @@ test("databases newer than the running binary fail closed", async () => {
       "f".repeat(64),
     );
   assert.throws(
-    () => inspectOpenControlDatabase(database),
+    () => inspectControlMigrations(database),
     /unsupported control database schema/,
   );
   database.close();
@@ -219,6 +257,11 @@ test("databases newer than the running binary fail closed", async () => {
 test("developer migration commands scaffold, apply, and inspect", async () => {
   const root = await temporaryRoot("commands");
   const scaffoldRoot = await temporaryRoot("scaffold");
+  for (let version = 1; version <= CONTROL_SCHEMA_VERSION; version += 1)
+    await writeFile(
+      join(scaffoldRoot, `${String(version).padStart(3, "0")}-fixture.ts`),
+      "",
+    );
   const cli = join(repositoryRoot, "dist/cli.js");
   const applied = JSON.parse(
     (
@@ -246,8 +289,7 @@ test("developer migration commands scaffold, apply, and inspect", async () => {
       await exec(
         process.execPath,
         [
-          cli,
-          "migration-create",
+          join(repositoryRoot, "scripts/create-migration.mjs"),
           "--name",
           "typed fixture",
           "--directory",

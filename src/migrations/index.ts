@@ -15,6 +15,9 @@ export const CONTROL_MIGRATIONS: readonly ControlMigration[] = Object.freeze([
   migration006,
 ]);
 
+export const CONTROL_SCHEMA_VERSION = CONTROL_MIGRATIONS.length;
+export const CHECKSUM_MIGRATION_VERSION = migration006.version;
+
 for (const [index, migration] of CONTROL_MIGRATIONS.entries()) {
   const expectedVersion = index + 1;
   if (migration.version !== expectedVersion)

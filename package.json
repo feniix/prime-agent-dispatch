@@ -14,7 +14,7 @@
     "format:write": "prettier --write .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "migration:apply": "node dist/cli.js migration-apply",
-    "migration:create": "node dist/cli.js migration-create",
+    "migration:create": "node scripts/create-migration.mjs",
     "migration:status": "node dist/cli.js migration-status",
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js",

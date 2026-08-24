@@ -1,17 +1,18 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import {
+import { migrateControlDatabase as applyControlMigrations } from "./migrations/runner.js";
+import { runImmediateTransaction } from "./migrations/framework.js";
+
+export {
   inspectControlMigrations,
-  latestControlSchemaVersion,
   migrateControlDatabase,
   type ControlMigrationState,
   type MigrationRunnerOptions,
 } from "./migrations/runner.js";
-import { runImmediateTransaction } from "./migrations/framework.js";
+export { CONTROL_SCHEMA_VERSION } from "./migrations/index.js";
 
 export const CONTROL_DATABASE_NAME = "control-plane.sqlite3";
-export const CONTROL_SCHEMA_VERSION = latestControlSchemaVersion();
 const SQLITE_BUSY = 5;
 const JOURNAL_MODE_RETRY_MS = 5_000;
 const JOURNAL_MODE_RETRY_DELAY_MS = 25;
@@ -31,7 +32,7 @@ export function openControlDatabase(stateRoot: string): ControlDatabase {
     enableWal(database);
     database.exec("PRAGMA synchronous = FULL");
     database.exec("PRAGMA wal_autocheckpoint = 1000");
-    migrateControlDatabase(database);
+    applyControlMigrations(database);
     return database;
   } catch (error) {
     database.close();
@@ -47,26 +48,16 @@ function enableWal(database: ControlDatabase): void {
       return;
     } catch (error) {
       if (
-        (error as { errcode?: unknown }).errcode !== SQLITE_BUSY ||
+        typeof error !== "object" ||
+        error === null ||
+        !("errcode" in error) ||
+        error.errcode !== SQLITE_BUSY ||
         Date.now() >= deadline
       )
         throw error;
       Atomics.wait(journalModeRetrySignal, 0, 0, JOURNAL_MODE_RETRY_DELAY_MS);
     }
   }
-}
-
-export function migrateOpenControlDatabase(
-  database: ControlDatabase,
-  options?: MigrationRunnerOptions,
-): ControlMigrationState {
-  return migrateControlDatabase(database, options);
-}
-
-export function inspectOpenControlDatabase(
-  database: ControlDatabase,
-): ControlMigrationState {
-  return inspectControlMigrations(database);
 }
 
 export function immediateTransaction<T>(

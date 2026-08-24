@@ -68,6 +68,8 @@ export const migration002 = defineControlMigration({
         1,
         NULL,
         CASE
+          WHEN json_type(state_json, '$') = 'null'
+            THEN json_extract('invalid canonical job state', '$')
           WHEN json_extract(state_json, '$.status') IN (
             'succeeded', 'failed', 'cancelled', 'interrupted'
           ) THEN json_extract(state_json, '$.status')

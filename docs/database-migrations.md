@@ -7,15 +7,16 @@ SQLite WAL, foreign keys, `synchronous=FULL`, a five-second busy timeout, and a
 
 ## Create and review a migration
 
-Build once, then generate the next fail-closed scaffold:
+Generate the next fail-closed scaffold:
 
 ```bash
-pnpm run build
 pnpm run migration:create -- --name "describe the schema change"
 ```
 
-Replace the scaffold's throwing data step with `kyselyStep` schema/query
-builders. Use `sqlStep` only for SQLite DDL Kysely cannot express. Add the new
+Replace the scaffold's fail-closed SQL step with `kyselyStep` schema/query
+builders. Define a migration-local database interface and pass it to
+`kyselyStep<ThatSchema>` when the step touches tables beyond migration
+metadata. Use `sqlStep` only for SQLite DDL Kysely cannot express. Add the new
 module to `src/migrations/index.ts`; versions must be a contiguous prefix and
 previous migration modules must not change.
 
