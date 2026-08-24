@@ -13,6 +13,9 @@
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migration:apply": "node dist/cli.js migration-apply",
+    "migration:create": "node scripts/create-migration.mjs",
+    "migration:status": "node dist/cli.js migration-status",
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js",
     "test:openclaw-lifecycle": "PRIME_DISPATCH_OPENCLAW_LIFECYCLE_ACCEPTANCE=1 node --test test/openclaw-lifecycle.integration.test.js",
@@ -24,6 +27,7 @@
     "canonicalize": "4.0.0",
     "commander": "15.0.0",
     "eventsource-parser": "4.0.0",
+    "kysely": "0.29.5",
     "zod": "4.0.17"
   },
   "devDependencies": {

@@ -1,10 +1,16 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Command, Option } from "commander";
 import { PrimeDispatcher } from "./dispatcher.js";
 import { AuthorizationSchema, PrimeStartInputSchema } from "./schemas.js";
 import { loadHostConfig, resolveHostRepositoryPolicy } from "./host-config.js";
 import { CleanupManager } from "./cleanup.js";
+import {
+  CONTROL_DATABASE_NAME,
+  inspectControlMigrations,
+  openControlDatabase,
+} from "./sqlite.js";
 
 type CommonOptions = { stateRoot?: string };
 
@@ -73,6 +79,39 @@ const program = new Command()
   .description("Detached single-root Prime job control")
   .showHelpAfterError()
   .showSuggestionAfterError();
+
+withStateRoot(
+  program
+    .command("migration-apply")
+    .description("apply pending control-database migrations")
+    .action((options) => {
+      const database = openControlDatabase(stateRoot(options));
+      try {
+        print(inspectControlMigrations(database));
+      } finally {
+        database.close();
+      }
+    }),
+);
+
+withStateRoot(
+  program
+    .command("migration-status")
+    .description(
+      "verify control-database migration history without changing it",
+    )
+    .action((options) => {
+      const database = new DatabaseSync(
+        join(stateRoot(options), CONTROL_DATABASE_NAME),
+        { readOnly: true },
+      );
+      try {
+        print(inspectControlMigrations(database));
+      } finally {
+        database.close();
+      }
+    }),
+);
 
 withStateRoot(
   program

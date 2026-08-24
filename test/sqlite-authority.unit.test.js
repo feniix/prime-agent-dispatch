@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   CONTROL_DATABASE_NAME,
+  CONTROL_SCHEMA_VERSION,
   GlobalJobLease,
   JobStore,
   PrimeStartInputSchema,
@@ -57,7 +58,7 @@ test("control database enables WAL, foreign keys, durable sync, and migrations",
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      5,
+      CONTROL_SCHEMA_VERSION,
     );
     assert.ok(
       database

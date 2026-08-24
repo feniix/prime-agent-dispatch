@@ -18,7 +18,11 @@ import { isDeepStrictEqual } from "node:util";
 import { HostConfigSchema } from "./host-config.js";
 import { atomicWriteFile } from "./store.js";
 import { acquireProcessDirectoryLock } from "./process-lock.js";
-import { CONTROL_DATABASE_NAME, CONTROL_SCHEMA_VERSION } from "./sqlite.js";
+import {
+  CONTROL_DATABASE_NAME,
+  CONTROL_SCHEMA_VERSION,
+  inspectControlMigrations,
+} from "./sqlite.js";
 
 const PLUGIN_ID = "prime-dispatch";
 const INSTALL_SCHEMA_VERSION = 1;
@@ -691,14 +695,10 @@ async function auditControlDatabase(
     const foreignKeys = database.prepare("PRAGMA foreign_key_check").all();
     if (foreignKeys.length > 0)
       violations.push("control database foreign-key check failed");
-    const migration = database
-      .prepare(
-        "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-      )
-      .get() as { version?: unknown } | undefined;
-    if (migration?.version !== CONTROL_SCHEMA_VERSION)
+    const migration = inspectControlMigrations(database);
+    if (migration.currentVersion !== CONTROL_SCHEMA_VERSION)
       violations.push(
-        `control database schema is ${String(migration?.version)}; expected ${CONTROL_SCHEMA_VERSION}`,
+        `control database schema is ${migration.currentVersion}; expected ${CONTROL_SCHEMA_VERSION}`,
       );
   } catch (error) {
     violations.push(`control database is invalid: ${errorMessage(error)}`);

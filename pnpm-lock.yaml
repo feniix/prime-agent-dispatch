@@ -17,6 +17,9 @@ importers:
       eventsource-parser:
         specifier: 4.0.0
         version: 4.0.0
+      kysely:
+        specifier: 0.29.5
+        version: 0.29.5
       zod:
         specifier: 4.0.17
         version: 4.0.17
@@ -49,6 +52,10 @@ packages:
     resolution: {integrity: sha512-aIpvYxbqTx4KYWw73KpCt1Rh22tEAJ144F1qR76CT3Ex+LNMEPKf5HFrK5Yz9fMP1EVT0GrfA35VZvWQhMPuSQ==}
     engines: {node: '>=22.12'}
 
+  kysely@0.29.5:
+    resolution: {integrity: sha512-ooa+eSbBNPTo3MycPEuW5jdrxQdQwdtB3LC3h43FiXQbIry5tR0C5lDG7eealK0E4D7XjrnOP5DIUg/LyjRMYQ==}
+    engines: {node: '>=22.0.0'}
+
   prettier@3.6.2:
     resolution: {integrity: sha512-I7AIg5boAr5R0FFtJ6rCfD+LFsWHp81dolrFD8S79U9tb8Az2nGrJncnMSnys+bpQJfRUzqs9hnA81OAA3hCuQ==}
     engines: {node: '>=14'}
@@ -76,6 +83,8 @@ snapshots:
   commander@15.0.0: {}
 
   eventsource-parser@4.0.0: {}
+
+  kysely@0.29.5: {}
 
   prettier@3.6.2: {}
 
