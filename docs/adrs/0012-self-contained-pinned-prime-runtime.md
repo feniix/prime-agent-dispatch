@@ -9,7 +9,7 @@ consulted: [ryn]
 
 ## Context and Problem Statement
 
-Prime Agent `0.7.2` is distributed as an archive whose CLI imports sibling bundles and external runtime dependencies. The official archive is checksum-pinned but omits `node_modules`; the locally working installation therefore loads a dependency tree that is not covered by the archive or entrypoint checksum. Verifying only `cli.js` or running only `--version` does not establish complete runtime integrity.
+Prime Agent release archives, including `0.8.0`, contain a CLI that imports sibling bundles and external runtime dependencies. The official archive is checksum-pinned but omits `node_modules`; the locally working installation therefore loads a dependency tree that is not covered by the archive or entrypoint checksum. Verifying only `cli.js` or running only `--version` does not establish complete runtime integrity.
 
 ## Decision Drivers
 
@@ -48,5 +48,5 @@ Deep review demonstrated that the official archive contains sibling bundles but 
 
 ## More Information
 
-- Prime compatibility target: `0.7.2`, commit `97b994c3d7c45ca1ae635190e91e9e58ddf2577c`.
+- Prime compatibility target: `0.8.0`, commit `8d7deeab5861bf9d77bde3d8511046a5c799818d`.
 - [ADR-0005](0005-opaque-openai-compatible-inference-broker.md)

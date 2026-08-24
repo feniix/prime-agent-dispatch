@@ -9,6 +9,7 @@ This is not production-ready. The default execution backend is intentionally nam
 ## Current status
 
 - **Subscription feasibility gate:** [`spikes/001-codex-subscription`](spikes/001-codex-subscription/README.md) is **VALIDATED**. Real Prime Agent `0.7.2` completed a streamed tool-call fixture run with `gpt-5.6-sol` and high reasoning through OpenClaw-held Codex subscription authentication. Prime received only a scoped, revocable token.
+- **Current compatibility gate:** Prime Agent `0.8.0` completed the opt-in real disposable-fixture acceptance with the same scoped broker, model, reasoning, tool-call, gate, and local-commit path on 2026-08-24.
 - **Beta Milestone 1:** **COMPLETE for the disposable-fixture CLI scope, with reviewed limitations.** It productionizes the broker seam, checks the pinned Prime release and entrypoint, adds immutable confirmation and trusted host policy, enforces one global job and finite budgets, and validates real Prime completion and cancellation. Complete dependency-tree integrity remains a follow-up.
 - **Worker reconnection:** detached workers now persist PID plus OS process-start identity, a random nonce, private socket path, and protocol version. CLI startup scans nonterminal jobs and accepts a worker only after both process identity and a nonce-bound socket handshake match.
 - **Beta Milestone 2:** **IMPLEMENTED for the operational Discord fixture path.** The package in [`openclaw-plugin`](openclaw-plugin/README.md) exposes owner-only typed tools, hash-bound one-time confirmation, editable status-card delivery, terminal notification catch-up, and the standalone CLI/control boundary. See the [Beta Milestone 2 report](docs/beta-milestone-2.md).
@@ -230,9 +231,9 @@ node dist/cli.js cleanup-apply --state-root /tmp/prime-dispatch-state --run-id R
 
 ## Prime compatibility
 
-The compatibility target is Prime Agent **0.7.2**, commit **`97b994c3d7c45ca1ae635190e91e9e58ddf2577c`**.
+The compatibility target is Prime Agent **0.8.0**, commit **`8d7deeab5861bf9d77bde3d8511046a5c799818d`**.
 
-Reference protocol: <https://github.com/PrimeIntellect-ai/prime-agent/blob/97b994c3d7c45ca1ae635190e91e9e58ddf2577c/packages/coding-agent/docs/rpc.md>
+Reference protocol: <https://github.com/PrimeIntellect-ai/prime-agent/blob/8d7deeab5861bf9d77bde3d8511046a5c799818d/packages/coding-agent/docs/rpc.md>
 
 The driver uses strict LF-delimited JSONL and the official command shapes:
 
@@ -243,7 +244,7 @@ The driver uses strict LF-delimited JSONL and the official command shapes:
 
 For real Prime, provide `--host-config` containing the trusted release artifact, executable, repository roots, per-repository fixture classification, and gates. Repository entries default to non-fixtures; a caller-supplied `--fixture` flag cannot relabel a host-configured repository. Callers cannot choose the model or reasoning level. Real Prime also rejects `--yes`: review the first invocation's resolved summary and rerun with its `--confirm-hash`.
 
-The worker verifies the pinned tarball and executable checksums plus the reported version, launches JSONL RPC with `gpt-5.6-sol`/high, uses a job-private HOME/config/session directory plus a short private macOS TMPDIR, exposes only IPython, and sets `RLM_MAX_DEPTH=0`. Prime receives the edit-only execution contract as an appended system prompt: it works inside the current worktree and leaves trusted verification gates and Git commits to the worker. The RPC reader drains recognized oversized observational events with bounded hash/size/type evidence. Because Prime 0.7.2 repeats tool results in its terminal transcript, a bounded oversized `agent_end` is retained, fully parsed, and reduced to bounded summary and metadata; malformed, reclassified, or over-ceiling terminal records and all oversized control records fail closed. The upstream archive omits runtime dependencies, so verifying the complete loaded dependency tree requires the self-contained runtime follow-up cataloged in the [deep-review findings](docs/beta-milestone-1-review.md).
+The worker verifies the pinned tarball and executable checksums plus the reported version, launches JSONL RPC with `gpt-5.6-sol`/high, uses a job-private HOME/config/session directory plus a short private macOS TMPDIR, exposes only IPython, and sets `RLM_MAX_DEPTH=0`. Prime receives the edit-only execution contract as an appended system prompt: it works inside the current worktree and leaves trusted verification gates and Git commits to the worker. The RPC reader drains recognized oversized observational events with bounded hash/size/type evidence. Because Prime can repeat tool results in its terminal transcript, a bounded oversized `agent_end` is retained, fully parsed, and reduced to bounded summary and metadata; malformed, reclassified, or over-ceiling terminal records and all oversized control records fail closed. The upstream archive omits runtime dependencies, so verifying the complete loaded dependency tree requires the self-contained runtime follow-up cataloged in the [deep-review findings](docs/beta-milestone-1-review.md).
 
 ## Security and threat model
 

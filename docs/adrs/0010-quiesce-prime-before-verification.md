@@ -30,7 +30,7 @@ Prime emits `agent_end` when its logical run finishes, but that event does not i
 
 Chosen option: **close steering and quiesce the complete Prime process tree before entering verification**.
 
-On `agent_end`, the RPC backend stops accepting steering, requests abort, escalates through process-group termination when required, and awaits bounded process-tree exit before resolving the agent run. Signal-based exits count as terminal and stdin failures are handled. The line reader keeps bounded memory: it hashes and drains recognized oversized observational events. Prime 0.7.2 repeats tool results in its terminal transcript, so a bounded oversized `agent_end` is retained, fully parsed, and reduced to bounded terminal fields; malformed, reclassified, or over-ceiling terminal records and all oversized control records fail closed.
+On `agent_end`, the RPC backend stops accepting steering, requests abort, escalates through process-group termination when required, and awaits bounded process-tree exit before resolving the agent run. Signal-based exits count as terminal and stdin failures are handled. The line reader keeps bounded memory: it hashes and drains recognized oversized observational events. Prime terminal transcripts can repeat tool results, so a bounded oversized `agent_end` is retained, fully parsed, and reduced to bounded terminal fields; malformed, reclassified, or over-ceiling terminal records and all oversized control records fail closed.
 
 ### Consequences
 

@@ -53,10 +53,10 @@ test(
           prime: {
             executable:
               process.env.PRIME_AGENT_EXECUTABLE ??
-              "/var/lib/evie-agent/downloads/prime-agent-0.7.2/package/dist/bundle/cli.js",
+              "/var/lib/evie-agent/downloads/prime-agent-0.8.0/package/dist/bundle/cli.js",
             releaseArtifact:
               process.env.PRIME_AGENT_TARBALL ??
-              "/var/lib/evie-agent/downloads/prime-agent-0.7.2.tgz",
+              "/var/lib/evie-agent/downloads/prime-agent-0.8.0.tgz",
           },
           repositories: [
             {

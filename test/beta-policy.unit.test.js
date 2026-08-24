@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+  PRIME_AGENT_EXECUTABLE_SHA256,
   PRIME_AGENT_SHA256,
   PRIME_AGENT_VERSION,
   buildConfirmationSummary,
@@ -32,10 +33,14 @@ test("configured Prime release and entrypoint checksums are verified", async () 
       }),
     /checksum mismatch/,
   );
-  assert.equal(PRIME_AGENT_VERSION, "0.7.2");
+  assert.equal(PRIME_AGENT_VERSION, "0.8.0");
   assert.equal(
     PRIME_AGENT_SHA256,
-    "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e",
+    "f5b0093c7e0fddb73f94773d74383585456adfa84f12a4082d3098f23bb8fab6",
+  );
+  assert.equal(
+    PRIME_AGENT_EXECUTABLE_SHA256,
+    "bf73f2d622a26e67ca4448519207374c8b47c363a2685b76c91deb63b53a815a",
   );
 });
 
