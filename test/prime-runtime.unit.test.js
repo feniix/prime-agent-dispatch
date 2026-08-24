@@ -381,10 +381,10 @@ test("Prime installation verifies release artifact checksum and executable versi
   const artifact = join(root, "release.tgz");
   const executable = join(root, "prime.js");
   await writeFile(artifact, "fixture release");
-  await writeFile(executable, 'console.log("0.7.2")\n');
+  await writeFile(executable, 'console.log("0.8.0")\n');
   const sha = createHash("sha256").update("fixture release").digest("hex");
   const executableSha = createHash("sha256")
-    .update('console.log("0.7.2")\n')
+    .update('console.log("0.8.0")\n')
     .digest("hex");
   await assert.doesNotReject(() =>
     verifyPrimeInstallation({
@@ -394,7 +394,7 @@ test("Prime installation verifies release artifact checksum and executable versi
       expectedExecutableSha256: executableSha,
     }),
   );
-  await writeFile(executable, 'console.log("0.7.2"); // substituted\n');
+  await writeFile(executable, 'console.log("0.8.0"); // substituted\n');
   await assert.rejects(
     () =>
       verifyPrimeInstallation({
@@ -405,7 +405,7 @@ test("Prime installation verifies release artifact checksum and executable versi
       }),
     /executable checksum mismatch/,
   );
-  await writeFile(executable, 'console.log("0.7.1")\n');
+  await writeFile(executable, 'console.log("0.7.4")\n');
   await assert.rejects(
     () =>
       verifyPrimeInstallation({
@@ -413,7 +413,7 @@ test("Prime installation verifies release artifact checksum and executable versi
         executablePath: executable,
         expectedSha256: sha,
         expectedExecutableSha256: createHash("sha256")
-          .update('console.log("0.7.1")\n')
+          .update('console.log("0.7.4")\n')
           .digest("hex"),
       }),
     /version mismatch/,

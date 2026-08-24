@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { runCommand } from "./process.js";
 
-export const PRIME_AGENT_VERSION = "0.7.2" as const;
+export const PRIME_AGENT_VERSION = "0.8.0" as const;
 export const PRIME_AGENT_SHA256 =
-  "bc5471f2a626d727b88a45eb745fff93b10c554a3c4fc5912f25d8c64b987f5e" as const;
+  "f5b0093c7e0fddb73f94773d74383585456adfa84f12a4082d3098f23bb8fab6" as const;
 export const PRIME_AGENT_EXECUTABLE_SHA256 =
-  "a6144570af2554b537530372cb3080b4f7713875e8d9d4677e453bb1040f1ec5" as const;
+  "bf73f2d622a26e67ca4448519207374c8b47c363a2685b76c91deb63b53a815a" as const;
 
 async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
   const hash = createHash("sha256");
