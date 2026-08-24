@@ -174,7 +174,7 @@ pnpm run build
 pnpm run test:live
 ```
 
-The test suite has deterministic unit/integration layers plus an opt-in real acceptance. Focused tests cover schema defaults and bounds, broker policy, release and executable verification, host configuration, complete confirmation binding, Prime turn limits, the state-transition matrix, stale-lease recovery, store revisions and locking, private IPC, Git transport deterrence, artifact path safety, and full-lifecycle command limits. Deterministic integration tests use temporary fixture repositories and fake Prime; the opt-in test uses real Prime and Codex subscription auth against a disposable fixture.
+The test suite has deterministic unit/integration layers plus an opt-in real acceptance. Focused tests cover schema defaults and bounds, broker policy, release and executable verification, host configuration, complete confirmation binding, Prime turn limits, the state-transition matrix, stale-lease recovery, store revisions and locking, private IPC, Git transport deterrence, artifact path safety, and full-lifecycle command limits. Deterministic integration tests use temporary fixture repositories and fake Prime; the opt-in test rebuilds first, then uses real Prime against disposable success and cancellation fixtures. The success fixture uses Codex subscription auth. The cancellation fixture uses a local hanging broker, records the real CLI and daemon identities, follows production teardown ordering, and proves that no recorded process or active kernel/forkserver journal entry remains.
 
 - happy path, gate, worktree, commit, report and result;
 - `RLM_MAX_DEPTH=0` and dedicated `PRIME_AGENT_CODING_AGENT_DIR` observation;

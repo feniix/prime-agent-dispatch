@@ -16,7 +16,8 @@
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js",
     "test:openclaw-lifecycle": "PRIME_DISPATCH_OPENCLAW_LIFECYCLE_ACCEPTANCE=1 node --test test/openclaw-lifecycle.integration.test.js",
-    "test:live": "PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test test/live-prime.acceptance.test.js",
+    "pretest:live": "tsc -p tsconfig.json",
+    "test:live": "PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test --test-concurrency=1 test/live-prime.acceptance.test.js test/live-prime-cancellation.acceptance.test.js",
     "test:adapter": "corepack pnpm --dir openclaw-plugin run build && corepack pnpm --dir openclaw-plugin test"
   },
   "dependencies": {
