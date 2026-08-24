@@ -92,6 +92,15 @@ export const ChildSpawnEnvelopeSchema = z
         path: ["dependencyChildIds"],
         message: "a child cannot depend on itself",
       });
+    if (
+      envelope.lifecycle.cancellationGraceMs !==
+      envelope.budget.cancellationGraceMs
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["lifecycle", "cancellationGraceMs"],
+        message: "child lifecycle and budget cancellation grace must match",
+      });
   });
 export type ChildSpawnEnvelope = z.infer<typeof ChildSpawnEnvelopeSchema>;
 

@@ -882,8 +882,14 @@ export class JobStore {
     const now = new Date().toISOString();
     const event = this.transaction("enable_child_tree", () => {
       const state = this.readStateFromDatabase(jobId);
-      if (terminalStatuses.has(state.status))
-        throw new Error("cannot enable child execution for a terminal job");
+      if (
+        state.status !== "queued" &&
+        state.status !== "provisioning" &&
+        state.status !== "running"
+      )
+        throw new Error(
+          "child execution policy must be enabled before verification",
+        );
       const existing = this.childTreeRow(jobId, false);
       if (existing) {
         if (existing.policy_sha256 !== policyDigest)
@@ -1036,6 +1042,10 @@ export class JobStore {
         jobId,
         input.expectedTreeRevision,
       );
+      if (this.readStateFromDatabase(jobId).status !== "running")
+        throw new Error(
+          "children may only be retried while the root is running",
+        );
       const row = this.assertChildMutation(jobId, input);
       if (row.status !== "failed" && row.status !== "interrupted")
         throw new Error("only failed or interrupted children may be retried");
@@ -1144,6 +1154,8 @@ export class JobStore {
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
         throw new Error("child attempt is stale");
+      if (row.status !== attempt.status)
+        throw new Error("child and attempt lifecycle state diverged");
       if (attempt.native_handle_json)
         throw new Error("child attempt already has a native runtime handle");
       const envelope = ChildSpawnEnvelopeSchema.parse(
@@ -1195,6 +1207,8 @@ export class JobStore {
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
         throw new Error("child attempt is stale");
+      if (row.status !== attempt.status)
+        throw new Error("child and attempt lifecycle state diverged");
       if (attempt.status !== "active" && attempt.status !== "cancelling")
         throw new Error("child attempt is already terminal");
       if (attempt.status === "cancelling" && evidence.outcome !== "cancelled")

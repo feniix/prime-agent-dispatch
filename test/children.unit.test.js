@@ -415,6 +415,23 @@ test("one retry creates linked attempt history without admitting a sixth child",
   );
   assert.equal(child.attempts[1].inference.model, "gpt-5.6-mini");
   assert.equal((await store.readChildTree(request.jobId)).children.length, 1);
+  tree = await store.readChildTree(request.jobId);
+  child = await store.completeChildAttempt(request.jobId, {
+    ...completion(child, "failed", "retry also failed"),
+    expectedTreeRevision: tree.revision,
+  });
+  await store.updateState(request.jobId, "verifying");
+  tree = await store.readChildTree(request.jobId);
+  await assert.rejects(
+    () =>
+      store.retryChild(request.jobId, {
+        childId: child.envelope.childId,
+        expectedTreeRevision: tree.revision,
+        expectedChildRevision: child.revision,
+        envelopeDigest: child.envelopeDigest,
+      }),
+    /only be retried while the root is running/,
+  );
 });
 
 test("native rlm calls pass through durable admission before runtime spawn", async () => {
