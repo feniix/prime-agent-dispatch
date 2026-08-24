@@ -181,6 +181,7 @@ type ChildAttemptRow = {
   previous_attempt_id: string | null;
   status: ChildStatus;
   inference_json: string;
+  native_child_id: string | null;
   native_handle_json: string | null;
   started_at: string;
   completed_at: string | null;
@@ -190,7 +191,6 @@ type ChildAttemptRow = {
 export type CompleteChildAttemptInput = {
   childId: string;
   attemptId: string;
-  expectedTreeRevision: number;
   expectedChildRevision: number;
   envelopeDigest: string;
   evidence: ChildTerminalEvidence;
@@ -198,7 +198,6 @@ export type CompleteChildAttemptInput = {
 
 export type ChildMutationInput = {
   childId: string;
-  expectedTreeRevision: number;
   expectedChildRevision: number;
   envelopeDigest: string;
 };
@@ -1040,10 +1039,7 @@ export class JobStore {
     await this.ensureImported(jobId);
     const now = new Date().toISOString();
     const child = this.transaction("retry_child", () => {
-      const tree = this.assertChildTreeRevision(
-        jobId,
-        input.expectedTreeRevision,
-      );
+      const policy = this.childTreePolicy(jobId);
       if (this.readStateFromDatabase(jobId).status !== "running")
         throw new Error(
           "children may only be retried while the root is running",
@@ -1052,8 +1048,8 @@ export class JobStore {
       const prior = this.currentChildAttemptFromDatabase(input.childId);
       if (prior.status !== "failed" && prior.status !== "interrupted")
         throw new Error("only failed or interrupted children may be retried");
-      this.assertChildActiveSlot(jobId, tree.policy.maxActiveChildren);
-      if (prior.ordinal >= tree.policy.maxAttemptsPerChild)
+      this.assertChildActiveSlot(jobId, policy.maxActiveChildren);
+      if (prior.ordinal >= policy.maxAttemptsPerChild)
         throw new Error("child retry limit reached");
       const envelope = ChildSpawnEnvelopeSchema.parse(
         parseSqliteJson(row.envelope_json, "child spawn envelope"),
@@ -1110,7 +1106,6 @@ export class JobStore {
     await this.ensureImported(jobId);
     const now = new Date().toISOString();
     const child = this.transaction("cancel_child", () => {
-      this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
       this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.status !== "active")
@@ -1147,7 +1142,6 @@ export class JobStore {
     const nativeHandle = NativeRlmSpawnHandleSchema.parse(input.nativeHandle);
     const now = new Date().toISOString();
     const child = this.transaction("bind_child_runtime", () => {
-      this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
       const row = this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
@@ -1168,9 +1162,14 @@ export class JobStore {
         throw new Error("native child model does not match admitted child");
       this.database
         .prepare(
-          "UPDATE child_attempts SET native_handle_json = ? WHERE attempt_id = ?",
+          `UPDATE child_attempts SET native_child_id = ?, native_handle_json = ?
+           WHERE attempt_id = ?`,
         )
-        .run(sqliteJson(nativeHandle), input.attemptId);
+        .run(
+          nativeHandle.rlmChildId,
+          sqliteJson(nativeHandle),
+          input.attemptId,
+        );
       this.database
         .prepare(
           `UPDATE logical_children SET revision = revision + 1, updated_at = ?
@@ -1200,7 +1199,6 @@ export class JobStore {
     await this.ensureImported(jobId);
     const evidence = ChildTerminalEvidenceSchema.parse(input.evidence);
     const child = this.transaction("complete_child_attempt", () => {
-      this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
       const row = this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
@@ -1255,7 +1253,6 @@ export class JobStore {
     await this.ensureImported(jobId);
     const now = new Date().toISOString();
     const child = this.transaction("decide_child_result", () => {
-      this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
       this.assertChildMutation(jobId, input);
       const status = this.currentChildAttemptFromDatabase(input.childId).status;
       if (input.decision === "selected" && status !== "succeeded")
@@ -1890,6 +1887,16 @@ export class JobStore {
   }
 
   private childAttemptFromRow(row: ChildAttemptRow): ChildAttempt {
+    const nativeHandle = row.native_handle_json
+      ? NativeRlmSpawnHandleSchema.parse(
+          parseSqliteJson(
+            row.native_handle_json,
+            "native child runtime handle",
+          ),
+        )
+      : undefined;
+    if ((nativeHandle?.rlmChildId ?? null) !== row.native_child_id)
+      throw new Error("stored native child runtime identity mismatch");
     return ChildAttemptSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       attemptId: row.attempt_id,
@@ -1903,14 +1910,7 @@ export class JobStore {
       inference: parseSqliteJson(row.inference_json, "child inference policy"),
       startedAt: row.started_at,
       ...(row.completed_at ? { completedAt: row.completed_at } : {}),
-      ...(row.native_handle_json
-        ? {
-            nativeHandle: parseSqliteJson(
-              row.native_handle_json,
-              "native child runtime handle",
-            ),
-          }
-        : {}),
+      ...(nativeHandle ? { nativeHandle } : {}),
       ...(row.terminal_evidence_json
         ? {
             terminalEvidence: parseSqliteJson(
@@ -1927,7 +1927,8 @@ export class JobStore {
       this.database
         .prepare(
           `SELECT attempt_id, child_id, job_id, ordinal, previous_attempt_id,
-                  status, inference_json, native_handle_json, started_at, completed_at,
+                  status, inference_json, native_child_id, native_handle_json,
+                  started_at, completed_at,
                   terminal_evidence_json
            FROM child_attempts WHERE child_id = ? ORDER BY ordinal`,
         )
@@ -1939,7 +1940,8 @@ export class JobStore {
     const row = this.database
       .prepare(
         `SELECT attempt_id, child_id, job_id, ordinal, previous_attempt_id,
-                status, inference_json, native_handle_json, started_at, completed_at,
+                status, inference_json, native_child_id, native_handle_json,
+                started_at, completed_at,
                 terminal_evidence_json
          FROM child_attempts WHERE child_id = ? ORDER BY ordinal DESC LIMIT 1`,
       )
@@ -2009,10 +2011,15 @@ export class JobStore {
       );
     return {
       row,
-      policy: ChildTreePolicySchema.parse(
-        parseSqliteJson(row.policy_json, "child tree policy"),
-      ),
+      policy: this.childTreePolicy(jobId),
     };
+  }
+
+  private childTreePolicy(jobId: string): ChildTreePolicy {
+    const row = this.childTreeRow(jobId) as ChildTreeRow;
+    return ChildTreePolicySchema.parse(
+      parseSqliteJson(row.policy_json, "child tree policy"),
+    );
   }
 
   private assertChildMutation(

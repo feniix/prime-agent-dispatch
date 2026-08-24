@@ -31,6 +31,7 @@ export interface NativeRlmRuntime {
    * before rejecting.
    */
   run(request: NativeRlmRunRequest): Promise<NativeRlmSpawnHandle>;
+  /** Resolve only after the native child process tree is quiescent. */
   cancel(handle: NativeRlmSpawnHandle): Promise<void>;
 }
 
@@ -89,29 +90,37 @@ export class BoundedRlmHostBridge {
       handle = NativeRlmSpawnHandleSchema.parse(
         await this.runtime.run(request),
       );
-      const tree = await this.store.readChildTree(this.jobId);
-      if (!tree) throw new Error("child tree disappeared after admission");
       child = await this.store.bindChildRuntime(this.jobId, {
         childId: envelope.childId,
         attemptId: child.attempts.at(-1)!.attemptId,
-        expectedTreeRevision: tree.revision,
         expectedChildRevision: child.revision,
         envelopeDigest: child.envelopeDigest,
         nativeHandle: handle,
       });
       return { child, handle };
     } catch (error) {
-      if (handle) await this.runtime.cancel(handle).catch(() => undefined);
+      const failureMessage = (
+        error instanceof Error ? error.message : String(error)
+      ).slice(0, 8_192);
+      if (handle) {
+        try {
+          await this.runtime.cancel(handle);
+        } catch (cancellationError) {
+          throw new AggregateError(
+            [error, cancellationError],
+            "native RLM binding failed and runtime cancellation could not be confirmed",
+          );
+        }
+      }
       const tree = await this.store.readChildTree(this.jobId);
       const current = tree?.children.find(
         (candidate) => candidate.envelope.childId === envelope.childId,
       );
-      if (tree && current && current.status === "active")
-        await this.store
-          .completeChildAttempt(this.jobId, {
+      if (current && current.status === "active") {
+        try {
+          await this.store.completeChildAttempt(this.jobId, {
             childId: envelope.childId,
             attemptId: current.attempts.at(-1)!.attemptId,
-            expectedTreeRevision: tree.revision,
             expectedChildRevision: current.revision,
             envelopeDigest: current.envelopeDigest,
             evidence: {
@@ -119,11 +128,17 @@ export class BoundedRlmHostBridge {
               outcome: "interrupted",
               summary:
                 "native RLM admission failed before a trusted runtime binding",
-              error: error instanceof Error ? error.message : String(error),
+              error: failureMessage || "native RLM runtime failed",
               completedAt: new Date().toISOString(),
             },
-          })
-          .catch(() => undefined);
+          });
+        } catch (persistenceError) {
+          throw new AggregateError(
+            [error, persistenceError],
+            "native RLM admission failed and terminal evidence could not be persisted",
+          );
+        }
+      }
       throw error;
     }
   }

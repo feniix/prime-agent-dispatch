@@ -438,11 +438,13 @@ function migrate(database: ControlDatabase): void {
             'active', 'cancelling', 'succeeded', 'failed', 'cancelled', 'interrupted'
           )),
           inference_json TEXT NOT NULL,
+          native_child_id TEXT,
           native_handle_json TEXT,
           started_at TEXT NOT NULL,
           completed_at TEXT,
           terminal_evidence_json TEXT,
-          UNIQUE (child_id, ordinal)
+          UNIQUE (child_id, ordinal),
+          UNIQUE (job_id, native_child_id)
         ) STRICT;
 
         CREATE INDEX logical_children_job_wave
@@ -451,7 +453,7 @@ function migrate(database: ControlDatabase): void {
           ON child_attempts(job_id, status, child_id, ordinal);
 
         CREATE TRIGGER logical_children_envelope_immutable
-        BEFORE UPDATE OF name, envelope_json, envelope_sha256, criticality, wave
+        BEFORE UPDATE OF child_id, job_id, name, envelope_json, envelope_sha256, criticality, wave
         ON logical_children
         BEGIN
           SELECT RAISE(ABORT, 'child spawn envelope is immutable');
@@ -469,6 +471,14 @@ function migrate(database: ControlDatabase): void {
         ON child_attempts
         BEGIN
           SELECT RAISE(ABORT, 'child attempt policy is immutable');
+        END;
+
+        CREATE TRIGGER child_attempt_native_handle_immutable
+        BEFORE UPDATE OF native_child_id, native_handle_json
+        ON child_attempts
+        WHEN OLD.native_child_id IS NOT NULL OR OLD.native_handle_json IS NOT NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'native child runtime handle is immutable');
         END;
 
         CREATE TRIGGER child_dependencies_immutable_update

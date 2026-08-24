@@ -131,6 +131,25 @@ test("concurrent admissions cannot exceed three active children", async () => {
     /active admission limit/,
   );
   assert.equal((await store.readChildTree(request.jobId)).children.length, 3);
+  const admitted = results.flatMap((result, index) =>
+    result.status === "fulfilled"
+      ? [{ child: result.value, connection: stores[index] }]
+      : [],
+  );
+  await Promise.all(
+    admitted.map(({ child, connection }) =>
+      connection.completeChildAttempt(
+        request.jobId,
+        completion(child, "succeeded"),
+      ),
+    ),
+  );
+  assert.deepEqual(
+    (await store.readChildTree(request.jobId)).children.map(
+      (child) => child.status,
+    ),
+    ["succeeded", "succeeded", "succeeded"],
+  );
   for (const connection of stores) connection.close();
 });
 
@@ -143,10 +162,8 @@ test("logical child total is five even after earlier attempts finish", async () 
       tree.revision,
       envelope(request.jobId, `total-${index}`, { criticality: "advisory" }),
     );
-    tree = await store.readChildTree(request.jobId);
     await store.completeChildAttempt(request.jobId, {
       ...completion(child, "succeeded"),
-      expectedTreeRevision: tree.revision,
     });
     tree = await store.readChildTree(request.jobId);
   }
@@ -212,18 +229,16 @@ test("stale writers, duplicate names, wrong parents, and dependency cycles roll 
 
 test("spawn envelopes are digest-bound and immutable in SQLite", async () => {
   const { root, store, request } = await fixture();
-  let tree = await store.enableChildTree(request.jobId);
+  const tree = await store.enableChildTree(request.jobId);
   const child = await store.admitChild(
     request.jobId,
     tree.revision,
     envelope(request.jobId, "immutable"),
   );
-  tree = await store.readChildTree(request.jobId);
   await assert.rejects(
     () =>
       store.completeChildAttempt(request.jobId, {
         ...completion(child, "succeeded"),
-        expectedTreeRevision: tree.revision,
         envelopeDigest: "f".repeat(64),
       }),
     /spawn envelope changed/,
@@ -243,7 +258,7 @@ test("spawn envelopes are digest-bound and immutable in SQLite", async () => {
 
 test("verification joins all attempts and discarded children must be cancelled", async () => {
   const { store, request } = await fixture();
-  let tree = await store.enableChildTree(request.jobId);
+  const tree = await store.enableChildTree(request.jobId);
   let child = await store.admitChild(
     request.jobId,
     tree.revision,
@@ -253,32 +268,25 @@ test("verification joins all attempts and discarded children must be cancelled",
     () => store.updateState(request.jobId, "verifying"),
     /every child attempt to be terminal/,
   );
-  tree = await store.readChildTree(request.jobId);
   await assert.rejects(
     () =>
       store.completeChildAttempt(request.jobId, {
         ...completion(child, "cancelled"),
-        expectedTreeRevision: tree.revision,
       }),
     /cancellation must be requested/,
   );
   child = await store.requestChildCancellation(request.jobId, {
     childId: child.envelope.childId,
-    expectedTreeRevision: tree.revision,
     expectedChildRevision: child.revision,
     envelopeDigest: child.envelopeDigest,
   });
-  tree = await store.readChildTree(request.jobId);
   child = await store.completeChildAttempt(request.jobId, {
     ...completion(child, "cancelled", "root discarded this child"),
-    expectedTreeRevision: tree.revision,
   });
-  tree = await store.readChildTree(request.jobId);
   await assert.rejects(
     () =>
       store.decideChildResult(request.jobId, {
         childId: child.envelope.childId,
-        expectedTreeRevision: tree.revision,
         expectedChildRevision: child.revision,
         envelopeDigest: child.envelopeDigest,
         decision: "selected",
@@ -287,7 +295,6 @@ test("verification joins all attempts and discarded children must be cancelled",
   );
   child = await store.decideChildResult(request.jobId, {
     childId: child.envelope.childId,
-    expectedTreeRevision: tree.revision,
     expectedChildRevision: child.revision,
     envelopeDigest: child.envelopeDigest,
     decision: "discarded",
@@ -304,10 +311,8 @@ test("required failure blocks root success while advisory failure stays attribut
     tree.revision,
     envelope(request.jobId, "required-failure"),
   );
-  tree = await store.readChildTree(request.jobId);
   await store.completeChildAttempt(request.jobId, {
     ...completion(required, "failed", "required failed"),
-    expectedTreeRevision: tree.revision,
   });
   tree = await store.readChildTree(request.jobId);
   const advisory = await store.admitChild(
@@ -315,10 +320,8 @@ test("required failure blocks root success while advisory failure stays attribut
     tree.revision,
     envelope(request.jobId, "advisory-failure", { criticality: "advisory" }),
   );
-  tree = await store.readChildTree(request.jobId);
   await store.completeChildAttempt(request.jobId, {
     ...completion(advisory, "failed", "advisory failed"),
-    expectedTreeRevision: tree.revision,
   });
   await store.updateState(request.jobId, "verifying");
   await store.updateState(request.jobId, "committing");
@@ -349,16 +352,14 @@ test("required failure blocks root success while advisory failure stays attribut
 
 test("an advisory-only failure remains evidence without blocking root success", async () => {
   const { store, request } = await fixture("advisory-root-success");
-  let tree = await store.enableChildTree(request.jobId);
+  const tree = await store.enableChildTree(request.jobId);
   const advisory = await store.admitChild(
     request.jobId,
     tree.revision,
     envelope(request.jobId, "advisory-only", { criticality: "advisory" }),
   );
-  tree = await store.readChildTree(request.jobId);
   await store.completeChildAttempt(request.jobId, {
     ...completion(advisory, "failed", "non-blocking review failed"),
-    expectedTreeRevision: tree.revision,
   });
   await store.updateState(request.jobId, "verifying");
   await store.updateState(request.jobId, "committing");
@@ -385,21 +386,17 @@ test("an advisory-only failure remains evidence without blocking root success", 
 
 test("one retry creates linked attempt history without admitting a sixth child", async () => {
   const { store, request } = await fixture();
-  let tree = await store.enableChildTree(request.jobId);
+  const tree = await store.enableChildTree(request.jobId);
   let child = await store.admitChild(
     request.jobId,
     tree.revision,
     envelope(request.jobId, "retryable"),
   );
-  tree = await store.readChildTree(request.jobId);
   child = await store.completeChildAttempt(request.jobId, {
     ...completion(child, "failed"),
-    expectedTreeRevision: tree.revision,
   });
-  tree = await store.readChildTree(request.jobId);
   child = await store.retryChild(request.jobId, {
     childId: child.envelope.childId,
-    expectedTreeRevision: tree.revision,
     expectedChildRevision: child.revision,
     envelopeDigest: child.envelopeDigest,
     inference: {
@@ -415,18 +412,14 @@ test("one retry creates linked attempt history without admitting a sixth child",
   );
   assert.equal(child.attempts[1].inference.model, "gpt-5.6-mini");
   assert.equal((await store.readChildTree(request.jobId)).children.length, 1);
-  tree = await store.readChildTree(request.jobId);
   child = await store.completeChildAttempt(request.jobId, {
     ...completion(child, "failed", "retry also failed"),
-    expectedTreeRevision: tree.revision,
   });
   await store.updateState(request.jobId, "verifying");
-  tree = await store.readChildTree(request.jobId);
   await assert.rejects(
     () =>
       store.retryChild(request.jobId, {
         childId: child.envelope.childId,
-        expectedTreeRevision: tree.revision,
         expectedChildRevision: child.revision,
         envelopeDigest: child.envelopeDigest,
       }),
@@ -471,4 +464,64 @@ test("native rlm calls pass through durable admission before runtime spawn", asy
     "sub-native-1",
   );
   assert.equal(admitted.child.revision, 1);
+});
+
+test("an unconfirmed native cancellation keeps the child active and blocks joins", async () => {
+  const { store, request } = await fixture("uncertain-native-cancellation");
+  const tree = await store.enableChildTree(request.jobId);
+  const prompt = "return a mismatched native handle";
+  const bridge = new BoundedRlmHostBridge(store, request.jobId, {
+    async run(nativeRequest) {
+      return {
+        rlmChildId: "sub-unconfirmed",
+        name: nativeRequest.kwargs.name,
+        sessionDir: "/tmp/unconfirmed-native-session",
+        model: "openai/not-the-admitted-model",
+      };
+    },
+    async cancel() {
+      throw new Error("native runtime remained reachable");
+    },
+  });
+  await assert.rejects(
+    () =>
+      bridge.run({
+        expectedTreeRevision: tree.revision,
+        request: { prompt, kwargs: {} },
+        envelope: envelope(request.jobId, "unconfirmed-native", { prompt }),
+      }),
+    /runtime cancellation could not be confirmed/,
+  );
+  assert.equal(
+    (await store.readChildTree(request.jobId)).children[0].status,
+    "active",
+  );
+  await assert.rejects(
+    () => store.updateState(request.jobId, "verifying"),
+    /every child attempt to be terminal/,
+  );
+});
+
+test("native spawn errors persist bounded terminal evidence", async () => {
+  const { store, request } = await fixture("bounded-native-error");
+  const tree = await store.enableChildTree(request.jobId);
+  const prompt = "fail before returning a native handle";
+  const bridge = new BoundedRlmHostBridge(store, request.jobId, {
+    async run() {
+      throw new Error("x".repeat(9_000));
+    },
+    async cancel() {
+      assert.fail("a runtime without a handle must quiesce before rejecting");
+    },
+  });
+  await assert.rejects(() =>
+    bridge.run({
+      expectedTreeRevision: tree.revision,
+      request: { prompt, kwargs: {} },
+      envelope: envelope(request.jobId, "bounded-native-error", { prompt }),
+    }),
+  );
+  const child = (await store.readChildTree(request.jobId)).children[0];
+  assert.equal(child.status, "interrupted");
+  assert.equal(child.attempts[0].terminalEvidence.error.length, 8_192);
 });
