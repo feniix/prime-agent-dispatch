@@ -1,9 +1,21 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+  inspectControlMigrations,
+  latestControlSchemaVersion,
+  migrateControlDatabase,
+  type ControlMigrationState,
+  type MigrationRunnerOptions,
+} from "./migrations/runner.js";
+import { runImmediateTransaction } from "./migrations/framework.js";
 
 export const CONTROL_DATABASE_NAME = "control-plane.sqlite3";
-export const CONTROL_SCHEMA_VERSION = 5;
+export const CONTROL_SCHEMA_VERSION = latestControlSchemaVersion();
+const SQLITE_BUSY = 5;
+const JOURNAL_MODE_RETRY_MS = 5_000;
+const JOURNAL_MODE_RETRY_DELAY_MS = 25;
+const journalModeRetrySignal = new Int32Array(new SharedArrayBuffer(4));
 
 export type ControlDatabase = DatabaseSync;
 
@@ -12,33 +24,56 @@ export function openControlDatabase(stateRoot: string): ControlDatabase {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const databasePath = join(root, CONTROL_DATABASE_NAME);
   const database = new DatabaseSync(databasePath);
-  chmodSync(databasePath, 0o600);
-  database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA busy_timeout = 5000");
-  database.exec("PRAGMA journal_mode = WAL");
-  database.exec("PRAGMA synchronous = FULL");
-  database.exec("PRAGMA wal_autocheckpoint = 1000");
-  migrate(database);
-  return database;
+  try {
+    chmodSync(databasePath, 0o600);
+    database.exec("PRAGMA foreign_keys = ON");
+    database.exec("PRAGMA busy_timeout = 5000");
+    enableWal(database);
+    database.exec("PRAGMA synchronous = FULL");
+    database.exec("PRAGMA wal_autocheckpoint = 1000");
+    migrateControlDatabase(database);
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}
+
+function enableWal(database: ControlDatabase): void {
+  const deadline = Date.now() + JOURNAL_MODE_RETRY_MS;
+  for (;;) {
+    try {
+      database.exec("PRAGMA journal_mode = WAL");
+      return;
+    } catch (error) {
+      if (
+        (error as { errcode?: unknown }).errcode !== SQLITE_BUSY ||
+        Date.now() >= deadline
+      )
+        throw error;
+      Atomics.wait(journalModeRetrySignal, 0, 0, JOURNAL_MODE_RETRY_DELAY_MS);
+    }
+  }
+}
+
+export function migrateOpenControlDatabase(
+  database: ControlDatabase,
+  options?: MigrationRunnerOptions,
+): ControlMigrationState {
+  return migrateControlDatabase(database, options);
+}
+
+export function inspectOpenControlDatabase(
+  database: ControlDatabase,
+): ControlMigrationState {
+  return inspectControlMigrations(database);
 }
 
 export function immediateTransaction<T>(
   database: ControlDatabase,
   operation: () => T,
 ): T {
-  database.exec("BEGIN IMMEDIATE");
-  try {
-    const result = operation();
-    database.exec("COMMIT");
-    return result;
-  } catch (error) {
-    try {
-      database.exec("ROLLBACK");
-    } catch {
-      // Preserve the original transactional failure.
-    }
-    throw error;
-  }
+  return runImmediateTransaction(database, operation);
 }
 
 export function sqliteJson(value: unknown): string {
@@ -53,450 +88,4 @@ export function parseSqliteJson(value: unknown, label: string): unknown {
   } catch (error) {
     throw new Error(`invalid ${label} stored in SQLite`, { cause: error });
   }
-}
-
-function migrate(database: ControlDatabase): void {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      name TEXT NOT NULL,
-      applied_at TEXT NOT NULL
-    ) STRICT;
-  `);
-  const current = database
-    .prepare(
-      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-    )
-    .get() as { version: number };
-  if (current.version > CONTROL_SCHEMA_VERSION)
-    throw new Error(
-      `unsupported control database schema ${current.version}; expected at most ${CONTROL_SCHEMA_VERSION}`,
-    );
-  if (current.version < 1)
-    immediateTransaction(database, () => {
-      const locked = database
-        .prepare(
-          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-        )
-        .get() as { version: number };
-      if (locked.version >= 1) return;
-      if (locked.version !== 0)
-        throw new Error(
-          `unsupported control database schema ${locked.version}`,
-        );
-      database.exec(`
-      CREATE TABLE jobs (
-        job_id TEXT PRIMARY KEY,
-        request_json TEXT NOT NULL,
-        state_json TEXT NOT NULL,
-        result_json TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        imported_from_json INTEGER NOT NULL DEFAULT 0 CHECK (imported_from_json IN (0, 1))
-      ) STRICT;
-
-      CREATE TABLE events (
-        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-        sequence INTEGER NOT NULL CHECK (sequence > 0),
-        type TEXT NOT NULL,
-        dedupe_key TEXT,
-        event_json TEXT NOT NULL,
-        PRIMARY KEY (job_id, sequence)
-      ) STRICT;
-
-      CREATE UNIQUE INDEX events_dedupe
-        ON events(job_id, type, dedupe_key)
-        WHERE dedupe_key IS NOT NULL;
-
-      CREATE TABLE notification_cursors (
-        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-        consumer_id TEXT NOT NULL,
-        last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0),
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (job_id, consumer_id)
-      ) STRICT;
-
-      CREATE TABLE inference_usage (
-        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-        request_id TEXT NOT NULL,
-        usage_json TEXT NOT NULL,
-        PRIMARY KEY (job_id, request_id)
-      ) STRICT;
-
-      CREATE TABLE artifacts (
-        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-        relative_path TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('file', 'symlink')),
-        sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
-        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
-        published_at TEXT NOT NULL,
-        PRIMARY KEY (job_id, relative_path)
-      ) STRICT;
-
-      CREATE TABLE leases (
-        name TEXT PRIMARY KEY,
-        owner_json TEXT NOT NULL,
-        revision INTEGER NOT NULL CHECK (revision > 0),
-        updated_at TEXT NOT NULL
-      ) STRICT;
-
-      CREATE TABLE authority_audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id TEXT,
-        at TEXT NOT NULL,
-        action TEXT NOT NULL,
-        data_json TEXT NOT NULL
-      ) STRICT;
-    `);
-      database
-        .prepare(
-          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        )
-        .run(1, "initial transactional authority", new Date().toISOString());
-    });
-
-  const afterInitial = database
-    .prepare(
-      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-    )
-    .get() as { version: number };
-  if (afterInitial.version < 2)
-    immediateTransaction(database, () => {
-      const locked = database
-        .prepare(
-          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-        )
-        .get() as { version: number };
-      if (locked.version >= 2) return;
-      if (locked.version !== 1)
-        throw new Error(
-          `unsupported control database schema ${locked.version}`,
-        );
-      database.exec(`
-        CREATE TABLE execution_attempts (
-          attempt_id TEXT PRIMARY KEY,
-          job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
-          resumed_from_attempt_id TEXT REFERENCES execution_attempts(attempt_id) ON DELETE RESTRICT,
-          status TEXT NOT NULL CHECK (status IN ('active', 'succeeded', 'failed', 'cancelled', 'interrupted')),
-          started_at TEXT NOT NULL,
-          completed_at TEXT,
-          resume_plan_json TEXT,
-          terminal_result_json TEXT,
-          UNIQUE (job_id, ordinal)
-        ) STRICT;
-
-        CREATE TABLE recovery_checkpoints (
-          attempt_id TEXT NOT NULL REFERENCES execution_attempts(attempt_id) ON DELETE RESTRICT,
-          job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-          operation_key TEXT NOT NULL,
-          ordinal INTEGER NOT NULL CHECK (ordinal > 0),
-          stage TEXT NOT NULL CHECK (stage IN (
-            'worktree',
-            'model_provisioning',
-            'prime_execution',
-            'quiescence',
-            'verification',
-            'commit',
-            'terminal_materialization'
-          )),
-          status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'uncertain', 'retryable')),
-          facts_json TEXT NOT NULL,
-          started_at TEXT NOT NULL,
-          completed_at TEXT,
-          PRIMARY KEY (attempt_id, operation_key),
-          UNIQUE (attempt_id, ordinal)
-        ) STRICT;
-
-        CREATE TABLE resume_confirmations (
-          token_hash TEXT PRIMARY KEY CHECK (length(token_hash) = 64),
-          job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE RESTRICT,
-          source_attempt_id TEXT NOT NULL REFERENCES execution_attempts(attempt_id) ON DELETE RESTRICT,
-          expected_revision INTEGER NOT NULL CHECK (expected_revision >= 0),
-          context_hash TEXT NOT NULL CHECK (length(context_hash) = 64),
-          plan_json TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          expires_at TEXT NOT NULL,
-          used_at TEXT
-        ) STRICT;
-
-        CREATE INDEX recovery_checkpoints_job
-          ON recovery_checkpoints(job_id, attempt_id, ordinal);
-        CREATE INDEX resume_confirmations_job
-          ON resume_confirmations(job_id, created_at);
-      `);
-      const jobs = database
-        .prepare(
-          "SELECT job_id, state_json, result_json, created_at, updated_at FROM jobs ORDER BY job_id",
-        )
-        .all() as Array<{
-        job_id: string;
-        state_json: string;
-        result_json: string | null;
-        created_at: string;
-        updated_at: string;
-      }>;
-      const insertAttempt = database.prepare(
-        `INSERT INTO execution_attempts(
-           attempt_id, job_id, ordinal, resumed_from_attempt_id, status,
-           started_at, completed_at, resume_plan_json, terminal_result_json
-         ) VALUES (?, ?, 1, NULL, ?, ?, ?, NULL, ?)`,
-      );
-      for (const job of jobs) {
-        const state = parseSqliteJson(job.state_json, "job state") as {
-          status?: string;
-        };
-        const terminal = new Set([
-          "succeeded",
-          "failed",
-          "cancelled",
-          "interrupted",
-        ]).has(state.status ?? "");
-        const status = terminal ? (state.status as string) : "active";
-        insertAttempt.run(
-          `legacy:${job.job_id}`,
-          job.job_id,
-          status,
-          job.created_at,
-          terminal ? job.updated_at : null,
-          job.result_json,
-        );
-      }
-      database
-        .prepare(
-          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        )
-        .run(
-          2,
-          "execution attempts and recovery checkpoints",
-          new Date().toISOString(),
-        );
-    });
-
-  const afterRecovery = database
-    .prepare(
-      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-    )
-    .get() as { version: number };
-  if (afterRecovery.version < 3)
-    immediateTransaction(database, () => {
-      const locked = database
-        .prepare(
-          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-        )
-        .get() as { version: number };
-      if (locked.version >= 3) return;
-      if (locked.version !== 2)
-        throw new Error(
-          `unsupported control database schema ${locked.version}`,
-        );
-      database.exec(`
-        ALTER TABLE artifacts ADD COLUMN retention_status TEXT NOT NULL DEFAULT 'retained';
-        ALTER TABLE artifacts ADD COLUMN deleted_at TEXT;
-        ALTER TABLE artifacts ADD COLUMN cleanup_run_id TEXT;
-
-        CREATE TABLE cleanup_runs (
-          run_id TEXT PRIMARY KEY,
-          policy_json TEXT NOT NULL,
-          snapshot_sha256 TEXT NOT NULL CHECK (length(snapshot_sha256) = 64),
-          status TEXT NOT NULL CHECK (status IN ('planned', 'applying', 'completed', 'interrupted')),
-          created_at TEXT NOT NULL,
-          started_at TEXT,
-          completed_at TEXT,
-          estimated_reclaimed_bytes INTEGER NOT NULL CHECK (estimated_reclaimed_bytes >= 0),
-          reclaimed_bytes INTEGER NOT NULL DEFAULT 0 CHECK (reclaimed_bytes >= 0),
-          quota_deficit_bytes INTEGER NOT NULL DEFAULT 0 CHECK (quota_deficit_bytes >= 0)
-        ) STRICT;
-
-        CREATE TABLE cleanup_actions (
-          run_id TEXT NOT NULL REFERENCES cleanup_runs(run_id) ON DELETE RESTRICT,
-          sequence INTEGER NOT NULL CHECK (sequence > 0),
-          job_id TEXT REFERENCES jobs(job_id) ON DELETE RESTRICT,
-          kind TEXT NOT NULL CHECK (kind IN ('artifact', 'disposable_cache', 'worktree', 'branch', 'evidence')),
-          target TEXT NOT NULL,
-          decision TEXT NOT NULL CHECK (decision IN ('keep', 'delete')),
-          reason TEXT NOT NULL,
-          expected_json TEXT NOT NULL,
-          estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
-          status TEXT NOT NULL CHECK (status IN ('planned', 'applying', 'applied', 'skipped', 'failed')),
-          outcome_json TEXT,
-          updated_at TEXT NOT NULL,
-          PRIMARY KEY (run_id, sequence)
-        ) STRICT;
-
-        CREATE INDEX cleanup_actions_job
-          ON cleanup_actions(job_id, run_id, sequence);
-      `);
-      database
-        .prepare(
-          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        )
-        .run(
-          3,
-          "checkpointed bounded evidence retention",
-          new Date().toISOString(),
-        );
-    });
-
-  const afterCleanup = database
-    .prepare(
-      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-    )
-    .get() as { version: number };
-  if (afterCleanup.version < 4)
-    immediateTransaction(database, () => {
-      const locked = database
-        .prepare(
-          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-        )
-        .get() as { version: number };
-      if (locked.version >= 4) return;
-      if (locked.version !== 3)
-        throw new Error(
-          `unsupported control database schema ${locked.version}`,
-        );
-      database.exec(`
-        CREATE TABLE cleanup_job_reservations (
-          job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE RESTRICT,
-          run_id TEXT NOT NULL REFERENCES cleanup_runs(run_id) ON DELETE RESTRICT,
-          state_revision INTEGER NOT NULL CHECK (state_revision >= 0),
-          acquired_at TEXT NOT NULL
-        ) STRICT;
-
-        CREATE INDEX cleanup_job_reservations_run
-          ON cleanup_job_reservations(run_id, job_id);
-      `);
-      database
-        .prepare(
-          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        )
-        .run(
-          4,
-          "durable per-job cleanup reservations",
-          new Date().toISOString(),
-        );
-    });
-
-  const afterReservations = database
-    .prepare(
-      "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-    )
-    .get() as { version: number };
-  if (afterReservations.version < 5)
-    immediateTransaction(database, () => {
-      const locked = database
-        .prepare(
-          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
-        )
-        .get() as { version: number };
-      if (locked.version >= 5) return;
-      if (locked.version !== 4)
-        throw new Error(
-          `unsupported control database schema ${locked.version}`,
-        );
-      database.exec(`
-        CREATE TABLE child_trees (
-          job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE RESTRICT,
-          policy_json TEXT NOT NULL,
-          policy_sha256 TEXT NOT NULL CHECK (length(policy_sha256) = 64),
-          revision INTEGER NOT NULL CHECK (revision >= 0),
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-
-        CREATE TABLE logical_children (
-          child_id TEXT PRIMARY KEY,
-          job_id TEXT NOT NULL REFERENCES child_trees(job_id) ON DELETE RESTRICT,
-          name TEXT NOT NULL,
-          envelope_json TEXT NOT NULL,
-          envelope_sha256 TEXT NOT NULL CHECK (length(envelope_sha256) = 64),
-          criticality TEXT NOT NULL CHECK (criticality IN ('required', 'advisory')),
-          wave INTEGER NOT NULL CHECK (wave > 0 AND wave <= 5),
-          decision TEXT NOT NULL CHECK (decision IN ('pending', 'selected', 'discarded')),
-          revision INTEGER NOT NULL CHECK (revision >= 0),
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE (job_id, name),
-          UNIQUE (job_id, child_id)
-        ) STRICT;
-
-        CREATE TABLE child_dependencies (
-          job_id TEXT NOT NULL REFERENCES child_trees(job_id) ON DELETE RESTRICT,
-          child_id TEXT NOT NULL REFERENCES logical_children(child_id) ON DELETE RESTRICT,
-          dependency_child_id TEXT NOT NULL REFERENCES logical_children(child_id) ON DELETE RESTRICT,
-          PRIMARY KEY (job_id, child_id, dependency_child_id),
-          CHECK (child_id <> dependency_child_id)
-        ) STRICT;
-
-        CREATE TABLE child_attempts (
-          attempt_id TEXT PRIMARY KEY,
-          child_id TEXT NOT NULL REFERENCES logical_children(child_id) ON DELETE RESTRICT,
-          job_id TEXT NOT NULL REFERENCES child_trees(job_id) ON DELETE RESTRICT,
-          ordinal INTEGER NOT NULL CHECK (ordinal > 0 AND ordinal <= 2),
-          previous_attempt_id TEXT REFERENCES child_attempts(attempt_id) ON DELETE RESTRICT,
-          status TEXT NOT NULL CHECK (status IN (
-            'active', 'cancelling', 'succeeded', 'failed', 'cancelled', 'interrupted'
-          )),
-          inference_json TEXT NOT NULL,
-          native_child_id TEXT,
-          native_handle_json TEXT,
-          started_at TEXT NOT NULL,
-          completed_at TEXT,
-          terminal_evidence_json TEXT,
-          UNIQUE (child_id, ordinal),
-          UNIQUE (job_id, native_child_id)
-        ) STRICT;
-
-        CREATE INDEX logical_children_job_wave
-          ON logical_children(job_id, wave, name);
-        CREATE INDEX child_attempts_job_status
-          ON child_attempts(job_id, status, child_id, ordinal);
-
-        CREATE TRIGGER logical_children_envelope_immutable
-        BEFORE UPDATE OF child_id, job_id, name, envelope_json, envelope_sha256, criticality, wave
-        ON logical_children
-        BEGIN
-          SELECT RAISE(ABORT, 'child spawn envelope is immutable');
-        END;
-
-        CREATE TRIGGER child_tree_policy_immutable
-        BEFORE UPDATE OF policy_json, policy_sha256
-        ON child_trees
-        BEGIN
-          SELECT RAISE(ABORT, 'child tree policy is immutable');
-        END;
-
-        CREATE TRIGGER child_attempt_policy_immutable
-        BEFORE UPDATE OF child_id, job_id, ordinal, previous_attempt_id, inference_json, started_at
-        ON child_attempts
-        BEGIN
-          SELECT RAISE(ABORT, 'child attempt policy is immutable');
-        END;
-
-        CREATE TRIGGER child_attempt_native_handle_immutable
-        BEFORE UPDATE OF native_child_id, native_handle_json
-        ON child_attempts
-        WHEN OLD.native_child_id IS NOT NULL OR OLD.native_handle_json IS NOT NULL
-        BEGIN
-          SELECT RAISE(ABORT, 'native child runtime handle is immutable');
-        END;
-
-        CREATE TRIGGER child_dependencies_immutable_update
-        BEFORE UPDATE ON child_dependencies
-        BEGIN
-          SELECT RAISE(ABORT, 'child dependencies are immutable');
-        END;
-
-        CREATE TRIGGER child_dependencies_immutable_delete
-        BEFORE DELETE ON child_dependencies
-        BEGIN
-          SELECT RAISE(ABORT, 'child dependencies are immutable');
-        END;
-      `);
-      database
-        .prepare(
-          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-        )
-        .run(5, "bounded root-directed child tree", new Date().toISOString());
-    });
 }

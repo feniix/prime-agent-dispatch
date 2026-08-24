@@ -1,0 +1,265 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { promisify } from "node:util";
+import {
+  CONTROL_DATABASE_NAME,
+  CONTROL_SCHEMA_VERSION,
+  inspectOpenControlDatabase,
+  migrateOpenControlDatabase,
+  openControlDatabase,
+} from "../dist/index.js";
+
+const exec = promisify(execFile);
+const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+
+async function temporaryRoot(label) {
+  return mkdtemp(join(tmpdir(), `prime-migrations-${label}-`));
+}
+
+function databaseAt(root) {
+  const database = new DatabaseSync(join(root, CONTROL_DATABASE_NAME));
+  database.exec("PRAGMA foreign_keys = ON");
+  database.exec("PRAGMA busy_timeout = 5000");
+  database.exec("PRAGMA journal_mode = WAL");
+  database.exec("PRAGMA synchronous = FULL");
+  return database;
+}
+
+function insertSentinelJob(database, jobId) {
+  const at = "2026-08-24T22:00:00.000Z";
+  database
+    .prepare(
+      `INSERT INTO jobs(
+         job_id, request_json, state_json, result_json,
+         created_at, updated_at, imported_from_json
+       ) VALUES (?, '{}', ?, NULL, ?, ?, 0)`,
+    )
+    .run(jobId, JSON.stringify({ status: "interrupted" }), at, at);
+}
+
+test("fresh databases apply the immutable migration manifest through latest", async () => {
+  const root = await temporaryRoot("fresh");
+  const database = openControlDatabase(root);
+  try {
+    const state = inspectOpenControlDatabase(database);
+    assert.equal(state.currentVersion, CONTROL_SCHEMA_VERSION);
+    assert.equal(state.latestVersion, CONTROL_SCHEMA_VERSION);
+    assert.deepEqual(
+      state.applied.map((migration) => migration.version),
+      Array.from({ length: CONTROL_SCHEMA_VERSION }, (_, index) => index + 1),
+    );
+    assert.ok(
+      state.applied.every(
+        (migration) =>
+          typeof migration.checksum === "string" &&
+          migration.checksum.length === 64,
+      ),
+    );
+  } finally {
+    database.close();
+  }
+});
+
+for (let fixtureVersion = 1; fixtureVersion <= 5; fixtureVersion += 1) {
+  test(`schema v${fixtureVersion} upgrades to latest with authority data preserved`, async () => {
+    const root = await temporaryRoot(`v${fixtureVersion}`);
+    const fixture = databaseAt(root);
+    migrateOpenControlDatabase(fixture, { targetVersion: 1 });
+    const jobId = `fixture-v${fixtureVersion}`;
+    insertSentinelJob(fixture, jobId);
+    if (fixtureVersion > 1)
+      migrateOpenControlDatabase(fixture, { targetVersion: fixtureVersion });
+    fixture.close();
+
+    const migrated = openControlDatabase(root);
+    try {
+      assert.equal(
+        inspectOpenControlDatabase(migrated).currentVersion,
+        CONTROL_SCHEMA_VERSION,
+      );
+      assert.equal(
+        migrated.prepare("SELECT job_id FROM jobs WHERE job_id = ?").get(jobId)
+          .job_id,
+        jobId,
+      );
+      assert.equal(
+        migrated
+          .prepare("SELECT status FROM execution_attempts WHERE attempt_id = ?")
+          .get(`legacy:${jobId}`).status,
+        "interrupted",
+      );
+      assert.equal(
+        migrated.prepare("PRAGMA integrity_check").get().integrity_check,
+        "ok",
+      );
+      assert.deepEqual(migrated.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      migrated.close();
+    }
+  });
+}
+
+test("concurrent startup records each migration exactly once", async () => {
+  const root = await temporaryRoot("concurrent");
+  const moduleUrl = pathToFileURL(join(repositoryRoot, "dist/index.js")).href;
+  const program = `
+    import { openControlDatabase } from ${JSON.stringify(moduleUrl)};
+    const database = openControlDatabase(process.argv[1]);
+    database.close();
+  `;
+  await Promise.all(
+    Array.from({ length: 6 }, () =>
+      exec(process.execPath, ["--input-type=module", "--eval", program, root]),
+    ),
+  );
+  const database = databaseAt(root);
+  try {
+    assert.equal(
+      database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()
+        .count,
+      CONTROL_SCHEMA_VERSION,
+    );
+    assert.equal(
+      database
+        .prepare(
+          "SELECT COUNT(DISTINCT version) AS count FROM schema_migrations",
+        )
+        .get().count,
+      CONTROL_SCHEMA_VERSION,
+    );
+    assert.equal(
+      inspectOpenControlDatabase(database).currentVersion,
+      CONTROL_SCHEMA_VERSION,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("a mid-migration failure rolls back and later startup retries", async () => {
+  const root = await temporaryRoot("rollback");
+  const database = databaseAt(root);
+  migrateOpenControlDatabase(database, { targetVersion: 2 });
+  assert.throws(
+    () =>
+      migrateOpenControlDatabase(database, {
+        targetVersion: 3,
+        faultInjector(point) {
+          if (point === "migration:3:operation:1")
+            throw new Error("injected migration failure");
+        },
+      }),
+    /injected migration failure/,
+  );
+  assert.equal(inspectOpenControlDatabase(database).currentVersion, 2);
+  assert.equal(
+    database
+      .prepare("PRAGMA table_info(artifacts)")
+      .all()
+      .some((column) => column.name === "retention_status"),
+    false,
+  );
+  assert.equal(
+    migrateOpenControlDatabase(database).currentVersion,
+    CONTROL_SCHEMA_VERSION,
+  );
+  database.close();
+});
+
+test("tampered applied migration checksums fail closed", async () => {
+  const root = await temporaryRoot("checksum-drift");
+  const database = openControlDatabase(root);
+  database
+    .prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 3")
+    .run("0".repeat(64));
+  assert.throws(
+    () => inspectOpenControlDatabase(database),
+    /migration 3 checksum drift/,
+  );
+  database.close();
+  assert.throws(() => openControlDatabase(root), /migration 3 checksum drift/);
+});
+
+test("missing applied migrations fail closed", async () => {
+  const root = await temporaryRoot("missing");
+  const database = openControlDatabase(root);
+  database.prepare("DELETE FROM schema_migrations WHERE version = 3").run();
+  assert.throws(
+    () => inspectOpenControlDatabase(database),
+    /not a contiguous prefix/,
+  );
+  database.close();
+});
+
+test("databases newer than the running binary fail closed", async () => {
+  const root = await temporaryRoot("future");
+  const database = openControlDatabase(root);
+  database
+    .prepare(
+      "INSERT INTO schema_migrations(version, name, applied_at, checksum) VALUES (?, 'future', ?, ?)",
+    )
+    .run(
+      CONTROL_SCHEMA_VERSION + 1,
+      "2026-08-24T22:01:00.000Z",
+      "f".repeat(64),
+    );
+  assert.throws(
+    () => inspectOpenControlDatabase(database),
+    /unsupported control database schema/,
+  );
+  database.close();
+});
+
+test("developer migration commands scaffold, apply, and inspect", async () => {
+  const root = await temporaryRoot("commands");
+  const scaffoldRoot = await temporaryRoot("scaffold");
+  const cli = join(repositoryRoot, "dist/cli.js");
+  const applied = JSON.parse(
+    (
+      await exec(
+        process.execPath,
+        [cli, "migration-apply", "--state-root", root],
+        { cwd: repositoryRoot },
+      )
+    ).stdout,
+  );
+  assert.equal(applied.currentVersion, CONTROL_SCHEMA_VERSION);
+  const status = JSON.parse(
+    (
+      await exec(
+        process.execPath,
+        [cli, "migration-status", "--state-root", root],
+        { cwd: repositoryRoot },
+      )
+    ).stdout,
+  );
+  assert.equal(status.currentVersion, CONTROL_SCHEMA_VERSION);
+
+  const created = JSON.parse(
+    (
+      await exec(
+        process.execPath,
+        [
+          cli,
+          "migration-create",
+          "--name",
+          "typed fixture",
+          "--directory",
+          scaffoldRoot,
+        ],
+        { cwd: repositoryRoot },
+      )
+    ).stdout,
+  );
+  assert.equal(created.created, join(scaffoldRoot, "007-typed-fixture.ts"));
+  assert.match(
+    await readFile(created.created, "utf8"),
+    /MIGRATION 007 MUST BE IMPLEMENTED/,
+  );
+});

@@ -23,6 +23,7 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 - [ADR-0017: Resume only from mechanically proven checkpoints](0017-mechanically-proven-safe-resume.md)
 - [ADR-0018: Use durable plans for bounded lossless cleanup](0018-use-durable-plans-for-lossless-cleanup.md)
 - [ADR-0019: Use bounded root-directed child agents with isolated Git proposals](0019-bounded-root-directed-child-agents.md)
+- [ADR-0020: Use Kysely-backed typed control-database migrations](0020-kysely-typed-migrations.md)
 
 ## Status conventions
 

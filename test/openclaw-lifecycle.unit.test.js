@@ -21,6 +21,7 @@ import {
   rollbackOpenClaw,
   uninstallOpenClaw,
 } from "../dist/openclaw-install.js";
+import { openControlDatabase } from "../dist/sqlite.js";
 
 async function writeJson(path, value) {
   await mkdir(dirname(path), { recursive: true });
@@ -463,6 +464,33 @@ test("audit fails closed on a corrupt transactional control database", async () 
     (await auditOpenClawInstall(openclawStateDir)).join("\n"),
     /control database is invalid/i,
   );
+});
+
+test("audit fails closed on control migration checksum drift", async () => {
+  const { root, openclawStateDir, sourceRoot, hostConfigSource, dependencies } =
+    await fixture();
+  try {
+    await installOpenClaw(
+      {
+        openclawStateDir,
+        sourceRoot,
+        hostConfigSource,
+      },
+      dependencies,
+    );
+    const layout = openClawLayout(openclawStateDir);
+    const database = openControlDatabase(layout.stateRoot);
+    database
+      .prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 2")
+      .run("0".repeat(64));
+    database.close();
+    assert.match(
+      (await auditOpenClawInstall(openclawStateDir)).join("\n"),
+      /migration 2 checksum drift/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("keeps a committed install coherent when gateway restart fails", async () => {

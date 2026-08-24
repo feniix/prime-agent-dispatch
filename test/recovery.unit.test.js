@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import {
   assessSafeResume,
   CONTROL_DATABASE_NAME,
+  CONTROL_SCHEMA_VERSION,
   GlobalJobLease,
   JobStore,
   PrimeDispatcher,
@@ -153,7 +154,7 @@ test("current schema creates one auditable initial execution attempt", async () 
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      5,
+      CONTROL_SCHEMA_VERSION,
     );
   } finally {
     database.close();
@@ -408,7 +409,7 @@ test("schema v1 upgrades in place and preserves terminal result evidence", async
   `);
   database
     .prepare(
-      "INSERT INTO schema_migrations(version, name, applied_at) VALUES (1, 'v1', ?)",
+      "INSERT INTO schema_migrations(version, name, applied_at) VALUES (1, 'initial transactional authority', ?)",
     )
     .run(request.createdAt);
   database

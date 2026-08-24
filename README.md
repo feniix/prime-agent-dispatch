@@ -97,7 +97,7 @@ The state root and each job have this layout:
     prime-agent/             dedicated Prime HOME/config/session directory
 ```
 
-SQLite uses WAL mode, foreign keys, a five-second busy timeout, `synchronous=FULL`, and explicit immediate transactions. One transaction assigns each state revision and event sequence; terminal transactions also bind result metadata, the lease release, inference accounting, and the current artifact-digest inventory. JSON/JSONL files are projections written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Missing or stale projections regenerate from SQLite; contradictory projections and bulky evidence are quarantined with an authority-audit record. Existing schema-v1 JSON jobs import losslessly and idempotently, while corrupt or unknown schemas remain untouched and fail closed.
+SQLite uses WAL mode, foreign keys, a five-second busy timeout, `synchronous=FULL`, and explicit immediate transactions. [Kysely-backed typed migrations](docs/database-migrations.md) apply automatically at startup, preserve the imported v1-v5 history, and fail closed on name, ordering, or checksum drift. One transaction assigns each state revision and event sequence; terminal transactions also bind result metadata, the lease release, inference accounting, and the current artifact-digest inventory. JSON/JSONL files are projections written with temporary-file creation, file `fsync`, rename, and parent-directory `fsync`. Missing or stale projections regenerate from SQLite; contradictory projections and bulky evidence are quarantined with an authority-audit record. Existing schema-v1 JSON jobs import losslessly and idempotently, while corrupt or unknown schemas remain untouched and fail closed.
 
 Cleanup is an explicit two-step operator action. `cleanup-plan` inventories every
 authoritative artifact, disposable runtime cache, worktree, and local branch,
@@ -150,7 +150,7 @@ Same-state transitions are idempotent. Other transitions are validated explicitl
 
 ## Install and verify
 
-Requires Node.js 22 or newer and Git. CI uses Node.js 24 and the
+Requires Node.js 24 or newer and Git. CI uses Node.js 24 and the
 repository-pinned pnpm version.
 
 ```bash
