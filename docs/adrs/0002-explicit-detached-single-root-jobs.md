@@ -7,6 +7,10 @@ consulted: [ryn]
 
 # Use explicit detached jobs with one root Prime agent
 
+This decision remains the default execution mode. ADR-0019 extends it with an
+explicitly gated, bounded multi-child mode; it does not make recursive child
+execution implicit for existing jobs.
+
 ## Context and Problem Statement
 
 Discord requests must be able to start long-running Prime work without holding an OpenClaw turn open. Dispatch must remain an explicit user-authorized operation, and the first prototype should validate the root integration without adding Prime child-agent concurrency.
