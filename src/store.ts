@@ -167,7 +167,6 @@ type LogicalChildRow = {
   job_id: string;
   envelope_json: string;
   envelope_sha256: string;
-  status: ChildStatus;
   decision: ChildDecision;
   revision: number;
   created_at: string;
@@ -967,7 +966,10 @@ export class JobStore {
         );
         if (dependencyEnvelope.wave >= envelope.wave)
           throw new Error("child dependency cycle or invalid dependency wave");
-        if (dependency.status !== "succeeded")
+        if (
+          this.currentChildAttemptFromDatabase(dependency.child_id).status !==
+          "succeeded"
+        )
           throw new Error("child dependencies must succeed before admission");
         return dependency;
       });
@@ -975,9 +977,9 @@ export class JobStore {
       this.database
         .prepare(
           `INSERT INTO logical_children(
-             child_id, job_id, name, envelope_json, envelope_sha256, status,
+             child_id, job_id, name, envelope_json, envelope_sha256,
              criticality, wave, decision, revision, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, 'pending', 0, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`,
         )
         .run(
           envelope.childId,
@@ -1047,10 +1049,10 @@ export class JobStore {
           "children may only be retried while the root is running",
         );
       const row = this.assertChildMutation(jobId, input);
-      if (row.status !== "failed" && row.status !== "interrupted")
+      const prior = this.currentChildAttemptFromDatabase(input.childId);
+      if (prior.status !== "failed" && prior.status !== "interrupted")
         throw new Error("only failed or interrupted children may be retried");
       this.assertChildActiveSlot(jobId, tree.policy.maxActiveChildren);
-      const prior = this.currentChildAttemptFromDatabase(input.childId);
       if (prior.ordinal >= tree.policy.maxAttemptsPerChild)
         throw new Error("child retry limit reached");
       const envelope = ChildSpawnEnvelopeSchema.parse(
@@ -1080,7 +1082,7 @@ export class JobStore {
       this.database
         .prepare(
           `UPDATE logical_children
-           SET status = 'active', decision = 'pending', revision = revision + 1,
+           SET decision = 'pending', revision = revision + 1,
                updated_at = ? WHERE child_id = ?`,
         )
         .run(now, input.childId);
@@ -1109,12 +1111,10 @@ export class JobStore {
     const now = new Date().toISOString();
     const child = this.transaction("cancel_child", () => {
       this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
-      const row = this.assertChildMutation(jobId, input);
-      if (row.status !== "active")
-        throw new Error("only an active child may enter cancellation");
+      this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.status !== "active")
-        throw new Error("active child does not have an active attempt");
+        throw new Error("only an active child may enter cancellation");
       this.database
         .prepare(
           "UPDATE child_attempts SET status = 'cancelling' WHERE attempt_id = ?",
@@ -1122,8 +1122,8 @@ export class JobStore {
         .run(attempt.attempt_id);
       this.database
         .prepare(
-          `UPDATE logical_children SET status = 'cancelling',
-             revision = revision + 1, updated_at = ? WHERE child_id = ?`,
+          `UPDATE logical_children SET revision = revision + 1,
+             updated_at = ? WHERE child_id = ?`,
         )
         .run(now, input.childId);
       this.advanceChildTreeRevision(jobId, now);
@@ -1149,13 +1149,11 @@ export class JobStore {
     const child = this.transaction("bind_child_runtime", () => {
       this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
       const row = this.assertChildMutation(jobId, input);
-      if (row.status !== "active")
-        throw new Error("native runtime may only bind to an active child");
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
         throw new Error("child attempt is stale");
-      if (row.status !== attempt.status)
-        throw new Error("child and attempt lifecycle state diverged");
+      if (attempt.status !== "active")
+        throw new Error("native runtime may only bind to an active child");
       if (attempt.native_handle_json)
         throw new Error("child attempt already has a native runtime handle");
       const envelope = ChildSpawnEnvelopeSchema.parse(
@@ -1207,8 +1205,6 @@ export class JobStore {
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
         throw new Error("child attempt is stale");
-      if (row.status !== attempt.status)
-        throw new Error("child and attempt lifecycle state diverged");
       if (attempt.status !== "active" && attempt.status !== "cancelling")
         throw new Error("child attempt is already terminal");
       if (attempt.status === "cancelling" && evidence.outcome !== "cancelled")
@@ -1231,10 +1227,10 @@ export class JobStore {
         );
       this.database
         .prepare(
-          `UPDATE logical_children SET status = ?, revision = revision + 1,
+          `UPDATE logical_children SET revision = revision + 1,
              updated_at = ? WHERE child_id = ?`,
         )
-        .run(evidence.outcome, evidence.completedAt, input.childId);
+        .run(evidence.completedAt, input.childId);
       this.advanceChildTreeRevision(jobId, evidence.completedAt);
       this.insertEvent(
         this.newEvent(jobId, "child_attempt_completed", {
@@ -1260,10 +1256,11 @@ export class JobStore {
     const now = new Date().toISOString();
     const child = this.transaction("decide_child_result", () => {
       this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
-      const row = this.assertChildMutation(jobId, input);
-      if (input.decision === "selected" && row.status !== "succeeded")
+      this.assertChildMutation(jobId, input);
+      const status = this.currentChildAttemptFromDatabase(input.childId).status;
+      if (input.decision === "selected" && status !== "succeeded")
         throw new Error("only a successful child result may be selected");
-      if (input.decision === "discarded" && row.status !== "cancelled")
+      if (input.decision === "discarded" && status !== "cancelled")
         throw new Error("discarded children require terminal cancellation");
       this.database
         .prepare(
@@ -1883,7 +1880,7 @@ export class JobStore {
   ): LogicalChildRow | undefined {
     const row = this.database
       .prepare(
-        `SELECT child_id, job_id, envelope_json, envelope_sha256, status,
+        `SELECT child_id, job_id, envelope_json, envelope_sha256,
                 decision, revision, created_at, updated_at
          FROM logical_children WHERE child_id = ?`,
       )
@@ -1958,16 +1955,19 @@ export class JobStore {
     );
     if (childEnvelopeDigest(envelope) !== row.envelope_sha256)
       throw new Error("stored child spawn envelope digest mismatch");
+    const attempts = this.childAttemptsFromDatabase(childId);
+    const current = attempts.at(-1);
+    if (!current) throw new Error(`child ${childId} has no attempt`);
     return LogicalChildSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       envelope,
       envelopeDigest: row.envelope_sha256,
-      status: row.status,
+      status: current.status,
       decision: row.decision,
       revision: row.revision,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      attempts: this.childAttemptsFromDatabase(childId),
+      attempts,
     });
   }
 
@@ -2081,7 +2081,14 @@ export class JobStore {
     this.assertChildrenJoined(jobId);
     const children = this.database
       .prepare(
-        `SELECT status, criticality FROM logical_children WHERE job_id = ?`,
+        `SELECT attempt.status, child.criticality
+         FROM logical_children AS child
+         JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+         WHERE child.job_id = ?
+           AND attempt.ordinal = (
+             SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+             WHERE latest.child_id = child.child_id
+           )`,
       )
       .all(jobId) as { status: ChildStatus; criticality: string }[];
     if (children.some((child) => !terminalChildStatuses.has(child.status)))

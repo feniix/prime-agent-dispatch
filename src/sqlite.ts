@@ -410,9 +410,6 @@ function migrate(database: ControlDatabase): void {
           name TEXT NOT NULL,
           envelope_json TEXT NOT NULL,
           envelope_sha256 TEXT NOT NULL CHECK (length(envelope_sha256) = 64),
-          status TEXT NOT NULL CHECK (status IN (
-            'active', 'cancelling', 'succeeded', 'failed', 'cancelled', 'interrupted'
-          )),
           criticality TEXT NOT NULL CHECK (criticality IN ('required', 'advisory')),
           wave INTEGER NOT NULL CHECK (wave > 0 AND wave <= 5),
           decision TEXT NOT NULL CHECK (decision IN ('pending', 'selected', 'discarded')),
@@ -448,8 +445,8 @@ function migrate(database: ControlDatabase): void {
           UNIQUE (child_id, ordinal)
         ) STRICT;
 
-        CREATE INDEX logical_children_job_status
-          ON logical_children(job_id, status, wave, name);
+        CREATE INDEX logical_children_job_wave
+          ON logical_children(job_id, wave, name);
         CREATE INDEX child_attempts_job_status
           ON child_attempts(job_id, status, child_id, ordinal);
 
