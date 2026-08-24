@@ -163,6 +163,18 @@ budget, and execution-policy envelope.
   issue #2 and the containment decisions and implementation in issues #3 and
   #12.
 
+### Implementation slices
+
+Issue #41 tracks the complete experimental feature through these independently
+reviewable slices:
+
+- #42: authoritative child-tree state, admission, scheduling, and joins;
+- #43: isolated worktrees, dependency waves, and reviewed integration;
+- #44: per-child inference leases, model policy, budgets, and retry lineage;
+- #45: cancellation, recovery, and bounded child evidence;
+- #46: Discord tree status and root-routed steering; and
+- #47: the opt-in live prototype-repository acceptance and rollout gate.
+
 ## Consequences
 
 - Good, because delegation remains useful while Git integration and job
