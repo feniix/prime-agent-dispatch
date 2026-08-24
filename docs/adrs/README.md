@@ -5,7 +5,7 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 ## Index
 
 - [ADR-0001: Keep the dispatch core standalone with a thin OpenClaw adapter](0001-standalone-core-and-thin-openclaw-adapter.md)
-- [ADR-0002: Use explicit detached jobs with one root Prime agent](0002-explicit-detached-single-root-jobs.md)
+- [ADR-0002: Use explicit detached jobs with one root Prime agent](0002-explicit-detached-single-root-jobs.md) — extended by ADR-0019 for explicitly gated child execution
 - [ADR-0003: Use versioned JSON and Zod for the durable control plane](0003-json-zod-control-plane.md) — superseded by ADR-0013
 - [ADR-0004: Isolate Git changes with worktrees and an execution backend](0004-git-worktrees-and-execution-backends.md)
 - [ADR-0005: Broker raw OpenAI-compatible inference instead of nesting agent loops](0005-opaque-openai-compatible-inference-broker.md)
@@ -22,6 +22,7 @@ These records use [MADR 4.0.0](https://github.com/adr/madr/releases/tag/4.0.0). 
 - [ADR-0016: Use a versioned host-local lifecycle for the OpenClaw integration](0016-versioned-openclaw-host-lifecycle.md)
 - [ADR-0017: Resume only from mechanically proven checkpoints](0017-mechanically-proven-safe-resume.md)
 - [ADR-0018: Use durable plans for bounded lossless cleanup](0018-use-durable-plans-for-lossless-cleanup.md)
+- [ADR-0019: Use bounded root-directed child agents with isolated Git proposals](0019-bounded-root-directed-child-agents.md)
 
 ## Status conventions
 
