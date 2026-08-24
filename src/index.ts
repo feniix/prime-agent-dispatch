@@ -1,5 +1,7 @@
 export * from "./agent.js";
 export * from "./cleanup.js";
+export * from "./children.js";
+export * from "./child-host-bridge.js";
 export * from "./dispatcher.js";
 export * from "./execution.js";
 export * from "./host-config.js";

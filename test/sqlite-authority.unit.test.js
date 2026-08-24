@@ -57,12 +57,19 @@ test("control database enables WAL, foreign keys, durable sync, and migrations",
       database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get().version,
-      4,
+      5,
     );
     assert.ok(
       database
         .prepare(
           "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_job_reservations'",
+        )
+        .get(),
+    );
+    assert.ok(
+      database
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'logical_children'",
         )
         .get(),
     );
