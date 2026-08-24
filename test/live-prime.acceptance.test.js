@@ -5,11 +5,16 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { JobStore, PrimeDispatcher } from "../dist/index.js";
+import {
+  JobStore,
+  PRIME_AGENT_VERSION,
+  PrimeDispatcher,
+} from "../dist/index.js";
 
 const exec = promisify(execFile);
 const cli = new URL("../dist/cli.js", import.meta.url).pathname;
 const live = process.env.PRIME_DISPATCH_LIVE_ACCEPTANCE === "1";
+const primeAgentRoot = `/var/lib/evie-agent/downloads/prime-agent-${PRIME_AGENT_VERSION}`;
 
 async function git(cwd, ...args) {
   return (await exec("git", ["-C", cwd, ...args])).stdout.trim();
@@ -53,10 +58,9 @@ test(
           prime: {
             executable:
               process.env.PRIME_AGENT_EXECUTABLE ??
-              "/var/lib/evie-agent/downloads/prime-agent-0.8.0/package/dist/bundle/cli.js",
+              `${primeAgentRoot}/package/dist/bundle/cli.js`,
             releaseArtifact:
-              process.env.PRIME_AGENT_TARBALL ??
-              "/var/lib/evie-agent/downloads/prime-agent-0.8.0.tgz",
+              process.env.PRIME_AGENT_TARBALL ?? `${primeAgentRoot}.tgz`,
           },
           repositories: [
             {
