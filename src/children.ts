@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import canonicalize from "canonicalize";
 import { z } from "zod";
 import { BudgetSchema, SCHEMA_VERSION } from "./schemas.js";
@@ -6,6 +7,7 @@ import { BudgetSchema, SCHEMA_VERSION } from "./schemas.js";
 export const CHILD_TREE_MAX_CHILDREN = 5 as const;
 export const CHILD_TREE_MAX_ACTIVE = 3 as const;
 export const CHILD_TREE_MAX_DEPTH = 1 as const;
+export const CHILD_PROPOSAL_DIFF_MAX_BYTES = 1_000_000 as const;
 
 const DigestSchema = z.string().regex(/^[0-9a-f]{64}$/);
 const CommitSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
@@ -130,6 +132,120 @@ export const ChildTerminalEvidenceSchema = z
   .strict();
 export type ChildTerminalEvidence = z.infer<typeof ChildTerminalEvidenceSchema>;
 
+export const ChildWaveBaseSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    jobId: z.string().min(1),
+    wave: z.number().int().positive().max(CHILD_TREE_MAX_CHILDREN),
+    baseSha: CommitSchema,
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type ChildWaveBase = z.infer<typeof ChildWaveBaseSchema>;
+
+export const ChildWorktreeIdentitySchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    attemptId: z.string().uuid(),
+    attemptOrdinal: z.number().int().positive().max(2),
+    childId: z.string().uuid(),
+    jobId: z.string().min(1),
+    repositoryPath: z.string().min(1),
+    worktreePath: z.string().min(1),
+    branchName: z.string().min(1),
+    baseSha: CommitSchema,
+    createdHeadSha: CommitSchema,
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type ChildWorktreeIdentity = z.infer<typeof ChildWorktreeIdentitySchema>;
+
+export const ChildProposalSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    attemptId: z.string().uuid(),
+    childId: z.string().uuid(),
+    jobId: z.string().min(1),
+    outcome: z.enum(["commit", "no_change", "read_only"]),
+    baseSha: CommitSchema,
+    proposalSha: CommitSchema.optional(),
+    diffDigest: DigestSchema,
+    recordedAt: z.string().datetime(),
+  })
+  .strict()
+  .superRefine((proposal, context) => {
+    if (proposal.outcome === "commit" && !proposal.proposalSha)
+      context.addIssue({
+        code: "custom",
+        path: ["proposalSha"],
+        message: "commit proposals require a proposal SHA",
+      });
+    if (proposal.outcome !== "commit" && proposal.proposalSha)
+      context.addIssue({
+        code: "custom",
+        path: ["proposalSha"],
+        message: "no-change and read-only proposals cannot name a commit",
+      });
+  });
+export type ChildProposal = z.infer<typeof ChildProposalSchema>;
+
+export const ChildIntegrationSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION),
+    integrationId: z.string().uuid(),
+    attemptId: z.string().uuid(),
+    childId: z.string().uuid(),
+    jobId: z.string().min(1),
+    status: z.enum(["applying", "integrated", "conflicted"]),
+    proposalSha: CommitSchema.optional(),
+    rootBeforeSha: CommitSchema,
+    rootAfterSha: CommitSchema.optional(),
+    conflict: z
+      .object({
+        paths: z.array(z.string().min(1).max(1_024)).max(100),
+        summary: z.string().min(1).max(8_192),
+      })
+      .strict()
+      .optional(),
+    startedAt: z.string().datetime(),
+    completedAt: z.string().datetime().optional(),
+  })
+  .strict()
+  .superRefine((integration, context) => {
+    if (
+      integration.status === "applying" &&
+      (integration.rootAfterSha ||
+        integration.conflict ||
+        integration.completedAt)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "applying integrations cannot have terminal evidence",
+      });
+    if (
+      integration.status === "integrated" &&
+      (!integration.rootAfterSha ||
+        integration.conflict ||
+        !integration.completedAt)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "integrated proposals require a root commit and completion time",
+      });
+    if (
+      integration.status === "conflicted" &&
+      (integration.rootAfterSha ||
+        !integration.conflict ||
+        !integration.completedAt)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "conflicted proposals require bounded conflict evidence",
+      });
+  });
+export type ChildIntegration = z.infer<typeof ChildIntegrationSchema>;
+
 export const NativeRlmSpawnHandleSchema = z
   .object({
     rlmChildId: z.string().min(1),
@@ -153,6 +269,9 @@ export const ChildAttemptSchema = z
     startedAt: z.string().datetime(),
     completedAt: z.string().datetime().optional(),
     nativeHandle: NativeRlmSpawnHandleSchema.optional(),
+    worktree: ChildWorktreeIdentitySchema.optional(),
+    proposal: ChildProposalSchema.optional(),
+    integration: ChildIntegrationSchema.optional(),
     terminalEvidence: ChildTerminalEvidenceSchema.optional(),
   })
   .strict();
@@ -182,6 +301,7 @@ export const ChildTreeSnapshotSchema = z
     revision: z.number().int().nonnegative(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
+    waveBases: z.array(ChildWaveBaseSchema).max(CHILD_TREE_MAX_CHILDREN),
     children: z.array(LogicalChildSchema).max(CHILD_TREE_MAX_CHILDREN),
   })
   .strict();
@@ -195,6 +315,30 @@ export function canonicalDigest(value: unknown): string {
 
 export function childEnvelopeDigest(envelope: ChildSpawnEnvelope): string {
   return canonicalDigest(ChildSpawnEnvelopeSchema.parse(envelope));
+}
+
+export function childWorktreePath(
+  stateRoot: string,
+  jobId: string,
+  childId: string,
+  attemptOrdinal = 1,
+): string {
+  return join(
+    stateRoot,
+    "worktrees",
+    "children",
+    jobId,
+    childId,
+    `attempt-${attemptOrdinal}`,
+  );
+}
+
+export function childBranchName(
+  jobId: string,
+  childId: string,
+  attemptOrdinal = 1,
+): string {
+  return `prime-child/${jobId}/${childId}/attempt-${attemptOrdinal}`;
 }
 
 export const terminalChildStatuses = new Set<ChildStatus>([

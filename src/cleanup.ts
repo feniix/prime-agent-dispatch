@@ -22,6 +22,11 @@ import {
 } from "./sqlite.js";
 import { JobStore } from "./store.js";
 import { terminalStatuses } from "./state-machine.js";
+import {
+  childBranchName,
+  childWorktreePath,
+  type ChildWorktreeIdentity,
+} from "./children.js";
 
 export type CleanupAction = {
   sequence: number;
@@ -325,6 +330,91 @@ export class CleanupManager {
           });
         }
       }
+
+      const childTree = await this.store.readChildTree(jobId);
+      for (const child of childTree?.children ?? []) {
+        for (const attempt of child.attempts) {
+          if (!attempt.worktree) continue;
+          const recorded = attempt.worktree;
+          const identity = await this.childWorktreeIdentity(
+            jobId,
+            recorded,
+            request.canonicalRepoPath,
+          ).catch((error: unknown) => ({
+            unsafe: `child worktree or branch ownership is unproven: ${String(error)}`,
+          }));
+          const ownershipUnsafe =
+            "unsafe" in identity ? identity.unsafe : undefined;
+          const reason = unsafe ?? ownershipUnsafe;
+          if (!("worktree" in identity)) {
+            add({
+              jobId,
+              kind: "worktree",
+              target: recorded.worktreePath,
+              decision: "keep",
+              reason: reason ?? "child worktree ownership is unproven",
+              expected: {
+                owner: "child",
+                childId: recorded.childId,
+                attemptId: recorded.attemptId,
+                attemptOrdinal: recorded.attemptOrdinal,
+                stateRevision: state.revision,
+                status: state.status,
+                branchName: recorded.branchName,
+              },
+              estimatedBytes: 0,
+              candidate: false,
+            });
+            continue;
+          }
+          add({
+            jobId,
+            kind: "worktree",
+            target: recorded.worktreePath,
+            decision: !reason && expired ? "delete" : "keep",
+            reason:
+              reason ??
+              (expired
+                ? `terminal ${state.status} retention age elapsed`
+                : `terminal ${state.status} retention age has not elapsed`),
+            expected: {
+              owner: "child",
+              childId: recorded.childId,
+              attemptId: recorded.attemptId,
+              attemptOrdinal: recorded.attemptOrdinal,
+              stateRevision: state.revision,
+              status: state.status,
+              ...identity.worktree,
+            },
+            estimatedBytes: identity.worktree.bytes,
+            candidate: !reason,
+          });
+          add({
+            jobId,
+            kind: "branch",
+            target: recorded.branchName,
+            decision: !reason && expired ? "delete" : "keep",
+            reason:
+              reason ??
+              (expired
+                ? "owned child worktree is scheduled before its local branch"
+                : `terminal ${state.status} retention age has not elapsed`),
+            expected: {
+              owner: "child",
+              childId: recorded.childId,
+              attemptId: recorded.attemptId,
+              attemptOrdinal: recorded.attemptOrdinal,
+              stateRevision: state.revision,
+              status: state.status,
+              repoPath: request.canonicalRepoPath,
+              branchName: recorded.branchName,
+              head: identity.branch.head,
+            },
+            estimatedBytes: 0,
+            candidate: !reason,
+          });
+        }
+      }
     }
 
     const totalBytes = actions.reduce(
@@ -357,6 +447,7 @@ export class CleanupManager {
             (value) =>
               value.jobId === action.jobId &&
               value.kind === "branch" &&
+              value.target === action.expected.branchName &&
               value.candidate,
           );
           if (branch) {
@@ -728,23 +819,110 @@ export class CleanupManager {
     const expectedPath = join(ownedRoot, jobId);
     if (state.branchName !== `prime/${jobId}`)
       throw new Error("recorded branch does not match the owned job branch");
+    return await this.registeredWorktreeIdentity(
+      repoPath,
+      state.worktreePath,
+      state.branchName,
+      expectedPath,
+      ownedRoot,
+    );
+  }
+
+  private async childWorktreeIdentity(
+    jobId: string,
+    recorded: ChildWorktreeIdentity,
+    repoPath: string,
+  ): Promise<{
+    worktree: {
+      canonicalPath: string;
+      repoPath: string;
+      branchName: string;
+      head: string;
+      bytes: number;
+      digest: string;
+    };
+    branch: { head: string };
+  }> {
+    if (recorded.jobId !== jobId)
+      throw new Error("recorded child worktree has the wrong root job");
+    if (recorded.repositoryPath !== repoPath)
+      throw new Error("recorded child repository identity changed");
+    if (
+      recorded.worktreePath !==
+      childWorktreePath(
+        this.stateRoot,
+        jobId,
+        recorded.childId,
+        recorded.attemptOrdinal,
+      )
+    )
+      throw new Error("recorded child worktree path is outside its owned path");
+    if (
+      recorded.branchName !==
+      childBranchName(jobId, recorded.childId, recorded.attemptOrdinal)
+    )
+      throw new Error("recorded child branch is outside its owned namespace");
+    const ownedRoot = await realpath(
+      resolve(this.stateRoot, "worktrees", "children"),
+    );
+    const expectedPath = join(
+      ownedRoot,
+      jobId,
+      recorded.childId,
+      `attempt-${recorded.attemptOrdinal}`,
+    );
+    const identity = await this.registeredWorktreeIdentity(
+      repoPath,
+      recorded.worktreePath,
+      recorded.branchName,
+      expectedPath,
+      ownedRoot,
+    );
+    if (!identity.worktree)
+      throw new Error("recorded child worktree is missing");
+    return { worktree: identity.worktree, branch: identity.branch };
+  }
+
+  private async registeredWorktreeIdentity(
+    repoPath: string,
+    worktreePath: string | undefined,
+    branchName: string,
+    expectedPath: string,
+    ownedRoot: string,
+  ): Promise<{
+    worktree?: {
+      canonicalPath: string;
+      repoPath: string;
+      branchName: string;
+      head: string;
+      bytes: number;
+      digest: string;
+    };
+    branch: { head: string };
+  }> {
     let worktree;
-    if (state.worktreePath) {
-      const canonicalPath = await realpath(state.worktreePath);
+    if (worktreePath) {
+      const canonicalPath = await realpath(worktreePath);
       if (canonicalPath !== expectedPath || !isInside(ownedRoot, canonicalPath))
         throw new Error("worktree canonical path changed");
-      const [top, branchName, head, commonDir, repositoryCommonDir, inventory] =
-        await Promise.all([
-          git(canonicalPath, ["rev-parse", "--show-toplevel"]),
-          git(canonicalPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
-          git(canonicalPath, ["rev-parse", "HEAD"]),
-          git(canonicalPath, ["rev-parse", "--git-common-dir"]),
-          git(repoPath, ["rev-parse", "--git-common-dir"]),
-          inventoryPath(canonicalPath),
-        ]);
+      const [
+        top,
+        actualBranchName,
+        head,
+        commonDir,
+        repositoryCommonDir,
+        inventory,
+      ] = await Promise.all([
+        git(canonicalPath, ["rev-parse", "--show-toplevel"]),
+        git(canonicalPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+        git(canonicalPath, ["rev-parse", "HEAD"]),
+        git(canonicalPath, ["rev-parse", "--git-common-dir"]),
+        git(repoPath, ["rev-parse", "--git-common-dir"]),
+        inventoryPath(canonicalPath),
+      ]);
       if (
         (await realpath(top)) !== canonicalPath ||
-        branchName !== state.branchName ||
+        actualBranchName !== branchName ||
         (await realpath(resolve(canonicalPath, commonDir))) !==
           (await realpath(resolve(repoPath, repositoryCommonDir)))
       )
@@ -754,7 +932,7 @@ export class CleanupManager {
     const branchHead = await git(repoPath, [
       "rev-parse",
       "--verify",
-      `refs/heads/${state.branchName}`,
+      `refs/heads/${branchName}`,
     ]);
     if (worktree && branchHead !== worktree.head)
       throw new Error("branch head differs from worktree head");
@@ -791,13 +969,48 @@ export class CleanupManager {
       throw new Error(
         "cleanup cache target is not host-owned disposable content",
       );
-    if (
-      action.kind === "worktree" &&
-      resolve(action.target) !== resolve(this.stateRoot, "worktrees", jobId)
-    )
-      throw new Error("cleanup worktree target is outside its owned job path");
-    if (action.kind === "branch" && action.target !== `prime/${jobId}`)
-      throw new Error("cleanup branch target is not owned by its job");
+    const childOwner = expected.owner === "child";
+    if (childOwner) {
+      if (
+        typeof expected.childId !== "string" ||
+        typeof expected.attemptId !== "string" ||
+        !Number.isSafeInteger(expected.attemptOrdinal)
+      )
+        throw new Error("cleanup child owner identity is corrupt");
+      if (
+        action.kind === "worktree" &&
+        resolve(action.target) !==
+          resolve(
+            childWorktreePath(
+              this.stateRoot,
+              jobId,
+              expected.childId,
+              expected.attemptOrdinal as number,
+            ),
+          )
+      )
+        throw new Error("cleanup child worktree is outside its owned path");
+      if (
+        action.kind === "branch" &&
+        action.target !==
+          childBranchName(
+            jobId,
+            expected.childId,
+            expected.attemptOrdinal as number,
+          )
+      )
+        throw new Error("cleanup child branch is outside its owned namespace");
+    } else {
+      if (
+        action.kind === "worktree" &&
+        resolve(action.target) !== resolve(this.stateRoot, "worktrees", jobId)
+      )
+        throw new Error(
+          "cleanup worktree target is outside its owned job path",
+        );
+      if (action.kind === "branch" && action.target !== `prime/${jobId}`)
+        throw new Error("cleanup branch target is not owned by its job");
+    }
     if (
       action.kind === "branch" &&
       !/^[a-f0-9]{40,64}$/.test(String(expected.head))
@@ -930,11 +1143,19 @@ export class CleanupManager {
         pathExists = false;
       }
       if (pathExists) {
-        const identity = await this.worktreeIdentity(
-          action.jobId,
-          state,
-          String(expected.repoPath),
-        );
+        const identity = childOwner
+          ? await this.registeredWorktreeIdentity(
+              String(expected.repoPath),
+              action.target,
+              String(expected.branchName),
+              String(expected.canonicalPath),
+              await realpath(resolve(this.stateRoot, "worktrees", "children")),
+            )
+          : await this.worktreeIdentity(
+              action.jobId,
+              state,
+              String(expected.repoPath),
+            );
         if (
           !identity.worktree ||
           identity.worktree.canonicalPath !== expected.canonicalPath ||
@@ -967,6 +1188,7 @@ export class CleanupManager {
         (value) =>
           value.jobId === action.jobId &&
           value.kind === "worktree" &&
+          value.expected.branchName === action.target &&
           value.decision === "delete",
       );
       if (worktree && worktree.status !== "applied")
