@@ -66,7 +66,11 @@ test("fresh databases apply the immutable migration manifest through latest", as
   }
 });
 
-for (let fixtureVersion = 1; fixtureVersion <= 5; fixtureVersion += 1) {
+for (
+  let fixtureVersion = 1;
+  fixtureVersion < CONTROL_SCHEMA_VERSION;
+  fixtureVersion += 1
+) {
   test(`schema v${fixtureVersion} upgrades to latest with authority data preserved`, async () => {
     const root = await temporaryRoot(`v${fixtureVersion}`);
     const fixture = databaseAt(root);
@@ -299,9 +303,13 @@ test("developer migration commands scaffold, apply, and inspect", async () => {
       )
     ).stdout,
   );
-  assert.equal(created.created, join(scaffoldRoot, "007-typed-fixture.ts"));
+  const nextVersion = String(CONTROL_SCHEMA_VERSION + 1).padStart(3, "0");
+  assert.equal(
+    created.created,
+    join(scaffoldRoot, `${nextVersion}-typed-fixture.ts`),
+  );
   assert.match(
     await readFile(created.created, "utf8"),
-    /MIGRATION 007 MUST BE IMPLEMENTED/,
+    new RegExp(`MIGRATION ${nextVersion} MUST BE IMPLEMENTED`),
   );
 });

@@ -26,6 +26,7 @@ test("stdout and stderr capture obey the shared output ceiling", async () => {
     Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr),
     12,
   );
+  assert.equal(result.outputTruncated, true);
 });
 
 test("output ceilings never split a UTF-8 character or exceed the byte limit", async () => {
@@ -46,6 +47,7 @@ test("output ceilings never split a UTF-8 character or exceed the byte limit", a
     { maxOutputBytes: 3 },
   );
   assert.equal(partial.stdout, "");
+  assert.equal(partial.outputTruncated, true);
 });
 
 test("spawn errors reject instead of producing a false command result", async () => {

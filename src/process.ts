@@ -5,6 +5,7 @@ type CommandResult = {
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  outputTruncated: boolean;
   timedOut: boolean;
   aborted: boolean;
 };
@@ -51,6 +52,7 @@ export async function runCommand(
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let timedOut = false;
     let aborted = false;
+    let outputTruncated = false;
     let killTimer: NodeJS.Timeout | undefined;
     const max = options.maxOutputBytes ?? 1_000_000;
     let capturedBytes = 0;
@@ -58,9 +60,13 @@ export async function runCommand(
       current: Buffer<ArrayBufferLike>,
       chunk: Buffer<ArrayBufferLike>,
     ): Buffer<ArrayBufferLike> => {
-      if (capturedBytes >= max) return current;
+      if (capturedBytes >= max) {
+        if (chunk.length > 0) outputTruncated = true;
+        return current;
+      }
       const accepted = chunk.subarray(0, Math.max(0, max - capturedBytes));
       capturedBytes += accepted.length;
+      if (accepted.length < chunk.length) outputTruncated = true;
       return Buffer.concat([current, accepted]);
     };
     child.stdout.on("data", (chunk: Buffer) => {
@@ -109,6 +115,7 @@ export async function runCommand(
         exitCode,
         stdout: decodeCapturedOutput(stdout),
         stderr: decodeCapturedOutput(stderr),
+        outputTruncated,
         timedOut,
         aborted,
       });
@@ -121,12 +128,16 @@ export async function git(
   args: string[],
   options: {
     timeoutMs?: number;
+    maxOutputBytes?: number;
     signal?: AbortSignal;
     terminationGraceMs?: number;
   } = {},
 ): Promise<string> {
   const result = await runCommand("git", ["-C", cwd, ...args], {
     timeoutMs: options.timeoutMs ?? 30_000,
+    ...(options.maxOutputBytes !== undefined
+      ? { maxOutputBytes: options.maxOutputBytes }
+      : {}),
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.terminationGraceMs !== undefined
       ? { terminationGraceMs: options.terminationGraceMs }
@@ -134,6 +145,8 @@ export async function git(
   });
   if (result.aborted)
     throw new Error(`git ${args[0] ?? ""} aborted by job control`);
+  if (result.outputTruncated)
+    throw new Error(`git ${args[0] ?? ""} output exceeded its bounded capture`);
   if (result.exitCode !== 0) {
     throw new Error(
       `git ${args[0] ?? ""} failed: ${result.stderr.trim() || result.stdout.trim()}`,

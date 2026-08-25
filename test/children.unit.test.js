@@ -431,22 +431,46 @@ test("native rlm calls pass through durable admission before runtime spawn", asy
   const { store, request } = await fixture();
   const tree = await store.enableChildTree(request.jobId);
   const calls = [];
-  const bridge = new BoundedRlmHostBridge(store, request.jobId, {
-    async run(nativeRequest) {
-      calls.push(nativeRequest);
-      assert.equal(
-        (await store.readChildTree(request.jobId)).children[0].status,
-        "active",
-      );
-      return {
-        rlmChildId: "sub-native-1",
-        name: nativeRequest.kwargs.name,
-        sessionDir: "/tmp/native-session",
-        model: nativeRequest.kwargs.model,
-      };
+  const bridge = new BoundedRlmHostBridge(
+    store,
+    request.jobId,
+    {
+      async run(nativeRequest, context) {
+        calls.push({ nativeRequest, context });
+        assert.equal(
+          (await store.readChildTree(request.jobId)).children[0].status,
+          "active",
+        );
+        return {
+          rlmChildId: "sub-native-1",
+          name: nativeRequest.kwargs.name,
+          sessionDir: "/tmp/native-session",
+          model: nativeRequest.kwargs.model,
+        };
+      },
+      async cancel() {},
     },
-    async cancel() {},
-  });
+    {
+      async prepare(child) {
+        return {
+          child,
+          identity: {
+            schemaVersion: 1,
+            attemptId: child.attempts.at(-1).attemptId,
+            attemptOrdinal: child.attempts.at(-1).ordinal,
+            childId: child.envelope.childId,
+            jobId: request.jobId,
+            repositoryPath: request.repoPath,
+            worktreePath: `/tmp/children/${child.envelope.childId}/attempt-1`,
+            branchName: `prime-child/${request.jobId}/${child.envelope.childId}/attempt-1`,
+            baseSha: child.envelope.baseSha,
+            createdHeadSha: child.envelope.baseSha,
+            createdAt: new Date().toISOString(),
+          },
+        };
+      },
+    },
+  );
   const prompt = "implement the bounded scheduler";
   const admitted = await bridge.run({
     expectedTreeRevision: tree.revision,
@@ -454,11 +478,15 @@ test("native rlm calls pass through durable admission before runtime spawn", asy
     envelope: envelope(request.jobId, "native-child", { prompt }),
   });
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].kwargs, {
+  assert.deepEqual(calls[0].nativeRequest.kwargs, {
     name: "native-child",
     model: "openai/gpt-5.6-sol",
     thinking: "high",
   });
+  assert.equal(
+    calls[0].context.worktree.branchName,
+    `prime-child/${request.jobId}/${calls[0].context.worktree.childId}/attempt-1`,
+  );
   assert.equal(
     admitted.child.attempts[0].nativeHandle.rlmChildId,
     "sub-native-1",

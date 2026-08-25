@@ -6,6 +6,7 @@ import {
   type ChildSpawnEnvelope,
   type LogicalChild,
   type NativeRlmSpawnHandle,
+  type ChildWorktreeIdentity,
 } from "./children.js";
 import { JobStore } from "./store.js";
 
@@ -30,9 +31,19 @@ export interface NativeRlmRuntime {
    * A rejecting implementation must quiesce any partially started runtime
    * before rejecting.
    */
-  run(request: NativeRlmRunRequest): Promise<NativeRlmSpawnHandle>;
+  run(
+    request: NativeRlmRunRequest,
+    context?: { worktree: ChildWorktreeIdentity },
+  ): Promise<NativeRlmSpawnHandle>;
   /** Resolve only after the native child process tree is quiescent. */
   cancel(handle: NativeRlmSpawnHandle): Promise<void>;
+}
+
+export interface ChildWorktreePreparer {
+  prepare(child: LogicalChild): Promise<{
+    child: LogicalChild;
+    identity: ChildWorktreeIdentity;
+  }>;
 }
 
 export class BoundedRlmHostBridge {
@@ -40,6 +51,7 @@ export class BoundedRlmHostBridge {
     private readonly store: JobStore,
     private readonly jobId: string,
     private readonly runtime: NativeRlmRuntime,
+    private readonly worktrees?: ChildWorktreePreparer,
   ) {}
 
   async run(input: {
@@ -85,10 +97,16 @@ export class BoundedRlmHostBridge {
       input.expectedTreeRevision,
       envelope,
     );
+    let worktree: ChildWorktreeIdentity | undefined;
     let handle: NativeRlmSpawnHandle | undefined;
     try {
+      if (this.worktrees) {
+        const prepared = await this.worktrees.prepare(child);
+        child = prepared.child;
+        worktree = prepared.identity;
+      }
       handle = NativeRlmSpawnHandleSchema.parse(
-        await this.runtime.run(request),
+        await this.runtime.run(request, worktree ? { worktree } : undefined),
       );
       child = await this.store.bindChildRuntime(this.jobId, {
         childId: envelope.childId,

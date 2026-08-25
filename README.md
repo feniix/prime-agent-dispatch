@@ -15,6 +15,7 @@ This is not production-ready. The default execution backend is intentionally nam
 - **OpenClaw deployment:** [`prime-dispatch-openclaw`](docs/openclaw-host-lifecycle.md) prepares versioned host-local releases, migrates durable state, validates the exact OpenClaw config delta, and provides idempotent upgrade, audit, rollback, and state-preserving uninstall operations.
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
 - **Beta Milestone 3:** **IMPLEMENTED for the disposable-fixture path.** Node 24's built-in SQLite owns transactional state, attempts, checkpoints, confirmations, leases, results, cursors, usage, artifact digests, and cleanup history. Explicit owner-confirmed resume continues only from mechanically proven safe evidence. Durable cleanup plans enforce host-owned age/byte policy while preserving minimum explanatory evidence. See the [Beta Milestone 3 report](docs/beta-milestone-3.md).
+- **Bounded child Git isolation:** writable child attempts receive host-derived branches and worktrees from immutable wave bases. Child commits remain proposals until the root performs an attributable integration transition; conflicts restore the root and preserve both sides. See [child proposal worktrees and root integration](docs/child-git-integration.md).
 
 The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
 

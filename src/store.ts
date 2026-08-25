@@ -52,22 +52,33 @@ import {
 } from "./recovery.js";
 import {
   ChildAttemptSchema,
+  ChildIntegrationSchema,
+  ChildProposalSchema,
+  CHILD_PROPOSAL_DIFF_MAX_BYTES,
   ChildSpawnEnvelopeSchema,
   ChildTerminalEvidenceSchema,
   ChildTreePolicySchema,
   ChildTreeSnapshotSchema,
+  ChildWaveBaseSchema,
+  ChildWorktreeIdentitySchema,
   DEFAULT_CHILD_TREE_POLICY,
   LogicalChildSchema,
   canonicalDigest,
+  childBranchName,
   childEnvelopeDigest,
+  childWorktreePath,
   terminalChildStatuses,
   type ChildAttempt,
   type ChildDecision,
+  type ChildIntegration,
+  type ChildProposal,
   type ChildSpawnEnvelope,
   type ChildStatus,
   type ChildTerminalEvidence,
   type ChildTreePolicy,
   type ChildTreeSnapshot,
+  type ChildWaveBase,
+  type ChildWorktreeIdentity,
   type LogicalChild,
   NativeRlmSpawnHandleSchema,
   type NativeRlmSpawnHandle,
@@ -188,6 +199,52 @@ type ChildAttemptRow = {
   terminal_evidence_json: string | null;
 };
 
+type ChildWaveBaseRow = {
+  job_id: string;
+  wave: number;
+  base_sha: string;
+  created_at: string;
+};
+
+type ChildWorktreeRow = {
+  attempt_id: string;
+  attempt_ordinal: number;
+  child_id: string;
+  job_id: string;
+  repository_path: string;
+  worktree_path: string;
+  branch_name: string;
+  base_sha: string;
+  created_head_sha: string;
+  created_at: string;
+};
+
+type ChildProposalRow = {
+  attempt_id: string;
+  child_id: string;
+  job_id: string;
+  outcome: ChildProposal["outcome"];
+  base_sha: string;
+  proposal_sha: string | null;
+  diff_text: string;
+  diff_sha256: string;
+  recorded_at: string;
+};
+
+type ChildIntegrationRow = {
+  integration_id: string;
+  attempt_id: string;
+  child_id: string;
+  job_id: string;
+  status: ChildIntegration["status"];
+  proposal_sha: string | null;
+  root_before_sha: string;
+  root_after_sha: string | null;
+  conflict_json: string | null;
+  started_at: string;
+  completed_at: string | null;
+};
+
 export type CompleteChildAttemptInput = {
   childId: string;
   attemptId: string;
@@ -205,6 +262,33 @@ export type ChildMutationInput = {
 export type BindChildRuntimeInput = ChildMutationInput & {
   attemptId: string;
   nativeHandle: NativeRlmSpawnHandle;
+};
+
+export type RecordChildWorktreeInput = ChildMutationInput & {
+  attemptId: string;
+  identity: ChildWorktreeIdentity;
+};
+
+export type RecordChildProposalInput = ChildMutationInput & {
+  attemptId: string;
+  proposal: ChildProposal;
+  proposalDiff: string;
+};
+
+export type BeginChildIntegrationInput = ChildMutationInput & {
+  attemptId: string;
+  integrationId: string;
+  proposalSha?: string;
+  rootBeforeSha: string;
+  startedAt: string;
+};
+
+export type CompleteChildIntegrationInput = {
+  integrationId: string;
+  status: "integrated" | "conflicted";
+  rootAfterSha?: string;
+  conflict?: ChildIntegration["conflict"];
+  completedAt: string;
 };
 
 export type JobStoreOptions = {
@@ -901,6 +985,15 @@ export class JobStore {
            ) VALUES (?, ?, ?, 0, ?, ?)`,
         )
         .run(jobId, sqliteJson(policy), policyDigest, now, now);
+      const request = JobRequestSchema.parse(
+        parseSqliteJson(this.jobRow(jobId).request_json, "job request"),
+      );
+      this.database
+        .prepare(
+          `INSERT INTO child_wave_bases(job_id, wave, base_sha, created_at)
+           VALUES (?, 1, ?, ?)`,
+        )
+        .run(jobId, request.baseSha, now);
       const created = this.newEvent(jobId, "child_tree_enabled", {
         policyDigest,
         maxChildren: policy.maxChildren,
@@ -918,6 +1011,399 @@ export class JobStore {
     await this.ensureImported(jobId);
     if (!this.childTreeRow(jobId, false)) return undefined;
     return this.childTreeFromDatabase(jobId);
+  }
+
+  async readChildProposalDiff(
+    jobId: string,
+    attemptId: string,
+  ): Promise<{ diff: string; digest: string }> {
+    await this.ensureImported(jobId);
+    const row = this.childProposalRow(attemptId);
+    if (row.job_id !== jobId)
+      throw new Error("child proposal has the wrong root job");
+    if (digestContent(row.diff_text) !== row.diff_sha256)
+      throw new Error("stored child proposal diff digest mismatch");
+    return { diff: row.diff_text, digest: row.diff_sha256 };
+  }
+
+  async recordChildWaveBase(
+    jobId: string,
+    input: {
+      expectedTreeRevision: number;
+      wave: number;
+      baseSha: string;
+    },
+  ): Promise<ChildWaveBase> {
+    await this.ensureImported(jobId);
+    const now = new Date().toISOString();
+    const base = ChildWaveBaseSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      jobId,
+      wave: input.wave,
+      baseSha: input.baseSha,
+      createdAt: now,
+    });
+    const event = this.transaction("record_child_wave_base", () => {
+      this.assertChildTreeRevision(jobId, input.expectedTreeRevision);
+      if (this.readStateFromDatabase(jobId).status !== "running")
+        throw new Error("child wave bases may only be recorded while running");
+      if (base.wave === 1)
+        throw new Error(
+          "the initial child wave base is fixed at tree enablement",
+        );
+      const unresolvedPriorWave = this.database
+        .prepare(
+          `SELECT 1
+           FROM logical_children AS child
+           JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+           LEFT JOIN child_proposals AS proposal
+             ON proposal.attempt_id = attempt.attempt_id
+           LEFT JOIN child_integrations AS integration
+             ON integration.attempt_id = attempt.attempt_id
+           WHERE child.job_id = ?
+             AND child.wave < ?
+             AND attempt.ordinal = (
+               SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+               WHERE latest.child_id = child.child_id
+             )
+             AND (
+               attempt.status IN ('active', 'cancelling')
+               OR (
+                 attempt.status = 'succeeded'
+                 AND proposal.attempt_id IS NOT NULL
+                 AND (integration.status IS NULL OR integration.status != 'integrated')
+               )
+             )
+           LIMIT 1`,
+        )
+        .get(jobId, base.wave);
+      if (unresolvedPriorWave)
+        throw new Error(
+          "a dependency wave base requires terminal, integrated prior waves",
+        );
+      const existing = this.childWaveBaseRow(jobId, base.wave, false);
+      if (existing) {
+        if (existing.base_sha !== base.baseSha)
+          throw new Error(`child wave ${base.wave} base is immutable`);
+        return undefined;
+      }
+      this.childWaveBaseRow(jobId, base.wave - 1);
+      this.database
+        .prepare(
+          `INSERT INTO child_wave_bases(job_id, wave, base_sha, created_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(jobId, base.wave, base.baseSha, base.createdAt);
+      this.advanceChildTreeRevision(jobId, base.createdAt);
+      const recorded = this.newEvent(jobId, "child_wave_base_recorded", {
+        wave: base.wave,
+        baseSha: base.baseSha,
+      });
+      this.insertEvent(recorded);
+      return recorded;
+    });
+    if (event) await this.projectEvents(jobId);
+    return this.childWaveBaseFromRow(this.childWaveBaseRow(jobId, base.wave));
+  }
+
+  async recordChildWorktree(
+    jobId: string,
+    input: RecordChildWorktreeInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const identity = ChildWorktreeIdentitySchema.parse(input.identity);
+    const child = this.transaction("record_child_worktree", () => {
+      const row = this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child attempt is stale");
+      if (attempt.status !== "active")
+        throw new Error("worktrees may only bind to active child attempts");
+      if (
+        identity.jobId !== jobId ||
+        identity.childId !== input.childId ||
+        identity.attemptId !== input.attemptId ||
+        identity.attemptOrdinal !== attempt.ordinal
+      )
+        throw new Error("child worktree identity has the wrong owner");
+      const envelope = ChildSpawnEnvelopeSchema.parse(
+        parseSqliteJson(row.envelope_json, "child spawn envelope"),
+      );
+      const request = JobRequestSchema.parse(
+        parseSqliteJson(this.jobRow(jobId).request_json, "job request"),
+      );
+      if (
+        identity.repositoryPath !== request.canonicalRepoPath ||
+        identity.repositoryPath !== envelope.worktree.repositoryPath
+      )
+        throw new Error("child worktree repository changed after admission");
+      if (
+        identity.worktreePath !==
+          childWorktreePath(this.root, jobId, input.childId, attempt.ordinal) ||
+        (attempt.ordinal === 1 &&
+          identity.worktreePath !== envelope.worktree.worktreePath)
+      )
+        throw new Error("child worktree path is outside its owned path");
+      if (
+        identity.branchName !==
+          childBranchName(jobId, input.childId, attempt.ordinal) ||
+        (attempt.ordinal === 1 &&
+          identity.branchName !== envelope.worktree.branchName)
+      )
+        throw new Error("child branch does not match its owned branch");
+      if (
+        identity.baseSha !== envelope.baseSha ||
+        identity.createdHeadSha !== envelope.baseSha
+      )
+        throw new Error("child worktree was not created at its admitted base");
+      if (this.childWorktreeRow(input.attemptId, false))
+        throw new Error("child attempt already has worktree identity");
+      this.database
+        .prepare(
+          `INSERT INTO child_worktrees(
+             attempt_id, attempt_ordinal, child_id, job_id, repository_path, worktree_path,
+             branch_name, base_sha, created_head_sha, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          identity.attemptId,
+          identity.attemptOrdinal,
+          identity.childId,
+          identity.jobId,
+          identity.repositoryPath,
+          identity.worktreePath,
+          identity.branchName,
+          identity.baseSha,
+          identity.createdHeadSha,
+          identity.createdAt,
+        );
+      this.database
+        .prepare(
+          `UPDATE logical_children SET revision = revision + 1, updated_at = ?
+           WHERE child_id = ?`,
+        )
+        .run(identity.createdAt, input.childId);
+      this.advanceChildTreeRevision(jobId, identity.createdAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_worktree_recorded", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          repositoryPath: identity.repositoryPath,
+          worktreePath: identity.worktreePath,
+          branchName: identity.branchName,
+          baseSha: identity.baseSha,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async recordChildProposal(
+    jobId: string,
+    input: RecordChildProposalInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const proposal = ChildProposalSchema.parse(input.proposal);
+    if (
+      Buffer.byteLength(input.proposalDiff, "utf8") >
+      CHILD_PROPOSAL_DIFF_MAX_BYTES
+    )
+      throw new Error("child proposal diff exceeds its evidence limit");
+    if (digestContent(input.proposalDiff) !== proposal.diffDigest)
+      throw new Error("child proposal diff digest does not match its evidence");
+    const child = this.transaction("record_child_proposal", () => {
+      this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child attempt is stale");
+      if (attempt.status !== "active" && attempt.status !== "succeeded")
+        throw new Error("only active or successful attempts may propose work");
+      if (
+        proposal.jobId !== jobId ||
+        proposal.childId !== input.childId ||
+        proposal.attemptId !== input.attemptId
+      )
+        throw new Error("child proposal has the wrong owner");
+      const worktree = this.childWorktreeRow(input.attemptId);
+      if (proposal.baseSha !== worktree.base_sha)
+        throw new Error("child proposal base differs from its worktree base");
+      if (this.childProposalRow(input.attemptId, false))
+        throw new Error("child attempt already has proposal evidence");
+      this.database
+        .prepare(
+          `INSERT INTO child_proposals(
+             attempt_id, child_id, job_id, outcome, base_sha, proposal_sha,
+             diff_text, diff_sha256, recorded_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          proposal.attemptId,
+          proposal.childId,
+          proposal.jobId,
+          proposal.outcome,
+          proposal.baseSha,
+          proposal.proposalSha ?? null,
+          input.proposalDiff,
+          proposal.diffDigest,
+          proposal.recordedAt,
+        );
+      this.database
+        .prepare(
+          `UPDATE logical_children SET revision = revision + 1, updated_at = ?
+           WHERE child_id = ?`,
+        )
+        .run(proposal.recordedAt, input.childId);
+      this.advanceChildTreeRevision(jobId, proposal.recordedAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_proposal_recorded", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          outcome: proposal.outcome,
+          baseSha: proposal.baseSha,
+          proposalSha: proposal.proposalSha,
+          diffDigest: proposal.diffDigest,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async beginChildIntegration(
+    jobId: string,
+    input: BeginChildIntegrationInput,
+  ): Promise<ChildIntegration> {
+    await this.ensureImported(jobId);
+    const integration = ChildIntegrationSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      integrationId: input.integrationId,
+      attemptId: input.attemptId,
+      childId: input.childId,
+      jobId,
+      status: "applying",
+      ...(input.proposalSha ? { proposalSha: input.proposalSha } : {}),
+      rootBeforeSha: input.rootBeforeSha,
+      startedAt: input.startedAt,
+    });
+    this.transaction("begin_child_integration", () => {
+      this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (
+        attempt.attempt_id !== input.attemptId ||
+        attempt.status !== "succeeded"
+      )
+        throw new Error(
+          "only the successful current child attempt may integrate",
+        );
+      const proposal = this.childProposalRow(input.attemptId);
+      if ((proposal.proposal_sha ?? undefined) !== integration.proposalSha)
+        throw new Error("child integration proposal SHA changed");
+      if (this.childIntegrationRow(input.attemptId, false))
+        throw new Error("child proposal already has an integration record");
+      this.database
+        .prepare(
+          `INSERT INTO child_integrations(
+             integration_id, attempt_id, child_id, job_id, status,
+             proposal_sha, root_before_sha, root_after_sha, conflict_json,
+             started_at, completed_at
+           ) VALUES (?, ?, ?, ?, 'applying', ?, ?, NULL, NULL, ?, NULL)`,
+        )
+        .run(
+          integration.integrationId,
+          integration.attemptId,
+          integration.childId,
+          integration.jobId,
+          integration.proposalSha ?? null,
+          integration.rootBeforeSha,
+          integration.startedAt,
+        );
+      this.database
+        .prepare(
+          `UPDATE logical_children SET revision = revision + 1, updated_at = ?
+           WHERE child_id = ?`,
+        )
+        .run(integration.startedAt, input.childId);
+      this.advanceChildTreeRevision(jobId, integration.startedAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_integration_started", {
+          integrationId: integration.integrationId,
+          childId: input.childId,
+          attemptId: input.attemptId,
+          proposalSha: integration.proposalSha,
+          rootBeforeSha: integration.rootBeforeSha,
+        }),
+      );
+    });
+    await this.projectEvents(jobId);
+    return this.childIntegrationFromRow(
+      this.childIntegrationByIdRow(integration.integrationId),
+    );
+  }
+
+  async completeChildIntegration(
+    jobId: string,
+    input: CompleteChildIntegrationInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const child = this.transaction("complete_child_integration", () => {
+      const row = this.childIntegrationByIdRow(input.integrationId);
+      if (row.job_id !== jobId)
+        throw new Error("child integration has the wrong root job");
+      if (row.status !== "applying")
+        throw new Error("child integration is already terminal");
+      const terminal = ChildIntegrationSchema.parse({
+        ...this.childIntegrationFromRow(row),
+        status: input.status,
+        ...(input.rootAfterSha ? { rootAfterSha: input.rootAfterSha } : {}),
+        ...(input.conflict ? { conflict: input.conflict } : {}),
+        completedAt: input.completedAt,
+      });
+      this.database
+        .prepare(
+          `UPDATE child_integrations
+           SET status = ?, root_after_sha = ?, conflict_json = ?, completed_at = ?
+           WHERE integration_id = ? AND status = 'applying'`,
+        )
+        .run(
+          terminal.status,
+          terminal.rootAfterSha ?? null,
+          terminal.conflict ? sqliteJson(terminal.conflict) : null,
+          input.completedAt,
+          terminal.integrationId,
+        );
+      if (terminal.status === "integrated")
+        this.database
+          .prepare(
+            `UPDATE logical_children SET decision = 'selected',
+               revision = revision + 1, updated_at = ? WHERE child_id = ?`,
+          )
+          .run(input.completedAt, terminal.childId);
+      else
+        this.database
+          .prepare(
+            `UPDATE logical_children SET revision = revision + 1,
+               updated_at = ? WHERE child_id = ?`,
+          )
+          .run(input.completedAt, terminal.childId);
+      this.advanceChildTreeRevision(jobId, input.completedAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_integration_completed", {
+          integrationId: terminal.integrationId,
+          childId: terminal.childId,
+          attemptId: terminal.attemptId,
+          status: terminal.status,
+          rootBeforeSha: terminal.rootBeforeSha,
+          rootAfterSha: terminal.rootAfterSha,
+          conflict: terminal.conflict,
+        }),
+      );
+      return this.logicalChildFromDatabase(terminal.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
   }
 
   async admitChild(
@@ -938,6 +1424,22 @@ export class JobStore {
         );
       if (envelope.parentJobId !== jobId)
         throw new Error("child parent must be the root job");
+      const waveBase = this.childWaveBaseRow(jobId, envelope.wave);
+      if (waveBase.base_sha !== envelope.baseSha)
+        throw new Error(
+          `child wave ${envelope.wave} base SHA does not match the recorded integrated base`,
+        );
+      const latestWave = (
+        this.database
+          .prepare(
+            "SELECT MAX(wave) AS wave FROM child_wave_bases WHERE job_id = ?",
+          )
+          .get(jobId) as { wave: number }
+      ).wave;
+      if (envelope.wave < latestWave)
+        throw new Error(
+          "child admission cannot reopen a closed dependency wave",
+        );
       const total = (
         this.database
           .prepare(
@@ -970,6 +1472,21 @@ export class JobStore {
           "succeeded"
         )
           throw new Error("child dependencies must succeed before admission");
+        const dependencyAttempt = this.currentChildAttemptFromDatabase(
+          dependency.child_id,
+        );
+        const proposal = this.childProposalRow(
+          dependencyAttempt.attempt_id,
+          false,
+        );
+        if (
+          proposal &&
+          this.childIntegrationRow(dependencyAttempt.attempt_id, false)
+            ?.status !== "integrated"
+        )
+          throw new Error(
+            "child dependencies with proposal evidence must be integrated before admission",
+          );
         return dependency;
       });
       const attemptId = randomUUID();
@@ -1211,6 +1728,18 @@ export class JobStore {
         throw new Error(
           "child cancellation must be requested before terminal cancellation",
         );
+      const worktree = this.childWorktreeRow(attempt.attempt_id, false);
+      const proposal = this.childProposalRow(attempt.attempt_id, false);
+      if (evidence.outcome === "succeeded" && worktree && !proposal)
+        throw new Error(
+          "successful writable children require recorded proposal evidence",
+        );
+      if (proposal) {
+        if ((proposal.proposal_sha ?? undefined) !== evidence.commitSha)
+          throw new Error(
+            "child terminal commit does not match recorded proposal evidence",
+          );
+      }
       this.database
         .prepare(
           `UPDATE child_attempts
@@ -1259,6 +1788,15 @@ export class JobStore {
         throw new Error("only a successful child result may be selected");
       if (input.decision === "discarded" && status !== "cancelled")
         throw new Error("discarded children require terminal cancellation");
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      const proposal = this.childProposalRow(attempt.attempt_id, false);
+      if (
+        input.decision === "selected" &&
+        proposal &&
+        this.childIntegrationRow(attempt.attempt_id, false)?.status !==
+          "integrated"
+      )
+        throw new Error("child proposal must be integrated before selection");
       this.database
         .prepare(
           `UPDATE logical_children SET decision = ?, revision = revision + 1,
@@ -1886,6 +2424,169 @@ export class JobStore {
     return row;
   }
 
+  private childWaveBaseRow(jobId: string, wave: number): ChildWaveBaseRow;
+  private childWaveBaseRow(
+    jobId: string,
+    wave: number,
+    required: false,
+  ): ChildWaveBaseRow | undefined;
+  private childWaveBaseRow(
+    jobId: string,
+    wave: number,
+    required = true,
+  ): ChildWaveBaseRow | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT job_id, wave, base_sha, created_at
+         FROM child_wave_bases WHERE job_id = ? AND wave = ?`,
+      )
+      .get(jobId, wave) as ChildWaveBaseRow | undefined;
+    if (!row && required)
+      throw new Error(`child wave ${wave} has no recorded integrated base`);
+    return row;
+  }
+
+  private childWaveBaseFromRow(row: ChildWaveBaseRow): ChildWaveBase {
+    return ChildWaveBaseSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      jobId: row.job_id,
+      wave: row.wave,
+      baseSha: row.base_sha,
+      createdAt: row.created_at,
+    });
+  }
+
+  private childWorktreeRow(attemptId: string): ChildWorktreeRow;
+  private childWorktreeRow(
+    attemptId: string,
+    required: false,
+  ): ChildWorktreeRow | undefined;
+  private childWorktreeRow(
+    attemptId: string,
+    required = true,
+  ): ChildWorktreeRow | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT attempt_id, attempt_ordinal, child_id, job_id, repository_path, worktree_path,
+                branch_name, base_sha, created_head_sha, created_at
+         FROM child_worktrees WHERE attempt_id = ?`,
+      )
+      .get(attemptId) as ChildWorktreeRow | undefined;
+    if (!row && required)
+      throw new Error(`child attempt ${attemptId} has no worktree identity`);
+    return row;
+  }
+
+  private childWorktreeFromRow(row: ChildWorktreeRow): ChildWorktreeIdentity {
+    return ChildWorktreeIdentitySchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      attemptId: row.attempt_id,
+      attemptOrdinal: row.attempt_ordinal,
+      childId: row.child_id,
+      jobId: row.job_id,
+      repositoryPath: row.repository_path,
+      worktreePath: row.worktree_path,
+      branchName: row.branch_name,
+      baseSha: row.base_sha,
+      createdHeadSha: row.created_head_sha,
+      createdAt: row.created_at,
+    });
+  }
+
+  private childProposalRow(attemptId: string): ChildProposalRow;
+  private childProposalRow(
+    attemptId: string,
+    required: false,
+  ): ChildProposalRow | undefined;
+  private childProposalRow(
+    attemptId: string,
+    required = true,
+  ): ChildProposalRow | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT attempt_id, child_id, job_id, outcome, base_sha, proposal_sha,
+                diff_text, diff_sha256, recorded_at
+         FROM child_proposals WHERE attempt_id = ?`,
+      )
+      .get(attemptId) as ChildProposalRow | undefined;
+    if (!row && required)
+      throw new Error(`child attempt ${attemptId} has no proposal evidence`);
+    return row;
+  }
+
+  private childProposalFromRow(row: ChildProposalRow): ChildProposal {
+    return ChildProposalSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      attemptId: row.attempt_id,
+      childId: row.child_id,
+      jobId: row.job_id,
+      outcome: row.outcome,
+      baseSha: row.base_sha,
+      ...(row.proposal_sha ? { proposalSha: row.proposal_sha } : {}),
+      diffDigest: row.diff_sha256,
+      recordedAt: row.recorded_at,
+    });
+  }
+
+  private childIntegrationRow(attemptId: string): ChildIntegrationRow;
+  private childIntegrationRow(
+    attemptId: string,
+    required: false,
+  ): ChildIntegrationRow | undefined;
+  private childIntegrationRow(
+    attemptId: string,
+    required = true,
+  ): ChildIntegrationRow | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT integration_id, attempt_id, child_id, job_id, status,
+                proposal_sha, root_before_sha, root_after_sha, conflict_json,
+                started_at, completed_at
+         FROM child_integrations WHERE attempt_id = ?`,
+      )
+      .get(attemptId) as ChildIntegrationRow | undefined;
+    if (!row && required)
+      throw new Error(`child attempt ${attemptId} has no integration record`);
+    return row;
+  }
+
+  private childIntegrationByIdRow(integrationId: string): ChildIntegrationRow {
+    const row = this.database
+      .prepare(
+        `SELECT integration_id, attempt_id, child_id, job_id, status,
+                proposal_sha, root_before_sha, root_after_sha, conflict_json,
+                started_at, completed_at
+         FROM child_integrations WHERE integration_id = ?`,
+      )
+      .get(integrationId) as ChildIntegrationRow | undefined;
+    if (!row) throw new Error(`unknown child integration: ${integrationId}`);
+    return row;
+  }
+
+  private childIntegrationFromRow(row: ChildIntegrationRow): ChildIntegration {
+    return ChildIntegrationSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      integrationId: row.integration_id,
+      attemptId: row.attempt_id,
+      childId: row.child_id,
+      jobId: row.job_id,
+      status: row.status,
+      ...(row.proposal_sha ? { proposalSha: row.proposal_sha } : {}),
+      rootBeforeSha: row.root_before_sha,
+      ...(row.root_after_sha ? { rootAfterSha: row.root_after_sha } : {}),
+      ...(row.conflict_json
+        ? {
+            conflict: parseSqliteJson(
+              row.conflict_json,
+              "child integration conflict",
+            ),
+          }
+        : {}),
+      startedAt: row.started_at,
+      ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    });
+  }
+
   private childAttemptFromRow(row: ChildAttemptRow): ChildAttempt {
     const nativeHandle = row.native_handle_json
       ? NativeRlmSpawnHandleSchema.parse(
@@ -1897,6 +2598,9 @@ export class JobStore {
       : undefined;
     if ((nativeHandle?.rlmChildId ?? null) !== row.native_child_id)
       throw new Error("stored native child runtime identity mismatch");
+    const worktreeRow = this.childWorktreeRow(row.attempt_id, false);
+    const proposalRow = this.childProposalRow(row.attempt_id, false);
+    const integrationRow = this.childIntegrationRow(row.attempt_id, false);
     return ChildAttemptSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       attemptId: row.attempt_id,
@@ -1911,6 +2615,15 @@ export class JobStore {
       startedAt: row.started_at,
       ...(row.completed_at ? { completedAt: row.completed_at } : {}),
       ...(nativeHandle ? { nativeHandle } : {}),
+      ...(worktreeRow
+        ? { worktree: this.childWorktreeFromRow(worktreeRow) }
+        : {}),
+      ...(proposalRow
+        ? { proposal: this.childProposalFromRow(proposalRow) }
+        : {}),
+      ...(integrationRow
+        ? { integration: this.childIntegrationFromRow(integrationRow) }
+        : {}),
       ...(row.terminal_evidence_json
         ? {
             terminalEvidence: parseSqliteJson(
@@ -1988,6 +2701,14 @@ export class JobStore {
         )
         .all(jobId) as { child_id: string }[]
     ).map((child) => this.logicalChildFromDatabase(child.child_id));
+    const waveBases = (
+      this.database
+        .prepare(
+          `SELECT job_id, wave, base_sha, created_at
+           FROM child_wave_bases WHERE job_id = ? ORDER BY wave`,
+        )
+        .all(jobId) as ChildWaveBaseRow[]
+    ).map((base) => this.childWaveBaseFromRow(base));
     return ChildTreeSnapshotSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       jobId,
@@ -1996,6 +2717,7 @@ export class JobStore {
       revision: row.revision,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      waveBases,
       children,
     });
   }
@@ -2077,6 +2799,29 @@ export class JobStore {
     if (active > 0)
       throw new Error(
         "trusted verification requires every child attempt to be terminal",
+      );
+    const unintegrated = (
+      this.database
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM logical_children AS child
+           JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+           JOIN child_proposals AS proposal ON proposal.attempt_id = attempt.attempt_id
+           LEFT JOIN child_integrations AS integration
+             ON integration.attempt_id = attempt.attempt_id
+           WHERE child.job_id = ?
+             AND attempt.status = 'succeeded'
+             AND attempt.ordinal = (
+               SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+               WHERE latest.child_id = child.child_id
+             )
+             AND (integration.status IS NULL OR integration.status != 'integrated')`,
+        )
+        .get(jobId) as { count: number }
+    ).count;
+    if (unintegrated > 0)
+      throw new Error(
+        "trusted verification requires every successful child proposal to be integrated",
       );
   }
 

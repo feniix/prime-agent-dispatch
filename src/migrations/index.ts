@@ -4,6 +4,7 @@ import { migration003 } from "./003-cleanup.js";
 import { migration004 } from "./004-cleanup-reservations.js";
 import { migration005 } from "./005-child-tree.js";
 import { migration006 } from "./006-kysely-integrity.js";
+import { migration007 } from "./007-child-git-integration.js";
 import type { ControlMigration } from "./framework.js";
 
 export const CONTROL_MIGRATIONS: readonly ControlMigration[] = Object.freeze([
@@ -13,6 +14,7 @@ export const CONTROL_MIGRATIONS: readonly ControlMigration[] = Object.freeze([
   migration004,
   migration005,
   migration006,
+  migration007,
 ]);
 
 export const CONTROL_SCHEMA_VERSION = CONTROL_MIGRATIONS.length;
