@@ -1,12 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  ChildInferencePolicySchema,
   InferenceUsageLedgerSchema,
   JobStateSchema,
   PrimeStartInputSchema,
   WorkerCommandSchema,
   WorkerRequestSchema,
 } from "../dist/index.js";
+
+const childPolicy = {
+  schemaVersion: 1,
+  experimental: true,
+  provider: "openai",
+  models: [{ model: "gpt-5.6-sol", reasoning: ["high"] }],
+  aggregateMaxTokens: 1_000,
+  rootReservePercent: 30,
+  maxTokensPerAttempt: 700,
+  maxRequestsPerAttempt: 4,
+  aggregateMaxConcurrency: 3,
+  maxConcurrencyPerAttempt: 1,
+  maxWallClockMsPerAttempt: 60_000,
+};
 
 function minimalStart() {
   return {
@@ -32,6 +47,22 @@ test("prime_start applies bounded defaults", () => {
     maxTokens: 250_000,
     maxTurns: 50,
   });
+});
+
+test("child inference allowlists bound rendered provider, model, and reasoning values", () => {
+  assert.doesNotThrow(() => ChildInferencePolicySchema.parse(childPolicy));
+  for (const value of [
+    { ...childPolicy, provider: "p".repeat(65) },
+    {
+      ...childPolicy,
+      models: [{ model: "m".repeat(129), reasoning: ["high"] }],
+    },
+    {
+      ...childPolicy,
+      models: [{ model: "model", reasoning: ["r".repeat(65)] }],
+    },
+  ])
+    assert.throws(() => ChildInferencePolicySchema.parse(value));
 });
 
 test("authorization accepts host-supplied owner and delivery identity", () => {
@@ -131,6 +162,22 @@ test("worker IPC accepts only status, steer, and cancel operations", () => {
       operation: "prime_steer",
       jobId: "job",
       message: "bounded",
+      childId: "11111111-1111-4111-8111-111111111111",
+    }),
+  );
+  assert.doesNotThrow(() =>
+    WorkerCommandSchema.parse({
+      operation: "prime_cancel",
+      jobId: "job",
+      childId: "11111111-1111-4111-8111-111111111111",
+    }),
+  );
+  assert.throws(() =>
+    WorkerCommandSchema.parse({
+      operation: "prime_steer",
+      jobId: "job",
+      message: "bounded",
+      childId: "not-a-child-id",
     }),
   );
   assert.throws(() =>

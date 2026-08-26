@@ -190,15 +190,31 @@ const plugin = definePluginEntry({
       Type.Object({
         jobId: Type.String(),
         message: Type.String({ minLength: 1, maxLength: 10_000 }),
+        childId: Type.Optional(Type.String({ format: "uuid" })),
       }),
-      (p, c) => adapter.steer({ jobId: p.jobId, message: p.message }, c),
+      (p, c) =>
+        adapter.steer(
+          {
+            jobId: p.jobId,
+            message: p.message,
+            ...(p.childId ? { childId: p.childId } : {}),
+          },
+          c,
+        ),
     );
     registerSimpleTool(
       api,
       adapter,
       "prime_cancel",
-      Type.Object({ jobId: Type.String() }),
-      (p, c) => adapter.cancel({ jobId: p.jobId }, c),
+      Type.Object({
+        jobId: Type.String(),
+        childId: Type.Optional(Type.String({ format: "uuid" })),
+      }),
+      (p, c) =>
+        adapter.cancel(
+          { jobId: p.jobId, ...(p.childId ? { childId: p.childId } : {}) },
+          c,
+        ),
     );
     registerSimpleTool(
       api,
@@ -486,7 +502,12 @@ function registerSimpleTool(
     (context) => ({
       name,
       label: name.replace("_", " "),
-      description: `${name} through the standalone authenticated Prime Dispatch control plane. Owner-only.`,
+      description:
+        name === "prime_steer"
+          ? "Send bounded operator guidance to the root. An optional childId names the target, but transport remains root-routed. Owner and original job route only."
+          : name === "prime_cancel"
+            ? "Cancel the root job, or route a child cancellation request through the root when childId is set. Owner and original job route only."
+            : `${name} through the standalone authenticated Prime Dispatch control plane. Owner and original job route only.`,
       parameters,
       async execute(_toolCallId, params) {
         return result(await execute(params as any, trustedContext(context)));

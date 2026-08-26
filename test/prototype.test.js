@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
+  DEFAULT_CHILD_INFERENCE_POLICY,
   JobStore,
   PrimeDispatcher,
   PrimeStartInputSchema,
@@ -99,6 +100,40 @@ async function waitForEvent(store, jobId, predicate, timeoutMs = 10_000) {
 async function startConfirmed(dispatcher, request) {
   const preview = await dispatcher.preview(request);
   return await dispatcher.startConfirmed(preview, preview.summary.requestHash);
+}
+
+function controlledChildEnvelope(tree, repo) {
+  return {
+    schemaVersion: 1,
+    childId: crypto.randomUUID(),
+    parentJobId: tree.jobId,
+    name: "controlled-child",
+    role: "implementation",
+    promptDigest: "a".repeat(64),
+    criticality: "required",
+    depth: 1,
+    wave: 1,
+    dependencyChildIds: [],
+    baseSha: tree.waveBases[0].baseSha,
+    worktree: {
+      repositoryPath: repo,
+      worktreePath: join(repo, ".worktrees", "controlled-child"),
+      branchName: "child/controlled-child",
+    },
+    inference: {
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      reasoning: "high",
+    },
+    budget: {
+      wallClockMs: 60_000,
+      cancellationGraceMs: 500,
+      maxOutputBytes: 100_000,
+      maxTokens: 10_000,
+      maxTurns: 5,
+    },
+    lifecycle: { cancellationGraceMs: 500, retryLimit: 1 },
+  };
 }
 
 test("happy path creates a worktree, passes gates, commits, and records root-only env", async () => {
@@ -321,6 +356,96 @@ test("a fresh CLI process reconnects to a surviving worker for steer and cancel"
   );
   assert.equal(terminal.summary, "cancelled by request");
   assert.equal((await dispatcher.result(jobId)).status, "cancelled");
+});
+
+test("child controls validate the tree and reach only the root transport", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const request = input(repo, root, "SLOW root-routed controls");
+  request.budget.maxTokens = DEFAULT_CHILD_INFERENCE_POLICY.aggregateMaxTokens;
+  const preview = await dispatcher.preview(
+    request,
+    DEFAULT_CHILD_INFERENCE_POLICY,
+  );
+  const started = await dispatcher.startConfirmed(
+    preview,
+    preview.summary.requestHash,
+  );
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "running",
+  );
+  let tree = await dispatcher.store.readChildTree(started.jobId);
+  const child = await dispatcher.store.admitChild(
+    started.jobId,
+    tree.revision,
+    controlledChildEnvelope(tree, repo),
+  );
+
+  await assert.rejects(
+    () => dispatcher.steer(started.jobId, "tampered", crypto.randomUUID()),
+    /outside this job/,
+  );
+  assert.deepEqual(
+    await dispatcher.steer(
+      started.jobId,
+      "keep this child bounded",
+      child.envelope.childId,
+    ),
+    {
+      accepted: true,
+      childId: child.envelope.childId,
+      routedTo: "root",
+    },
+  );
+  assert.deepEqual(
+    await dispatcher.cancel(started.jobId, child.envelope.childId),
+    {
+      accepted: true,
+      childId: child.envelope.childId,
+      routedTo: "root",
+    },
+  );
+  const events = await dispatcher.store.readEvents(started.jobId);
+  assert.equal(
+    events.find((event) => event.type === "steered")?.data.routedTo,
+    "root",
+  );
+  assert.equal(
+    events.find((event) => event.type === "child_cancellation_routed")?.data
+      .childId,
+    child.envelope.childId,
+  );
+  tree = await dispatcher.store.readChildTree(started.jobId);
+  assert.equal(tree.children[0].status, "active");
+  const cancelling = await dispatcher.store.requestChildCancellation(
+    started.jobId,
+    {
+      childId: child.envelope.childId,
+      expectedChildRevision: child.revision,
+      envelopeDigest: child.envelopeDigest,
+    },
+  );
+  await dispatcher.store.completeChildAttempt(started.jobId, {
+    childId: child.envelope.childId,
+    attemptId: child.attempts[0].attemptId,
+    expectedChildRevision: cancelling.revision,
+    envelopeDigest: child.envelopeDigest,
+    evidence: {
+      schemaVersion: 1,
+      outcome: "cancelled",
+      summary: "test child teardown",
+      completedAt: new Date().toISOString(),
+    },
+  });
+
+  await dispatcher.cancel(started.jobId);
+  await waitFor(
+    dispatcher,
+    started.jobId,
+    (value) => value.status === "cancelled",
+  );
 });
 
 test("dispatcher enforces one active job globally and releases after terminal state", async () => {

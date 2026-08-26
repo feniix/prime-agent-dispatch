@@ -5,7 +5,11 @@ import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { PrimeDispatcher, PrimeStartInputSchema } from "../dist/index.js";
+import {
+  DEFAULT_CHILD_INFERENCE_POLICY,
+  PrimeDispatcher,
+  PrimeStartInputSchema,
+} from "../dist/index.js";
 
 const exec = promisify(execFile);
 const cli = new URL("../dist/cli.js", import.meta.url).pathname;
@@ -92,6 +96,34 @@ test("confirmed start launches an internal snapshot across await boundaries", as
     (await dispatcher.store.readRequest(started.jobId)).task,
     "authorized snapshot",
   );
+});
+
+test("confirmed experimental preview enables exactly its hash-bound child policy", async () => {
+  const { root, repo, stateRoot } = await fixture();
+  const dispatcher = new PrimeDispatcher(stateRoot);
+  const preview = await dispatcher.preview(
+    PrimeStartInputSchema.parse({
+      task: "authorized descendants",
+      repoPath: repo,
+      repoRoots: [root],
+      fixture: true,
+      authorization: { channelId: "local", senderId: "local" },
+    }),
+    DEFAULT_CHILD_INFERENCE_POLICY,
+  );
+  assert.equal(preview.summary.multiChild.experimental, true);
+  assert.deepEqual(preview.summary.multiChild.topology, {
+    maxLogicalChildren: 5,
+    maxActiveChildren: 3,
+    maxDepth: 1,
+  });
+  const started = await dispatcher.startConfirmed(
+    preview,
+    preview.summary.requestHash,
+  );
+  const tree = await dispatcher.store.readChildTree(started.jobId);
+  assert.match(tree.inferencePolicyDigest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(tree.inferencePolicy, DEFAULT_CHILD_INFERENCE_POLICY);
 });
 
 test("CLI refuses launch without confirmation and --yes is explicit fixture acceptance", async () => {

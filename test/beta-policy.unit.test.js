@@ -179,3 +179,57 @@ test("confirmation hashes use RFC 8785 JSON key ordering", () => {
     createHash("sha256").update('{"Z":1,"a":2}').digest("hex"),
   );
 });
+
+test("confirmation binds the complete experimental descendant envelope", () => {
+  const multiChild = {
+    schemaVersion: 1,
+    experimental: true,
+    provider: "openai",
+    models: [
+      { model: "gpt-5.6-sol", reasoning: ["high"] },
+      { model: "gpt-5.6-mini", reasoning: ["medium"] },
+    ],
+    aggregateMaxTokens: 1_000,
+    rootReservePercent: 30,
+    maxTokensPerAttempt: 400,
+    maxRequestsPerAttempt: 4,
+    aggregateMaxConcurrency: 3,
+    maxConcurrencyPerAttempt: 1,
+    maxWallClockMsPerAttempt: 60_000,
+  };
+  const input = {
+    task: "multi-child fixture",
+    canonicalRepoPath: "/repos/fixture",
+    baseSha: "a".repeat(40),
+    gates: [],
+    budget: { maxTokens: 1_000 },
+    multiChild,
+    immutableRequest: { task: "multi-child fixture", multiChild },
+  };
+  const summary = buildConfirmationSummary(input);
+  assert.deepEqual(summary.multiChild.topology, {
+    maxLogicalChildren: 5,
+    maxActiveChildren: 3,
+    maxDepth: 1,
+  });
+  assert.equal(summary.multiChild.repositoryScope, "/repos/fixture");
+  assert.equal(summary.multiChild.rootReservePercent, 30);
+  assert.equal(summary.multiChild.retryLimit, 1);
+  assert.notEqual(
+    summary.requestHash,
+    buildConfirmationSummary({
+      ...input,
+      multiChild: {
+        ...multiChild,
+        models: [{ model: "gpt-5.6-sol", reasoning: ["high"] }],
+      },
+      immutableRequest: {
+        task: "multi-child fixture",
+        multiChild: {
+          ...multiChild,
+          models: [{ model: "gpt-5.6-sol", reasoning: ["high"] }],
+        },
+      },
+    }).requestHash,
+  );
+});

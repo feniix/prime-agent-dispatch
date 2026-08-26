@@ -31,6 +31,15 @@ import {
   assessSafeResume,
   resumeAuthorizationContextHash,
 } from "./resume.js";
+import {
+  assertChildControlTarget,
+  DEFAULT_CHILD_TREE_POLICY,
+  type ChildTreeSnapshot,
+} from "./children.js";
+import {
+  ChildInferencePolicySchema,
+  type ChildInferencePolicy,
+} from "./child-inference.js";
 
 type VerifyWorkerIdentity = (
   identity: NonNullable<ReturnType<typeof workerIdentityFromState>>,
@@ -79,8 +88,14 @@ export class PrimeDispatcher {
     this.store = new JobStore(this.stateRoot);
   }
 
-  async preview(input: PrimeStartInput): Promise<PreparedStart> {
+  async preview(
+    input: PrimeStartInput,
+    multiChild?: ChildInferencePolicy,
+  ): Promise<PreparedStart> {
     const parsed = PrimeStartInputSchema.parse(input);
+    const childPolicy = multiChild
+      ? ChildInferencePolicySchema.parse(multiChild)
+      : undefined;
     const repository = await resolveRepository(
       parsed.repoPath,
       parsed.repoRoots,
@@ -89,7 +104,8 @@ export class PrimeDispatcher {
     return {
       input: parsed,
       repository,
-      summary: summarizePreparedStart(parsed, repository),
+      ...(childPolicy ? { multiChild: childPolicy } : {}),
+      summary: summarizePreparedStart(parsed, repository, childPolicy),
     };
   }
 
@@ -99,12 +115,24 @@ export class PrimeDispatcher {
   ): Promise<{ jobId: string; state: unknown }> {
     const input = PrimeStartInputSchema.parse(prepared.input);
     const repository = { ...prepared.repository };
-    const currentSummary = summarizePreparedStart(input, repository);
+    const multiChild = prepared.multiChild
+      ? ChildInferencePolicySchema.parse(prepared.multiChild)
+      : undefined;
+    const currentSummary = summarizePreparedStart(
+      input,
+      repository,
+      multiChild,
+    );
     if (currentSummary.requestHash !== prepared.summary.requestHash)
       throw new Error("prepared request changed after preview");
     if (currentSummary.requestHash !== confirmationHash)
       throw new Error("confirmation hash mismatch; request was not authorized");
-    return await this.launch({ input, repository, summary: currentSummary });
+    return await this.launch({
+      input,
+      repository,
+      ...(multiChild ? { multiChild } : {}),
+      summary: currentSummary,
+    });
   }
 
   private async launch(
@@ -130,6 +158,12 @@ export class PrimeDispatcher {
     };
     try {
       const state = await this.store.initialize(request);
+      if (prepared.multiChild)
+        await this.store.enableChildTree(
+          jobId,
+          DEFAULT_CHILD_TREE_POLICY,
+          prepared.multiChild,
+        );
       await this.spawnWorker(jobId, launcherToken.nonce, workerNonce);
       return { jobId, state };
     } catch (error) {
@@ -394,6 +428,14 @@ export class PrimeDispatcher {
     }
   }
 
+  async treeStatus(
+    jobId: string,
+  ): Promise<{ state: unknown; childTree?: ChildTreeSnapshot }> {
+    const state = await this.status(jobId);
+    const childTree = await this.store.readChildTree(jobId);
+    return { state, ...(childTree ? { childTree } : {}) };
+  }
+
   private async readReconciledState(jobId: string): Promise<JobState> {
     let state = await this.store.readState(jobId);
     if (!terminalStatuses.has(state.status) && state.terminalIntentStatus) {
@@ -440,21 +482,34 @@ export class PrimeDispatcher {
     return results;
   }
 
-  async steer(jobId: string, message: string): Promise<unknown> {
+  async steer(
+    jobId: string,
+    message: string,
+    childId?: string,
+  ): Promise<unknown> {
     const state = (await this.status(jobId)) as JobState;
+    if (childId) await this.assertChildControlTarget(jobId, childId);
     const identity = workerIdentityFromState(state);
     if (!identity) throw new Error("verified job worker is not available");
     return await sendAuthenticatedWorkerCommand(identity, {
       operation: "prime_steer",
       jobId,
       message,
+      ...(childId ? { childId } : {}),
     });
   }
 
-  async cancel(jobId: string): Promise<unknown> {
+  async cancel(jobId: string, childId?: string): Promise<unknown> {
     const state = (await this.status(jobId)) as JobState;
+    if (childId) await this.assertChildControlTarget(jobId, childId, true);
     const identity = workerIdentityFromState(state);
     if (!identity) throw new Error("verified job worker is not available");
+    if (childId)
+      return await sendAuthenticatedWorkerCommand(identity, {
+        operation: "prime_cancel",
+        jobId,
+        childId,
+      });
     const request = await this.store.readRequest(jobId);
     return await sendAuthenticatedWorkerCommand(
       identity,
@@ -466,6 +521,15 @@ export class PrimeDispatcher {
   async result(jobId: string): Promise<unknown> {
     await this.status(jobId);
     return await this.store.readResult(jobId);
+  }
+
+  private async assertChildControlTarget(
+    jobId: string,
+    childId: string,
+    requireActive = false,
+  ): Promise<void> {
+    const tree = await this.store.readChildTree(jobId);
+    assertChildControlTarget(tree, childId, requireActive);
   }
 
   private async interruptUnverifiedWorker(
@@ -514,12 +578,14 @@ export class PrimeDispatcher {
 export type PreparedStart = {
   input: PrimeStartInput;
   repository: ResolvedRepository;
+  multiChild?: ChildInferencePolicy;
   summary: ReturnType<typeof buildConfirmationSummary>;
 };
 
 function summarizePreparedStart(
   input: PrimeStartInput,
   repository: ResolvedRepository,
+  multiChild?: ChildInferencePolicy,
 ) {
   return buildConfirmationSummary({
     task: input.task,
@@ -527,6 +593,11 @@ function summarizePreparedStart(
     baseSha: repository.baseSha,
     gates: input.gates,
     budget: input.budget,
-    immutableRequest: { ...input, ...repository },
+    ...(multiChild ? { multiChild } : {}),
+    immutableRequest: {
+      ...input,
+      ...repository,
+      ...(multiChild ? { multiChild } : {}),
+    },
   });
 }

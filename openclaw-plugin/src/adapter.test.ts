@@ -17,13 +17,92 @@ const ownerContext: TrustedToolContext = {
   deliveryId: "message-1",
 };
 
+const childId = "11111111-1111-4111-8111-111111111111";
+
+function childTree() {
+  return {
+    revision: 4,
+    policy: { maxChildren: 5, maxActiveChildren: 3 },
+    children: [
+      {
+        envelope: {
+          childId,
+          name: "implementation",
+          role: "implementation",
+          criticality: "required",
+          wave: 1,
+          prompt: "raw-child-prompt-must-not-render",
+        },
+        status: "active",
+        decision: "pending",
+        attempts: [
+          {
+            ordinal: 1,
+            inference: {
+              provider: "openai",
+              model: "gpt-5.6-sol",
+              reasoning: "high",
+            },
+            inferenceAllocation: { tokenLimit: 200 },
+            inferenceUsage: { observedUsage: { totalTokens: 10 } },
+            nativeHandle: {
+              sessionDir: "/private/session",
+              credential: "raw-child-credential-must-not-render",
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
 async function fixture() {
   const stateRoot = await mkdtemp(join(tmpdir(), "prime-adapter-"));
   const calls: string[][] = [];
+  const jobState = {
+    status: "running",
+    secretToken: "must-not-render",
+    modelTokens: "must-not-render-model-token",
+    inputTokens: 424242,
+    summary: "x".repeat(5000),
+    inference: {
+      observedUsage: {
+        inputTokens: 75,
+        cachedInputTokens: 50,
+        outputTokens: 30,
+        reasoningTokens: 13,
+        totalTokens: 105,
+      },
+      requestCounts: { total: 2, complete: 1, partial: 1, unknown: 0 },
+      completeness: "partial",
+      budget: {
+        tokenLimit: 100,
+        enforcement: "observed_admission_ceiling",
+        admission: "exhausted",
+        singleResponseMayOvershoot: true,
+        hardOutputTokenLimit: "unsupported",
+        monetaryCost: "unavailable",
+      },
+    },
+  };
   const runCli = vi.fn(async (args: string[]) => {
     calls.push(args);
     if (args[0] === "jobs") return { jobIds: [] };
-    if (args[0] === "notifications") return { notifications: [] };
+    if (args[0] === "notifications")
+      return {
+        request: {
+          authorization: {
+            provider: "discord",
+            channelId: "channel-1",
+            senderId: "owner-1",
+            senderIsOwner: true,
+            threadId: "thread-1",
+          },
+        },
+        state: jobState,
+        childTree: childTree(),
+        notifications: [],
+      };
     if (args[0] === "notification-ack") return { acknowledged: true };
     if (args[0] === "resume-preview")
       return {
@@ -61,37 +140,33 @@ async function fixture() {
             hardOutputTokenLimit: "unsupported",
             monetaryCost: "unavailable",
           },
+          multiChild: {
+            experimental: true,
+            topology: {
+              maxLogicalChildren: 5,
+              maxActiveChildren: 3,
+              maxDepth: 1,
+            },
+            repositoryScope: "/fixtures/repo",
+            provider: "openai",
+            models: [{ model: "gpt-5.6-sol", reasoning: ["high"] }],
+            aggregateMaxTokens: 100,
+            rootReservePercent: 30,
+            maxTokensPerAttempt: 70,
+            maxRequestsPerAttempt: 4,
+            aggregateMaxConcurrency: 3,
+            maxConcurrencyPerAttempt: 1,
+            maxWallClockMsPerAttempt: 60_000,
+            retryLimit: 1,
+          },
         },
         input: { fixture: true, agent: { kind: "prime-rpc" } },
       };
     }
     if (args[0] === "start") return { jobId: "job-1", state: {} };
-    return {
-      status: "running",
-      secretToken: "must-not-render",
-      modelTokens: "must-not-render-model-token",
-      inputTokens: 424242,
-      summary: "x".repeat(5000),
-      inference: {
-        observedUsage: {
-          inputTokens: 75,
-          cachedInputTokens: 50,
-          outputTokens: 30,
-          reasoningTokens: 13,
-          totalTokens: 105,
-        },
-        requestCounts: { total: 2, complete: 1, partial: 1, unknown: 0 },
-        completeness: "partial",
-        budget: {
-          tokenLimit: 100,
-          enforcement: "observed_admission_ceiling",
-          admission: "exhausted",
-          singleResponseMayOvershoot: true,
-          hardOutputTokenLimit: "unsupported",
-          monetaryCost: "unavailable",
-        },
-      },
-    };
+    if (args[0] === "tree-status")
+      return { state: jobState, childTree: childTree() };
+    return jobState;
   });
   const adapter = new PrimeDispatchAdapter(
     {
@@ -158,6 +233,13 @@ describe("PrimeDispatchAdapter", () => {
     expect(preview.presentation.blocks[0].text).toContain(
       "Hard output-token limit: unsupported; monetary cost: unavailable",
     );
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Experimental multi-child: enabled",
+    );
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Topology: 5 total / 3 active / depth 1",
+    );
+    expect(preview.presentation.blocks[0].text).toContain("root reserve: 30%");
 
     const restarted = new PrimeDispatchAdapter(adapter.config, {
       runCli: adapter.runCli,
@@ -260,10 +342,10 @@ describe("PrimeDispatchAdapter", () => {
     const { adapter, calls } = await fixture();
     const status = await adapter.status({ jobId: "job-1" }, ownerContext);
     await adapter.steer(
-      { jobId: "job-1", message: "stay bounded" },
+      { jobId: "job-1", message: "stay bounded", childId },
       ownerContext,
     );
-    await adapter.cancel({ jobId: "job-1" }, ownerContext);
+    await adapter.cancel({ jobId: "job-1", childId }, ownerContext);
     await adapter.result({ jobId: "job-1" }, ownerContext);
     expect(
       calls
@@ -271,11 +353,21 @@ describe("PrimeDispatchAdapter", () => {
         .filter((name) =>
           ["status", "steer", "cancel", "result"].includes(name),
         ),
-    ).toEqual(["status", "steer", "cancel", "result"]);
+    ).toEqual(["steer", "cancel", "result"]);
+    expect(calls).toContainEqual(
+      expect.arrayContaining(["steer", "--child-id", childId]),
+    );
+    expect(calls).toContainEqual(
+      expect.arrayContaining(["cancel", "--child-id", childId]),
+    );
     expect(JSON.stringify(status)).not.toContain("must-not-render");
     expect(status.state.inputTokens).toBe("[redacted]");
     expect(status.state.inference.observedUsage.inputTokens).toBe(75);
     expect(status.state.summary.length).toBeLessThanOrEqual(512);
+    expect(status.childTree.children[0].usage).toEqual({
+      totalTokens: 10,
+      tokenLimit: 200,
+    });
     expect(status.presentation.blocks[0].text).toContain(
       "Observed tokens: 105 / 100 (partial)",
     );
@@ -285,7 +377,21 @@ describe("PrimeDispatchAdapter", () => {
     expect(status.presentation.blocks[0].text).toContain(
       "Hard output-token limit: unsupported; monetary cost: unavailable",
     );
-    expect(status.presentation.blocks[1]).toMatchObject({
+    expect(status.presentation.blocks[1].text).toContain(
+      `implementation [${childId}]`,
+    );
+    const renderedText = status.presentation.blocks
+      .filter((block: Record<string, unknown>) => block.type === "text")
+      .map((block: Record<string, unknown>) => String(block.text ?? ""))
+      .join("");
+    expect(renderedText.length).toBeLessThanOrEqual(512);
+    expect(JSON.stringify(status.presentation)).not.toContain(
+      "raw-child-prompt",
+    );
+    expect(JSON.stringify(status.presentation)).not.toContain(
+      "raw-child-credential",
+    );
+    expect(status.presentation.blocks.at(-1)).toMatchObject({
       type: "buttons",
       buttons: [
         {
@@ -298,6 +404,81 @@ describe("PrimeDispatchAdapter", () => {
         },
       ],
     });
+  });
+
+  it("rejects owner controls from a route other than the confirmed job route", async () => {
+    const { adapter, calls } = await fixture();
+    for (const context of [
+      { ...ownerContext, senderId: "other-owner" },
+      { ...ownerContext, to: "other-channel" },
+      { ...ownerContext, threadId: "other-thread" },
+      { ...ownerContext, accountId: "other-account" },
+    ])
+      await expect(
+        adapter.steer({ jobId: "job-1", message: "do not deliver" }, context),
+      ).rejects.toThrow(/owner route/);
+    expect(calls.some((args) => args[0] === "steer")).toBe(false);
+  });
+
+  it("keeps five children and retry lineage useful within the card bound", async () => {
+    const { adapter, runCli } = await fixture();
+    const tree = childTree();
+    const template = tree.children[0];
+    tree.children = Array.from({ length: 5 }, (_, index) => {
+      const child = structuredClone(template);
+      child.envelope.childId = `11111111-1111-4111-8111-${String(index + 1).padStart(12, "0")}`;
+      child.envelope.name =
+        index === 0 ? "implementation" : `child-${index + 1}`;
+      if (index === 0) {
+        child.attempts[0].attemptId = "22222222-2222-4222-8222-222222222221";
+        child.attempts[0].status = "failed";
+        child.attempts.push({
+          ...structuredClone(child.attempts[0]),
+          attemptId: "22222222-2222-4222-8222-222222222222",
+          previousAttemptId: "22222222-2222-4222-8222-222222222221",
+          ordinal: 2,
+          status: "active",
+          proposal: { proposalSha: "a".repeat(40) },
+        });
+      }
+      return child;
+    });
+    runCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === "notifications")
+        return {
+          request: {
+            authorization: {
+              provider: "discord",
+              channelId: "channel-1",
+              senderId: "owner-1",
+              senderIsOwner: true,
+              threadId: "thread-1",
+            },
+          },
+          state: { status: "running" },
+          childTree: tree,
+          notifications: [],
+        };
+      if (args[0] === "tree-status")
+        return { state: { status: "running" }, childTree: tree };
+      throw new Error(`unexpected CLI call: ${args[0]}`);
+    });
+    const expanded = new PrimeDispatchAdapter(
+      { ...adapter.config, maxRenderedChars: 1_800 },
+      { runCli },
+    );
+
+    const status = await expanded.status({ jobId: "job-1" }, ownerContext);
+    const text = status.presentation.blocks
+      .filter((block: Record<string, unknown>) => block.type === "text")
+      .map((block: Record<string, unknown>) => String(block.text ?? ""))
+      .join("");
+
+    expect(text).toContain("Children: 5/5 total");
+    expect(text).toContain("child-5");
+    expect(text).toContain("retry 2←22222222");
+    expect(text).toContain(`proposal ${"a".repeat(12)}`);
+    expect(text.length).toBeLessThanOrEqual(1_800);
   });
 
   it("authorizes interactive refresh from durable job ownership", async () => {
@@ -316,9 +497,11 @@ describe("PrimeDispatchAdapter", () => {
             },
           },
           state: { status: "running" },
+          childTree: childTree(),
           notifications: [],
         };
-      if (args[0] === "status") return { status: "running" };
+      if (args[0] === "tree-status")
+        return { state: { status: "running" }, childTree: childTree() };
       throw new Error(`unexpected CLI call: ${args[0]}`);
     });
 
@@ -347,10 +530,14 @@ describe("PrimeDispatchAdapter", () => {
         accountId: "default",
         threadId: "thread-1",
       },
-      text: "Prime job job-1: running",
+      text: expect.stringContaining("Children: 1/5 total; 1/3 active"),
       presentation: {
         blocks: [
           expect.anything(),
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining(`implementation [${childId}]`),
+          }),
           {
             type: "buttons",
             buttons: [
@@ -371,9 +558,25 @@ describe("PrimeDispatchAdapter", () => {
     "removes refresh after a job is %s",
     async (terminalStatus) => {
       const { adapter, runCli } = await fixture();
-      runCli
-        .mockResolvedValueOnce({ status: terminalStatus })
-        .mockResolvedValueOnce({ notifications: [] });
+      runCli.mockImplementation(async (args: string[]) => {
+        if (args[0] === "notifications")
+          return {
+            request: {
+              authorization: {
+                provider: "discord",
+                channelId: "channel-1",
+                senderId: "owner-1",
+                senderIsOwner: true,
+                threadId: "thread-1",
+              },
+            },
+            state: { status: terminalStatus },
+            notifications: [],
+          };
+        if (args[0] === "tree-status")
+          return { state: { status: terminalStatus } };
+        throw new Error(`unexpected CLI call: ${args[0]}`);
+      });
 
       const status = await adapter.status({ jobId: "job-1" }, ownerContext);
 
@@ -386,11 +589,13 @@ describe("PrimeDispatchAdapter", () => {
 
   it("rediscovers jobs, edits one durable status card, and advances delivery once", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "prime-adapter-catchup-"));
-    let acknowledged = false;
+    let acknowledgedThrough = 0;
+    let latestSequence = 9;
+    let status = "running";
     const runCli = vi.fn(async (args: string[]) => {
       if (args[0] === "jobs") return { jobIds: ["job-1"] };
       if (args[0] === "notification-ack") {
-        acknowledged = true;
+        acknowledgedThrough = Number(args.at(-1));
         return { acknowledged: true };
       }
       if (args[0] === "notifications")
@@ -404,19 +609,21 @@ describe("PrimeDispatchAdapter", () => {
               threadId: "thread-1",
             },
           },
-          state: { status: "succeeded" },
-          notifications: acknowledged
-            ? []
-            : [
-                {
-                  deliveryKey: "job-1:event:9",
-                  event: {
-                    sequence: 9,
-                    type: "state_changed",
-                    data: { to: "succeeded" },
+          state: { status },
+          childTree: childTree(),
+          notifications:
+            acknowledgedThrough >= latestSequence
+              ? []
+              : [
+                  {
+                    deliveryKey: `job-1:event:${latestSequence}`,
+                    event: {
+                      sequence: latestSequence,
+                      type: "state_changed",
+                      data: { to: status },
+                    },
                   },
-                },
-              ],
+                ],
         };
       throw new Error(`unexpected CLI call: ${args[0]}`);
     });
@@ -435,8 +642,15 @@ describe("PrimeDispatchAdapter", () => {
       deliverTerminal: vi.fn(async () => undefined),
     };
     expect(await adapter.catchUpNotifications(delivery)).toBe(1);
-    expect(await adapter.catchUpNotifications(delivery)).toBe(0);
-    expect(delivery.upsertStatusCard).toHaveBeenCalledTimes(1);
+    const restarted = new PrimeDispatchAdapter(adapter.config, { runCli });
+    latestSequence = 10;
+    status = "succeeded";
+    expect(await restarted.catchUpNotifications(delivery)).toBe(1);
+    expect(await restarted.catchUpNotifications(delivery)).toBe(0);
+    expect(delivery.upsertStatusCard).toHaveBeenCalledTimes(2);
+    expect(delivery.upsertStatusCard).toHaveBeenLastCalledWith(
+      expect.objectContaining({ previousMessageId: "message-1" }),
+    );
     expect(delivery.deliverTerminal).toHaveBeenCalledTimes(1);
   });
 });

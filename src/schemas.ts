@@ -394,11 +394,13 @@ export const PrimeStatusInputSchema = z.object({
 export const PrimeSteerInputSchema = z.object({
   operation: z.literal("prime_steer").default("prime_steer"),
   jobId: z.string().min(1),
-  message: z.string().min(1),
+  message: z.string().min(1).max(10_000),
+  childId: z.string().uuid().optional(),
 });
 export const PrimeCancelInputSchema = z.object({
   operation: z.literal("prime_cancel").default("prime_cancel"),
   jobId: z.string().min(1),
+  childId: z.string().uuid().optional(),
 });
 export const PrimeResultInputSchema = z.object({
   operation: z.literal("prime_result").default("prime_result"),

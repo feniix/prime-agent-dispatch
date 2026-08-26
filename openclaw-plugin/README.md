@@ -11,6 +11,21 @@ runtime context. Repository eligibility, fixture classification, gates, Prime
 runtime paths, model, reasoning level, and hard ceilings come from the host
 configuration passed to the standalone CLI.
 
+When the host enables the experimental multi-child policy, the confirmation
+card binds the topology, repository scope, model allowlist, aggregate and
+per-attempt budgets, root reserve, retry limit, and descendant authorization
+into the reviewed request hash. Status cards show at most five children with
+their role, wave, lifecycle state, inference allocation and usage, retry
+lineage, proposed commit, and decision. Cards are edited in place and recover
+their durable message identity after an adapter restart.
+
+`prime_steer` and `prime_cancel` accept an optional `childId`. Child-targeted
+controls are never sent directly to a descendant: the standalone control plane
+validates the child against the confirmed tree and routes the request to the
+root agent, which remains the sole descendant authority. Every read and control
+must come from the original owner sender, provider, channel, account, and
+thread recorded on the job.
+
 ```bash
 corepack pnpm install --frozen-lockfile
 corepack pnpm test
