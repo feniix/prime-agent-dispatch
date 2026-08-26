@@ -240,12 +240,18 @@ describe("Prime Dispatch OpenClaw plugin", () => {
         {
           state: { status: "running", secret: "must-not-render" },
           presentation: {
-            blocks: [{ type: "text", text: "Status: running" }],
+            blocks: [
+              { type: "text", text: "Status: running" },
+              { type: "text", text: "Children: 1/5 total" },
+              { type: "buttons", buttons: [] },
+            ],
           },
         },
         "job-1",
       ),
-    ).toEqual({ text: "Prime job job-1\nStatus: running" });
+    ).toEqual({
+      text: "Prime job job-1\nStatus: running\nChildren: 1/5 total",
+    });
   });
 
   it("registers six optional typed tools and Discord confirmation commands", () => {

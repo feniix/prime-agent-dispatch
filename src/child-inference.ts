@@ -10,8 +10,8 @@ export const CHILD_ROOT_RESERVE_PERCENT = 30 as const;
 
 export const ChildInferenceModelPolicySchema = z
   .object({
-    model: z.string().min(1),
-    reasoning: z.array(z.string().min(1)).min(1),
+    model: z.string().min(1).max(128),
+    reasoning: z.array(z.string().min(1).max(64)).min(1).max(8),
   })
   .strict()
   .superRefine((value, context) => {
@@ -27,8 +27,8 @@ export const ChildInferencePolicySchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
     experimental: z.literal(true),
-    provider: z.string().min(1),
-    models: z.array(ChildInferenceModelPolicySchema).min(1),
+    provider: z.string().min(1).max(64),
+    models: z.array(ChildInferenceModelPolicySchema).min(1).max(8),
     aggregateMaxTokens: z.number().int().positive().max(HOST_MAX_MODEL_TOKENS),
     rootReservePercent: z
       .number()

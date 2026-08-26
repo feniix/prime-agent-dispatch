@@ -318,6 +318,21 @@ export const ChildTreeSnapshotSchema = z
   .strict();
 export type ChildTreeSnapshot = z.infer<typeof ChildTreeSnapshotSchema>;
 
+export function assertChildControlTarget(
+  tree: ChildTreeSnapshot | undefined,
+  childId: string,
+): LogicalChild {
+  const child = tree?.children.find(
+    (candidate) => candidate.envelope.childId === childId,
+  );
+  if (!child) throw new Error("child control target is outside this job");
+  if (child.decision === "discarded")
+    throw new Error("discarded children cannot receive operator control");
+  if (child.status !== "active" && child.status !== "cancelling")
+    throw new Error("only a nonterminal child may receive operator control");
+  return child;
+}
+
 export function canonicalDigest(value: unknown): string {
   const json = canonicalize(value);
   if (json === undefined) throw new Error("value is not canonicalizable JSON");

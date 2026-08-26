@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
+  assertChildControlTarget,
   BoundedRlmHostBridge,
   CONTROL_DATABASE_NAME,
   DEFAULT_CHILD_TREE_POLICY,
@@ -98,6 +99,34 @@ test("single-root jobs remain unchanged until the experimental tree is enabled",
     /not enabled/,
   );
   await store.updateState(request.jobId, "verifying");
+});
+
+test("root-routed controls reject foreign and inactive child targets", async () => {
+  const { store, request } = await fixture();
+  let tree = await store.enableChildTree(request.jobId);
+  const child = await store.admitChild(
+    request.jobId,
+    tree.revision,
+    envelope(request.jobId, "controlled"),
+  );
+  tree = await store.readChildTree(request.jobId);
+  assert.equal(
+    assertChildControlTarget(tree, child.envelope.childId).envelope.childId,
+    child.envelope.childId,
+  );
+  assert.throws(
+    () => assertChildControlTarget(tree, randomUUID()),
+    /outside this job/,
+  );
+  await store.completeChildAttempt(
+    request.jobId,
+    completion(child, "succeeded"),
+  );
+  tree = await store.readChildTree(request.jobId);
+  assert.throws(
+    () => assertChildControlTarget(tree, child.envelope.childId),
+    /only a nonterminal child/,
+  );
 });
 
 test("concurrent admissions cannot exceed three active children", async () => {

@@ -37,6 +37,7 @@ import {
   type ResumePlan,
 } from "./recovery.js";
 import { assertResumePlanEvidence } from "./resume.js";
+import { assertChildControlTarget } from "./children.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -135,16 +136,47 @@ async function serveCommands(): Promise<void> {
             reply(socket, await store.readState(jobId));
           } else if (command.operation === "prime_steer") {
             if (!agent) throw new Error("agent is not running");
+            if (command.childId) await assertRootRoutedChild(command.childId);
             const request = await store.readRequest(jobId);
             if (turnsUsed >= request.budget.maxTurns)
               throw new Error("Prime turn budget exhausted");
             turnsUsed += 1;
-            await agent.steer(command.message);
+            await agent.steer(
+              command.childId
+                ? rootRoutedChildGuidance(command.childId, command.message)
+                : command.message,
+            );
             await store.appendEvent(jobId, "steered", {
               message: command.message,
               turnsUsed,
+              ...(command.childId
+                ? { childId: command.childId, routedTo: "root" }
+                : {}),
             });
-            reply(socket, { accepted: true });
+            reply(socket, {
+              accepted: true,
+              ...(command.childId
+                ? { childId: command.childId, routedTo: "root" }
+                : {}),
+            });
+          } else if (command.childId) {
+            if (!agent) throw new Error("agent is not running");
+            await assertRootRoutedChild(command.childId);
+            const request = await store.readRequest(jobId);
+            if (turnsUsed >= request.budget.maxTurns)
+              throw new Error("Prime turn budget exhausted");
+            turnsUsed += 1;
+            await agent.steer(rootRoutedChildCancellation(command.childId));
+            await store.appendEvent(jobId, "child_cancellation_routed", {
+              childId: command.childId,
+              routedTo: "root",
+              turnsUsed,
+            });
+            reply(socket, {
+              accepted: true,
+              childId: command.childId,
+              routedTo: "root",
+            });
           } else {
             const current = await store.readState(jobId);
             if (terminalStatuses.has(current.status)) {
@@ -178,6 +210,26 @@ async function serveCommands(): Promise<void> {
     socketPath,
     protocolVersion: WORKER_PROTOCOL_VERSION,
   };
+}
+
+async function assertRootRoutedChild(childId: string): Promise<void> {
+  const tree = await store.readChildTree(jobId);
+  assertChildControlTarget(tree, childId);
+}
+
+function rootRoutedChildGuidance(childId: string, message: string): string {
+  return [
+    `Operator guidance targets child ${childId}.`,
+    "Keep communication root-routed: decide whether and how to forward or translate it.",
+    message,
+  ].join("\n");
+}
+
+function rootRoutedChildCancellation(childId: string): string {
+  return [
+    `The operator requests cancellation of child ${childId}.`,
+    "This request is addressed to the root. Decide and perform the bounded child cancellation through the host bridge; do not treat it as direct child transport.",
+  ].join("\n");
 }
 
 function buildTerminalResult(

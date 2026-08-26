@@ -164,6 +164,9 @@ withStateRoot(
         unsafeAllowLiveRepo: Boolean(options.unsafeAllowLiveRepo),
         gates: hostPolicy?.gates ?? callerGates,
         budget: {
+          ...(hostPolicy?.multiChild
+            ? { maxTokens: hostPolicy.multiChild.aggregateMaxTokens }
+            : {}),
           ...(options.wallClockMs
             ? { wallClockMs: Number(options.wallClockMs) }
             : {}),
@@ -179,7 +182,7 @@ withStateRoot(
         },
         agent: hostPolicy?.agent ?? { kind: "fake" },
       });
-      const preview = await dispatcher.preview(input);
+      const preview = await dispatcher.preview(input, hostPolicy?.multiChild);
       if (options.preview) {
         print({ resolvedRequest: preview.summary, input: preview.input });
         return;
@@ -276,7 +279,6 @@ withStateRoot(
 
 for (const [name, description, action] of [
   ["status", "show current job state", "status"],
-  ["cancel", "cancel a nonterminal job", "cancel"],
   ["result", "read a terminal job result", "result"],
 ] as const) {
   withStateRoot(
@@ -293,13 +295,44 @@ for (const [name, description, action] of [
 
 withStateRoot(
   program
+    .command("tree-status")
+    .description("show current job state and bounded child tree")
+    .requiredOption("--job-id <id>")
+    .action(async (options) => {
+      const dispatcher = await createDispatcher(options);
+      print(await dispatcher.treeStatus(options.jobId));
+    }),
+);
+
+withStateRoot(
+  program
+    .command("cancel")
+    .description(
+      "cancel a root job or route one child cancellation to its root",
+    )
+    .requiredOption("--job-id <id>")
+    .option("--child-id <uuid>")
+    .action(async (options) => {
+      const dispatcher = await createDispatcher(options);
+      print(await dispatcher.cancel(options.jobId, options.childId));
+    }),
+);
+
+withStateRoot(
+  program
     .command("steer")
     .description("send guidance during an active Prime turn")
     .requiredOption("--job-id <id>")
     .requiredOption("--message <text>")
+    .option(
+      "--child-id <uuid>",
+      "route guidance through the root for one child",
+    )
     .action(async (options) => {
       const dispatcher = await createDispatcher(options);
-      print(await dispatcher.steer(options.jobId, options.message));
+      print(
+        await dispatcher.steer(options.jobId, options.message, options.childId),
+      );
     }),
 );
 
@@ -326,6 +359,7 @@ withStateRoot(
       print({
         request: await dispatcher.store.readRequest(options.jobId),
         state: await dispatcher.store.readState(options.jobId),
+        childTree: await dispatcher.store.readChildTree(options.jobId),
         notifications: await dispatcher.store.pendingLifecycleNotifications(
           options.jobId,
           options.consumerId,

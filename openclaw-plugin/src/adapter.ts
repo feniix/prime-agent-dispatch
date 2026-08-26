@@ -99,6 +99,12 @@ type ResumeInput =
   | { action: "preview"; jobId: string }
   | { action: "confirm"; jobId: string; confirmationToken: string };
 
+type AuthorizedJobSnapshot = {
+  state: Record<string, any>;
+  childTree?: Record<string, any>;
+  notifications: unknown[];
+};
+
 export class PrimeDispatchAdapter {
   readonly config: PrimeDispatchPluginConfig;
   readonly runCli: CliRunner;
@@ -158,7 +164,11 @@ export class PrimeDispatchAdapter {
       confirmationToken,
       expiresAt: new Date(now + this.config.confirmationTtlMs).toISOString(),
       resolvedRequest: boundedPreview,
-      presentation: confirmationPresentation(boundedPreview, confirmationToken),
+      presentation: confirmationPresentation(
+        boundedPreview,
+        confirmationToken,
+        this.config.maxRenderedChars,
+      ),
     };
   }
 
@@ -166,26 +176,25 @@ export class PrimeDispatchAdapter {
     input: { jobId: string },
     context: TrustedToolContext,
   ): Promise<any> {
-    const response = await this.readOperation(
-      "status",
-      ["--job-id", input.jobId],
-      context,
-    );
+    this.assertOwner(context);
     const consumerId = `openclaw:${confirmationContextHash(context)}`;
-    const pending = asRecord(
+    const pending = await this.readAuthorizedJobSnapshot(
+      input.jobId,
+      context,
+      consumerId,
+    );
+    const current = asRecord(
       await this.runCli([
-        "notifications",
+        "tree-status",
         "--state-root",
         this.config.stateRoot,
         "--job-id",
         input.jobId,
-        "--consumer-id",
-        consumerId,
       ]),
     );
-    const notifications = Array.isArray(pending.notifications)
-      ? pending.notifications
-      : [];
+    const state = asRecord(current.state);
+    const childTree = asRecordOrUndefined(current.childTree);
+    const notifications = pending.notifications;
     const finalEvent = asRecordOrUndefined(notifications.at(-1))?.event;
     const finalSequence = asRecordOrUndefined(finalEvent)?.sequence;
     if (typeof finalSequence === "number")
@@ -201,8 +210,8 @@ export class PrimeDispatchAdapter {
         String(finalSequence),
       ]);
     return {
-      ...response,
-      notifications: sanitize(notifications, this.config.maxRenderedChars),
+      ...this.statusResponse(input.jobId, state, childTree),
+      notifications: boundedNotificationSummaries(notifications),
     };
   }
 
@@ -255,7 +264,13 @@ export class PrimeDispatchAdapter {
       jobId: input.jobId,
       attemptId: launched.attemptId,
       state: sanitize(launched.state, this.config.maxRenderedChars),
-      presentation: statusPresentation(input.jobId, "queued"),
+      presentation: statusPresentation(
+        input.jobId,
+        "queued",
+        undefined,
+        undefined,
+        this.config.maxRenderedChars,
+      ),
     };
   }
 
@@ -286,51 +301,63 @@ export class PrimeDispatchAdapter {
     const route = statusCardRoute(authorization);
     if (route.channel !== "discord")
       throw new Error("Prime Dispatch beta is Discord-only");
-    const response = await this.readOperation(
-      "status",
-      ["--job-id", input.jobId],
-      {
-        senderId: actor.senderId,
-        senderIsOwner: true,
-        channel: "discord",
-        to: route.to,
-        ...(route.accountId ? { accountId: route.accountId } : {}),
-        ...(route.threadId ? { threadId: route.threadId } : {}),
-      },
+    const current = asRecord(
+      await this.runCli([
+        "tree-status",
+        "--state-root",
+        this.config.stateRoot,
+        "--job-id",
+        input.jobId,
+      ]),
     );
-    const state = asRecord(response.state);
+    const state = asRecord(current.state);
+    const childTree = asRecordOrUndefined(current.childTree);
+    const boundedTree = boundedChildTree(childTree);
     const status = stringField(state, "status");
+    const response = this.statusResponse(input.jobId, state, childTree);
     return {
       jobId: input.jobId,
       route,
-      text: statusSummary(input.jobId, status, state.inference).slice(
-        0,
-        this.config.maxRenderedChars,
-      ),
+      text: statusSummary(
+        input.jobId,
+        status,
+        state.inference,
+        boundedTree,
+      ).slice(0, this.config.maxRenderedChars),
       presentation: response.presentation as Presentation,
     };
   }
 
   async steer(
-    input: { jobId: string; message: string },
+    input: { jobId: string; message: string; childId?: string },
     context: TrustedToolContext,
   ): Promise<any> {
-    this.assertOwner(context);
     return await this.readOperation(
       "steer",
-      ["--job-id", input.jobId, "--message", input.message],
+      input.jobId,
+      [
+        "--job-id",
+        input.jobId,
+        "--message",
+        input.message,
+        ...(input.childId ? ["--child-id", input.childId] : []),
+      ],
       context,
     );
   }
 
   async cancel(
-    input: { jobId: string },
+    input: { jobId: string; childId?: string },
     context: TrustedToolContext,
   ): Promise<any> {
-    this.assertOwner(context);
     return await this.readOperation(
       "cancel",
-      ["--job-id", input.jobId],
+      input.jobId,
+      [
+        "--job-id",
+        input.jobId,
+        ...(input.childId ? ["--child-id", input.childId] : []),
+      ],
       context,
     );
   }
@@ -341,6 +368,7 @@ export class PrimeDispatchAdapter {
   ): Promise<any> {
     return await this.readOperation(
       "result",
+      input.jobId,
       ["--job-id", input.jobId],
       context,
     );
@@ -378,8 +406,16 @@ export class PrimeDispatchAdapter {
       if (authorization.senderIsOwner !== true) continue;
       const route = statusCardRoute(authorization);
       const state = asRecord(pending.state);
+      const childTree = asRecordOrUndefined(pending.childTree);
+      const boundedTree = boundedChildTree(childTree);
       const status = stringField(state, "status");
-      const presentation = statusPresentation(jobId, status, state.inference);
+      const presentation = statusPresentation(
+        jobId,
+        status,
+        state.inference,
+        boundedTree,
+        this.config.maxRenderedChars,
+      );
       const last = asRecord(notifications.at(-1));
       const event = asRecord(last.event);
       const sequence = event.sequence;
@@ -387,10 +423,12 @@ export class PrimeDispatchAdapter {
         throw new Error("notification omitted sequence");
       const deliveryKey = stringField(last, "deliveryKey");
       const previousMessageId = await this.readStatusCard(jobId);
-      const text = statusSummary(jobId, status, state.inference).slice(
-        0,
-        this.config.maxRenderedChars,
-      );
+      const text = statusSummary(
+        jobId,
+        status,
+        state.inference,
+        boundedTree,
+      ).slice(0, this.config.maxRenderedChars);
       const messageId = await delivery.upsertStatusCard({
         jobId,
         route,
@@ -444,16 +482,28 @@ export class PrimeDispatchAdapter {
       phase: "launched",
       jobId,
       state: sanitize(launched.state, this.config.maxRenderedChars),
-      presentation: statusPresentation(jobId, "queued"),
+      presentation: statusPresentation(
+        jobId,
+        "queued",
+        undefined,
+        undefined,
+        this.config.maxRenderedChars,
+      ),
     };
   }
 
   private async readOperation(
-    operation: "status" | "steer" | "cancel" | "result",
+    operation: "steer" | "cancel" | "result",
+    jobId: string,
     args: string[],
     context: TrustedToolContext,
   ): Promise<any> {
     this.assertOwner(context);
+    const snapshot = await this.readAuthorizedJobSnapshot(
+      jobId,
+      context,
+      `openclaw:authorization:${confirmationContextHash(context)}`,
+    );
     const raw = await this.runCli([
       operation,
       "--state-root",
@@ -464,15 +514,81 @@ export class PrimeDispatchAdapter {
       string,
       any
     >;
-    const jobId = args[1] ?? "unknown";
+    const status = String(snapshot.state.status ?? operation);
     return {
       operation: `prime_${operation}`,
       state,
       presentation: statusPresentation(
         jobId,
-        String(state.status ?? operation),
-        state.inference,
+        status,
+        snapshot.state.inference,
+        boundedChildTree(snapshot.childTree),
+        this.config.maxRenderedChars,
       ),
+    };
+  }
+
+  private statusResponse(
+    jobId: string,
+    stateValue: Record<string, any>,
+    childTree?: Record<string, any>,
+  ): Record<string, unknown> {
+    const state = sanitize(stateValue, this.config.maxRenderedChars) as Record<
+      string,
+      any
+    >;
+    const boundedTree = boundedChildTree(childTree);
+    const status = stringField(state, "status");
+    return {
+      operation: "prime_status",
+      state,
+      ...(boundedTree ? { childTree: boundedTree } : {}),
+      presentation: statusPresentation(
+        jobId,
+        status,
+        state.inference,
+        boundedTree,
+        this.config.maxRenderedChars,
+      ),
+    };
+  }
+
+  private async readAuthorizedJobSnapshot(
+    jobId: string,
+    context: TrustedToolContext,
+    consumerId: string,
+  ): Promise<AuthorizedJobSnapshot> {
+    const pending = asRecord(
+      await this.runCli([
+        "notifications",
+        "--state-root",
+        this.config.stateRoot,
+        "--job-id",
+        jobId,
+        "--consumer-id",
+        consumerId,
+      ]),
+    );
+    const request = asRecord(pending.request);
+    const authorization = asRecord(request.authorization);
+    const expected = statusCardRoute(authorization);
+    if (
+      authorization.senderIsOwner !== true ||
+      stringField(authorization, "senderId") !== context.senderId ||
+      expected.channel !== context.channel ||
+      expected.to !== context.to ||
+      (expected.accountId ?? undefined) !== (context.accountId ?? undefined) ||
+      (expected.threadId ?? undefined) !== (context.threadId ?? undefined)
+    )
+      throw new Error("job authorization does not match the owner route");
+    return {
+      state: asRecord(pending.state),
+      ...(asRecordOrUndefined(pending.childTree)
+        ? { childTree: asRecord(pending.childTree) }
+        : {}),
+      notifications: Array.isArray(pending.notifications)
+        ? pending.notifications
+        : [],
     };
   }
 
@@ -676,6 +792,8 @@ function stringField(record: Record<string, any>, key: string): string {
 
 const SAFE_NUMERIC_USAGE_PATHS = new Set([
   "budgets.maxTokens",
+  "multiChild.aggregateMaxTokens",
+  "multiChild.maxTokensPerAttempt",
   "inference.observedUsage.inputTokens",
   "inference.observedUsage.cachedInputTokens",
   "inference.observedUsage.outputTokens",
@@ -726,9 +844,109 @@ function sanitize(
   return value;
 }
 
+function boundedChildTree(value: unknown): Record<string, unknown> | undefined {
+  const tree = asRecordOrUndefined(value);
+  if (!tree || !Array.isArray(tree.children)) return undefined;
+  const policy = asRecordOrUndefined(tree.policy);
+  return {
+    revision: boundedInteger(tree.revision, 0),
+    policy: {
+      maxChildren: boundedInteger(policy?.maxChildren, 5),
+      maxActiveChildren: boundedInteger(policy?.maxActiveChildren, 3),
+      maxDepth: boundedInteger(policy?.maxDepth, 1),
+    },
+    children: tree.children.slice(0, 5).flatMap((value) => {
+      const child = asRecordOrUndefined(value);
+      const envelope = asRecordOrUndefined(child?.envelope);
+      if (!child || !envelope) return [];
+      const attempts = Array.isArray(child.attempts)
+        ? child.attempts.slice(-2)
+        : [];
+      const attempt = asRecordOrUndefined(attempts.at(-1));
+      const inference =
+        asRecordOrUndefined(attempt?.inference) ??
+        asRecordOrUndefined(envelope.inference);
+      const allocation = asRecordOrUndefined(attempt?.inferenceAllocation);
+      const usage = asRecordOrUndefined(attempt?.inferenceUsage);
+      const observed = asRecordOrUndefined(usage?.observedUsage);
+      const proposal = asRecordOrUndefined(attempt?.proposal);
+      const totalTokens = boundedNumber(observed?.totalTokens);
+      const tokenLimit = boundedNumber(allocation?.tokenLimit);
+      return [
+        {
+          id: boundedStatusText(envelope.childId, 36),
+          name: boundedStatusText(envelope.name, 32),
+          role: boundedStatusText(envelope.role, 32),
+          criticality: boundedStatusText(envelope.criticality, 10),
+          wave: boundedInteger(envelope.wave, 0),
+          state: boundedStatusText(child.status, 12),
+          model: {
+            provider: boundedStatusText(inference?.provider, 16),
+            name: boundedStatusText(inference?.model, 32),
+            reasoning: boundedStatusText(inference?.reasoning, 16),
+          },
+          ...(totalTokens !== undefined || tokenLimit !== undefined
+            ? {
+                usage: {
+                  ...(totalTokens !== undefined ? { totalTokens } : {}),
+                  ...(tokenLimit !== undefined ? { tokenLimit } : {}),
+                  ...(typeof usage?.completeness === "string"
+                    ? {
+                        completeness: boundedStatusText(usage.completeness, 12),
+                      }
+                    : {}),
+                },
+              }
+            : {}),
+          retry: {
+            attempt: boundedInteger(attempt?.ordinal, attempts.length || 1),
+            ...(typeof attempt?.previousAttemptId === "string"
+              ? { previousAttemptId: attempt.previousAttemptId.slice(0, 36) }
+              : {}),
+          },
+          ...(typeof proposal?.proposalSha === "string"
+            ? { proposedCommit: proposal.proposalSha.slice(0, 64) }
+            : {}),
+          decision: boundedStatusText(child.decision, 12),
+        },
+      ];
+    }),
+  };
+}
+
+function boundedNotificationSummaries(
+  value: unknown,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 50).flatMap((item) => {
+    const notification = asRecordOrUndefined(item);
+    const event = asRecordOrUndefined(notification?.event);
+    const sequence = boundedNumber(event?.sequence);
+    if (!notification || !event || sequence === undefined) return [];
+    return [
+      {
+        sequence,
+        type: boundedStatusText(event.type, 64),
+        ...(typeof notification.deliveryKey === "string"
+          ? {
+              deliveryKey: boundedStatusText(notification.deliveryKey, 128),
+            }
+          : {}),
+      },
+    ];
+  });
+}
+
+function boundedNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
 function confirmationPresentation(
   preview: unknown,
   token: string,
+  maxChars: number,
 ): Presentation {
   const record = asRecord(preview);
   const budgets = asRecordOrUndefined(record.budgets);
@@ -750,33 +968,67 @@ function confirmationPresentation(
             : []),
         ]
       : [];
-  return {
-    title: "Prime Dispatch confirmation",
-    tone: "warning",
-    blocks: [
-      {
-        type: "text",
-        text: [
-          String(record.task ?? "Prime job"),
-          `Repository: ${String(record.canonicalRepoPath ?? "unknown")}`,
-          `Base: ${String(record.baseSha ?? "unknown")}`,
-          "Model: gpt-5.6-sol (high)",
-          ...budgetLines,
-          "Unsafe local fixture execution",
-        ].join("\n"),
-      },
-      {
-        type: "buttons",
-        buttons: [
-          {
-            label: "Confirm Prime job",
-            action: { type: "command", command: `/prime-confirm ${token}` },
-            style: "danger",
-          },
-        ],
-      },
-    ],
-  };
+  const multiChild = asRecordOrUndefined(record.multiChild);
+  const topology = asRecordOrUndefined(multiChild?.topology);
+  const models = Array.isArray(multiChild?.models)
+    ? multiChild.models.slice(0, 8).flatMap((value) => {
+        const model = asRecordOrUndefined(value);
+        if (!model || typeof model.model !== "string") return [];
+        const reasoning = Array.isArray(model.reasoning)
+          ? model.reasoning
+              .slice(0, 8)
+              .map((entry) => boundedStatusText(entry, 24))
+              .join(", ")
+          : "unknown";
+        return [`${boundedStatusText(model.model, 64)} (${reasoning})`];
+      })
+    : [];
+  const multiChildLines =
+    multiChild?.experimental === true
+      ? [
+          "Experimental multi-child: enabled",
+          `Topology: ${String(topology?.maxLogicalChildren ?? "?")} total / ${String(topology?.maxActiveChildren ?? "?")} active / depth ${String(topology?.maxDepth ?? "?")}`,
+          `Child models: ${boundedStatusText(multiChild.provider, 32)} · ${models.join("; ") || "none"}`,
+          `Aggregate tokens: ${String(multiChild.aggregateMaxTokens ?? "?")}; root reserve: ${String(multiChild.rootReservePercent ?? "?")}%`,
+          `Per attempt: ${String(multiChild.maxTokensPerAttempt ?? "?")} tokens / ${String(multiChild.maxRequestsPerAttempt ?? "?")} requests / ${String(multiChild.maxConcurrencyPerAttempt ?? "?")} concurrent / ${String(multiChild.maxWallClockMsPerAttempt ?? "?")} ms`,
+          `Retry limit: ${String(multiChild.retryLimit ?? "?")}; repository scope: ${boundedStatusText(multiChild.repositoryScope, 256)}`,
+          "Descendants remain root-directed and inside this confirmation envelope",
+        ]
+      : ["Experimental multi-child: disabled"];
+  return boundPresentationText(
+    {
+      title: "Prime Dispatch confirmation",
+      tone: "warning",
+      blocks: [
+        {
+          type: "text",
+          text: [
+            ...multiChildLines,
+            `Task: ${boundedStatusText(record.task ?? "Prime job", 240)}`,
+            `Repository: ${boundedStatusText(record.repository, 256)}`,
+            `Base: ${boundedStatusText(record.baseSha, 64)}`,
+            `Model: ${boundedStatusText(record.model, 64)} (${boundedStatusText(record.reasoningEffort, 24)})`,
+            ...budgetLines,
+            boundedStatusText(
+              record.executionWarning ?? "Unsafe local fixture execution",
+              256,
+            ),
+          ].join("\n"),
+        },
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Confirm Prime job",
+              action: { type: "command", command: `/prime-confirm ${token}` },
+              style: "danger",
+            },
+          ],
+        },
+      ],
+    },
+    maxChars,
+  );
 }
 
 function resumeConfirmationPresentation(
@@ -870,10 +1122,79 @@ function inferenceStatusLines(value: unknown): string[] {
   return lines;
 }
 
+function childTreeStatusLines(value: unknown): string[] {
+  const tree = asRecordOrUndefined(value);
+  if (!tree || !Array.isArray(tree.children)) return [];
+  const policy = asRecordOrUndefined(tree.policy);
+  const children = tree.children.slice(0, 5);
+  const active = children.filter((value) => {
+    const child = asRecordOrUndefined(value);
+    return child?.state === "active" || child?.state === "cancelling";
+  }).length;
+  const lines = [
+    `Children: ${children.length}/${boundedInteger(policy?.maxChildren, 5)} total; ${active}/${boundedInteger(policy?.maxActiveChildren, 3)} active; tree revision ${boundedInteger(tree.revision, 0)}`,
+  ];
+  for (const value of children) {
+    const child = asRecordOrUndefined(value);
+    if (!child) continue;
+    const model = asRecordOrUndefined(child.model);
+    const usage = asRecordOrUndefined(child.usage);
+    const retry = asRecordOrUndefined(child.retry);
+    const previousAttemptId =
+      typeof retry?.previousAttemptId === "string"
+        ? retry.previousAttemptId.slice(0, 8)
+        : undefined;
+    const totalTokens = boundedNumber(usage?.totalTokens);
+    const tokenLimit = boundedNumber(usage?.tokenLimit);
+    const completeness =
+      typeof usage?.completeness === "string"
+        ? ` (${boundedStatusText(usage.completeness, 12)})`
+        : "";
+    const usageText =
+      totalTokens !== undefined || tokenLimit !== undefined
+        ? `usage ${totalTokens ?? "unknown"}/${tokenLimit ?? "unknown"}${completeness}`
+        : undefined;
+    const details = [
+      `${boundedStatusText(child.role, 32)}/${boundedStatusText(child.criticality, 10)}`,
+      `wave ${boundedInteger(child.wave, 0)}`,
+      boundedStatusText(child.state, 12),
+      `${boundedStatusText(model?.provider, 16)}/${boundedStatusText(model?.name, 32)} (${boundedStatusText(model?.reasoning, 16)})`,
+      usageText,
+      previousAttemptId
+        ? `retry ${boundedInteger(retry?.attempt, 2)}←${previousAttemptId}`
+        : `attempt ${boundedInteger(retry?.attempt, 1)}`,
+      typeof child.proposedCommit === "string"
+        ? `proposal ${child.proposedCommit.slice(0, 12)}`
+        : undefined,
+      child.decision !== "pending"
+        ? `decision ${boundedStatusText(child.decision, 12)}`
+        : undefined,
+    ].filter((detail): detail is string => Boolean(detail));
+    lines.push(
+      `- ${boundedStatusText(child.name, 32)} [${boundedStatusText(child.id, 36)}] · ${details.join(" · ")}`,
+    );
+  }
+  return lines;
+}
+
+function boundedInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : fallback;
+}
+
+function boundedStatusText(value: unknown, maximum: number): string {
+  return String(value ?? "unknown")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, maximum);
+}
+
 function statusPresentation(
   jobId: string,
   status: string,
   inference?: unknown,
+  childTree?: unknown,
+  maxChars = 1_800,
 ): Presentation {
   const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(
     status,
@@ -886,6 +1207,9 @@ function statusPresentation(
       ),
     },
   ];
+  const childLines = childTreeStatusLines(childTree);
+  if (childLines.length > 0)
+    blocks.push({ type: "text", text: childLines.join("\n") });
   if (!terminal) {
     blocks.push({
       type: "buttons",
@@ -902,10 +1226,29 @@ function statusPresentation(
       ],
     });
   }
+  return boundPresentationText(
+    {
+      title: `Prime job ${jobId}`,
+      tone: status === "succeeded" ? "success" : terminal ? "danger" : "info",
+      blocks,
+    },
+    maxChars,
+  );
+}
+
+function boundPresentationText(
+  presentation: Presentation,
+  maximum: number,
+): Presentation {
+  let remaining = Math.max(0, maximum);
   return {
-    title: `Prime job ${jobId}`,
-    tone: status === "succeeded" ? "success" : terminal ? "danger" : "info",
-    blocks,
+    ...presentation,
+    blocks: presentation.blocks.map((block) => {
+      if (block.type !== "text" || typeof block.text !== "string") return block;
+      const text = block.text.slice(0, remaining);
+      remaining -= text.length;
+      return { ...block, text };
+    }),
   };
 }
 
@@ -926,9 +1269,12 @@ function statusSummary(
   jobId: string,
   status: string,
   inference?: unknown,
+  childTree?: unknown,
 ): string {
+  const childLine = childTreeStatusLines(childTree)[0];
   return [
     `Prime job ${jobId}: ${status}`,
     ...inferenceStatusLines(inference).slice(0, 1),
+    ...(childLine ? [childLine] : []),
   ].join(" · ");
 }

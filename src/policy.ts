@@ -2,6 +2,12 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import canonicalize from "canonicalize";
+import {
+  CHILD_TREE_MAX_ACTIVE,
+  CHILD_TREE_MAX_CHILDREN,
+  CHILD_TREE_MAX_DEPTH,
+} from "./children.js";
+import type { ChildInferencePolicy } from "./child-inference.js";
 
 export const PRIME_MODEL = "gpt-5.6-sol" as const;
 export const PRIME_REASONING_EFFORT = "high" as const;
@@ -102,10 +108,34 @@ type ConfirmationInput = {
   baseSha: string;
   gates: unknown;
   budget: unknown;
+  multiChild?: ChildInferencePolicy;
   immutableRequest?: unknown;
 };
 
 export function buildConfirmationSummary(input: ConfirmationInput) {
+  const multiChild = input.multiChild
+    ? {
+        experimental: true as const,
+        topology: {
+          maxLogicalChildren: CHILD_TREE_MAX_CHILDREN,
+          maxActiveChildren: CHILD_TREE_MAX_ACTIVE,
+          maxDepth: CHILD_TREE_MAX_DEPTH,
+        },
+        repositoryScope: input.canonicalRepoPath,
+        provider: input.multiChild.provider,
+        models: input.multiChild.models,
+        aggregateMaxTokens: input.multiChild.aggregateMaxTokens,
+        rootReservePercent: input.multiChild.rootReservePercent,
+        maxTokensPerAttempt: input.multiChild.maxTokensPerAttempt,
+        maxRequestsPerAttempt: input.multiChild.maxRequestsPerAttempt,
+        aggregateMaxConcurrency: input.multiChild.aggregateMaxConcurrency,
+        maxConcurrencyPerAttempt: input.multiChild.maxConcurrencyPerAttempt,
+        maxWallClockMsPerAttempt: input.multiChild.maxWallClockMsPerAttempt,
+        retryLimit: 1 as const,
+        descendantAuthorization:
+          "root-directed descendants must remain inside this confirmed envelope" as const,
+      }
+    : { experimental: false as const };
   const payload = {
     repository: input.canonicalRepoPath,
     baseSha: input.baseSha,
@@ -120,6 +150,7 @@ export function buildConfirmationSummary(input: ConfirmationInput) {
       monetaryCost: "unavailable" as const,
     },
     gates: input.gates,
+    multiChild,
     executionWarning:
       "unsafe-local: current-user execution is not sandboxed and has normal host networking",
   };
