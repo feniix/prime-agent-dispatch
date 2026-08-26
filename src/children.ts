@@ -321,7 +321,6 @@ export type ChildTreeSnapshot = z.infer<typeof ChildTreeSnapshotSchema>;
 export function assertChildControlTarget(
   tree: ChildTreeSnapshot | undefined,
   childId: string,
-  requireActive = false,
 ): LogicalChild {
   const child = tree?.children.find(
     (candidate) => candidate.envelope.childId === childId,
@@ -329,12 +328,8 @@ export function assertChildControlTarget(
   if (!child) throw new Error("child control target is outside this job");
   if (child.decision === "discarded")
     throw new Error("discarded children cannot receive operator control");
-  if (
-    requireActive &&
-    child.status !== "active" &&
-    child.status !== "cancelling"
-  )
-    throw new Error("only an active child may receive cancellation");
+  if (child.status !== "active" && child.status !== "cancelling")
+    throw new Error("only a nonterminal child may receive operator control");
   return child;
 }
 

@@ -713,19 +713,22 @@ export function statusCommandResult(value: any, jobId: string) {
   const status =
     typeof value?.state?.status === "string" ? value.state.status : "unknown";
   const detail = Array.isArray(value?.presentation?.blocks)
-    ? value.presentation.blocks.find(
-        (block: unknown) =>
+    ? value.presentation.blocks
+        .flatMap((block: unknown) =>
           typeof block === "object" &&
           block !== null &&
           (block as { type?: unknown }).type === "text" &&
-          typeof (block as { text?: unknown }).text === "string",
-      )?.text
-    : undefined;
+          typeof (block as { text?: unknown }).text === "string"
+            ? [(block as { text: string }).text.trim()]
+            : [],
+        )
+        .filter(Boolean)
+        .join("\n")
+    : "";
   return {
-    text:
-      typeof detail === "string" && detail.trim()
-        ? `Prime job ${jobId}\n${detail}`
-        : `Prime job ${jobId}: ${status}`,
+    text: detail
+      ? `Prime job ${jobId}\n${detail}`
+      : `Prime job ${jobId}: ${status}`,
   };
 }
 

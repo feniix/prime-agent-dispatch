@@ -501,7 +501,7 @@ export class PrimeDispatcher {
 
   async cancel(jobId: string, childId?: string): Promise<unknown> {
     const state = (await this.status(jobId)) as JobState;
-    if (childId) await this.assertChildControlTarget(jobId, childId, true);
+    if (childId) await this.assertChildControlTarget(jobId, childId);
     const identity = workerIdentityFromState(state);
     if (!identity) throw new Error("verified job worker is not available");
     if (childId)
@@ -526,10 +526,9 @@ export class PrimeDispatcher {
   private async assertChildControlTarget(
     jobId: string,
     childId: string,
-    requireActive = false,
   ): Promise<void> {
     const tree = await this.store.readChildTree(jobId);
-    assertChildControlTarget(tree, childId, requireActive);
+    assertChildControlTarget(tree, childId);
   }
 
   private async interruptUnverifiedWorker(

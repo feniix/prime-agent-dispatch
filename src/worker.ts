@@ -136,8 +136,7 @@ async function serveCommands(): Promise<void> {
             reply(socket, await store.readState(jobId));
           } else if (command.operation === "prime_steer") {
             if (!agent) throw new Error("agent is not running");
-            if (command.childId)
-              await assertRootRoutedChild(command.childId, false);
+            if (command.childId) await assertRootRoutedChild(command.childId);
             const request = await store.readRequest(jobId);
             if (turnsUsed >= request.budget.maxTurns)
               throw new Error("Prime turn budget exhausted");
@@ -162,7 +161,7 @@ async function serveCommands(): Promise<void> {
             });
           } else if (command.childId) {
             if (!agent) throw new Error("agent is not running");
-            await assertRootRoutedChild(command.childId, true);
+            await assertRootRoutedChild(command.childId);
             const request = await store.readRequest(jobId);
             if (turnsUsed >= request.budget.maxTurns)
               throw new Error("Prime turn budget exhausted");
@@ -213,12 +212,9 @@ async function serveCommands(): Promise<void> {
   };
 }
 
-async function assertRootRoutedChild(
-  childId: string,
-  requireActive: boolean,
-): Promise<void> {
+async function assertRootRoutedChild(childId: string): Promise<void> {
   const tree = await store.readChildTree(jobId);
-  assertChildControlTarget(tree, childId, requireActive);
+  assertChildControlTarget(tree, childId);
 }
 
 function rootRoutedChildGuidance(childId: string, message: string): string {

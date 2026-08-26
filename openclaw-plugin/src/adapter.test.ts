@@ -101,7 +101,19 @@ async function fixture() {
         },
         state: jobState,
         childTree: childTree(),
-        notifications: [],
+        notifications: [
+          {
+            deliveryKey: "job-1:event:3",
+            event: {
+              sequence: 3,
+              type: "steered",
+              data: {
+                message: "raw-guidance-must-not-render",
+                error: "raw-event-error-must-not-render",
+              },
+            },
+          },
+        ],
       };
     if (args[0] === "notification-ack") return { acknowledged: true };
     if (args[0] === "resume-preview")
@@ -125,11 +137,11 @@ async function fixture() {
       return {
         resolvedRequest: {
           requestHash: "a".repeat(64),
-          canonicalRepoPath: "/fixtures/repo",
+          repository: "/fixtures/repo",
           baseSha: "b".repeat(40),
-          task: "bounded task",
+          task: `bounded task\n${"forged policy ".repeat(30)}`,
           model: "gpt-5.6-sol",
-          reasoningLevel: "high",
+          reasoningEffort: "high",
           fixture: true,
           unsafeLocal: true,
           gates: [{ name: "test", command: "/usr/bin/true", args: [] }],
@@ -140,6 +152,7 @@ async function fixture() {
             hardOutputTokenLimit: "unsupported",
             monetaryCost: "unavailable",
           },
+          executionWarning: "unsafe-local fixture execution",
           multiChild: {
             experimental: true,
             topology: {
@@ -174,7 +187,7 @@ async function fixture() {
       stateRoot,
       hostConfigPath: "/trusted/host.json",
       confirmationTtlMs: 60_000,
-      maxRenderedChars: 512,
+      maxRenderedChars: 1_800,
     },
     { runCli },
   );
@@ -240,6 +253,21 @@ describe("PrimeDispatchAdapter", () => {
       "Topology: 5 total / 3 active / depth 1",
     );
     expect(preview.presentation.blocks[0].text).toContain("root reserve: 30%");
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Aggregate tokens: 100",
+    );
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Per attempt: 70 tokens",
+    );
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Repository: /fixtures/repo",
+    );
+    expect(preview.presentation.blocks[0].text).toContain(
+      "Task: bounded task forged policy",
+    );
+    expect(preview.presentation.blocks[0].text).not.toContain(
+      "\nforged policy",
+    );
 
     const restarted = new PrimeDispatchAdapter(adapter.config, {
       runCli: adapter.runCli,
@@ -361,9 +389,16 @@ describe("PrimeDispatchAdapter", () => {
       expect.arrayContaining(["cancel", "--child-id", childId]),
     );
     expect(JSON.stringify(status)).not.toContain("must-not-render");
+    expect(status.notifications).toEqual([
+      {
+        sequence: 3,
+        type: "steered",
+        deliveryKey: "job-1:event:3",
+      },
+    ]);
     expect(status.state.inputTokens).toBe("[redacted]");
     expect(status.state.inference.observedUsage.inputTokens).toBe(75);
-    expect(status.state.summary.length).toBeLessThanOrEqual(512);
+    expect(status.state.summary.length).toBeLessThanOrEqual(1_800);
     expect(status.childTree.children[0].usage).toEqual({
       totalTokens: 10,
       tokenLimit: 200,
@@ -384,7 +419,7 @@ describe("PrimeDispatchAdapter", () => {
       .filter((block: Record<string, unknown>) => block.type === "text")
       .map((block: Record<string, unknown>) => String(block.text ?? ""))
       .join("");
-    expect(renderedText.length).toBeLessThanOrEqual(512);
+    expect(renderedText.length).toBeLessThanOrEqual(1_800);
     expect(JSON.stringify(status.presentation)).not.toContain(
       "raw-child-prompt",
     );

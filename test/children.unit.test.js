@@ -124,8 +124,8 @@ test("root-routed controls reject foreign and inactive child targets", async () 
   );
   tree = await store.readChildTree(request.jobId);
   assert.throws(
-    () => assertChildControlTarget(tree, child.envelope.childId, true),
-    /only an active child/,
+    () => assertChildControlTarget(tree, child.envelope.childId),
+    /only a nonterminal child/,
   );
 });
 

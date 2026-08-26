@@ -211,7 +211,7 @@ export class PrimeDispatchAdapter {
       ]);
     return {
       ...this.statusResponse(input.jobId, state, childTree),
-      notifications: sanitize(notifications, this.config.maxRenderedChars),
+      notifications: boundedNotificationSummaries(notifications),
     };
   }
 
@@ -792,6 +792,8 @@ function stringField(record: Record<string, any>, key: string): string {
 
 const SAFE_NUMERIC_USAGE_PATHS = new Set([
   "budgets.maxTokens",
+  "multiChild.aggregateMaxTokens",
+  "multiChild.maxTokensPerAttempt",
   "inference.observedUsage.inputTokens",
   "inference.observedUsage.cachedInputTokens",
   "inference.observedUsage.outputTokens",
@@ -912,6 +914,29 @@ function boundedChildTree(value: unknown): Record<string, unknown> | undefined {
   };
 }
 
+function boundedNotificationSummaries(
+  value: unknown,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 50).flatMap((item) => {
+    const notification = asRecordOrUndefined(item);
+    const event = asRecordOrUndefined(notification?.event);
+    const sequence = boundedNumber(event?.sequence);
+    if (!notification || !event || sequence === undefined) return [];
+    return [
+      {
+        sequence,
+        type: boundedStatusText(event.type, 64),
+        ...(typeof notification.deliveryKey === "string"
+          ? {
+              deliveryKey: boundedStatusText(notification.deliveryKey, 128),
+            }
+          : {}),
+      },
+    ];
+  });
+}
+
 function boundedNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
@@ -948,11 +973,14 @@ function confirmationPresentation(
   const models = Array.isArray(multiChild?.models)
     ? multiChild.models.slice(0, 8).flatMap((value) => {
         const model = asRecordOrUndefined(value);
-        return model && typeof model.model === "string"
-          ? [
-              `${model.model} (${Array.isArray(model.reasoning) ? model.reasoning.slice(0, 8).map(String).join(", ") : "unknown"})`,
-            ]
-          : [];
+        if (!model || typeof model.model !== "string") return [];
+        const reasoning = Array.isArray(model.reasoning)
+          ? model.reasoning
+              .slice(0, 8)
+              .map((entry) => boundedStatusText(entry, 24))
+              .join(", ")
+          : "unknown";
+        return [`${boundedStatusText(model.model, 64)} (${reasoning})`];
       })
     : [];
   const multiChildLines =
@@ -960,10 +988,10 @@ function confirmationPresentation(
       ? [
           "Experimental multi-child: enabled",
           `Topology: ${String(topology?.maxLogicalChildren ?? "?")} total / ${String(topology?.maxActiveChildren ?? "?")} active / depth ${String(topology?.maxDepth ?? "?")}`,
-          `Child models: ${String(multiChild.provider ?? "unknown")} · ${models.join("; ") || "none"}`,
+          `Child models: ${boundedStatusText(multiChild.provider, 32)} · ${models.join("; ") || "none"}`,
           `Aggregate tokens: ${String(multiChild.aggregateMaxTokens ?? "?")}; root reserve: ${String(multiChild.rootReservePercent ?? "?")}%`,
           `Per attempt: ${String(multiChild.maxTokensPerAttempt ?? "?")} tokens / ${String(multiChild.maxRequestsPerAttempt ?? "?")} requests / ${String(multiChild.maxConcurrencyPerAttempt ?? "?")} concurrent / ${String(multiChild.maxWallClockMsPerAttempt ?? "?")} ms`,
-          `Retry limit: ${String(multiChild.retryLimit ?? "?")}; repository scope: ${String(multiChild.repositoryScope ?? "unknown")}`,
+          `Retry limit: ${String(multiChild.retryLimit ?? "?")}; repository scope: ${boundedStatusText(multiChild.repositoryScope, 256)}`,
           "Descendants remain root-directed and inside this confirmation envelope",
         ]
       : ["Experimental multi-child: disabled"];
@@ -975,13 +1003,16 @@ function confirmationPresentation(
         {
           type: "text",
           text: [
-            String(record.task ?? "Prime job"),
-            `Repository: ${String(record.canonicalRepoPath ?? "unknown")}`,
-            `Base: ${String(record.baseSha ?? "unknown")}`,
-            "Model: gpt-5.6-sol (high)",
-            ...budgetLines,
             ...multiChildLines,
-            "Unsafe local fixture execution",
+            `Task: ${boundedStatusText(record.task ?? "Prime job", 240)}`,
+            `Repository: ${boundedStatusText(record.repository, 256)}`,
+            `Base: ${boundedStatusText(record.baseSha, 64)}`,
+            `Model: ${boundedStatusText(record.model, 64)} (${boundedStatusText(record.reasoningEffort, 24)})`,
+            ...budgetLines,
+            boundedStatusText(
+              record.executionWarning ?? "Unsafe local fixture execution",
+              256,
+            ),
           ].join("\n"),
         },
         {
@@ -1113,15 +1144,22 @@ function childTreeStatusLines(value: unknown): string[] {
       typeof retry?.previousAttemptId === "string"
         ? retry.previousAttemptId.slice(0, 8)
         : undefined;
+    const totalTokens = boundedNumber(usage?.totalTokens);
+    const tokenLimit = boundedNumber(usage?.tokenLimit);
+    const completeness =
+      typeof usage?.completeness === "string"
+        ? ` (${boundedStatusText(usage.completeness, 12)})`
+        : "";
+    const usageText =
+      totalTokens !== undefined || tokenLimit !== undefined
+        ? `usage ${totalTokens ?? "unknown"}/${tokenLimit ?? "unknown"}${completeness}`
+        : undefined;
     const details = [
       `${boundedStatusText(child.role, 32)}/${boundedStatusText(child.criticality, 10)}`,
       `wave ${boundedInteger(child.wave, 0)}`,
       boundedStatusText(child.state, 12),
       `${boundedStatusText(model?.provider, 16)}/${boundedStatusText(model?.name, 32)} (${boundedStatusText(model?.reasoning, 16)})`,
-      typeof usage?.totalTokens === "number" &&
-      typeof usage?.tokenLimit === "number"
-        ? `usage ${usage.totalTokens}/${usage.tokenLimit}`
-        : undefined,
+      usageText,
       previousAttemptId
         ? `retry ${boundedInteger(retry?.attempt, 2)}←${previousAttemptId}`
         : `attempt ${boundedInteger(retry?.attempt, 1)}`,
