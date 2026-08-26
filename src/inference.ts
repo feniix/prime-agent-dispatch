@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -17,18 +17,43 @@ import {
 } from "./schemas.js";
 
 export type InferenceLease = {
+  leaseId: string;
   endpoint: URL;
   opaqueToken: string;
+  tokenSha256: string;
   expiresAt: Date;
   usage(): InferenceUsageLedgerSnapshot;
-  revoke(): Promise<void>;
+  revoke(reason?: string): Promise<void>;
 };
 
+export type InferenceLeaseBinding =
+  | {
+      kind: "root";
+      jobId: string;
+      provider: string;
+      model: string;
+      reasoning: string;
+    }
+  | {
+      kind: "child";
+      jobId: string;
+      childId: string;
+      attemptId: string;
+      provider: string;
+      model: string;
+      reasoning: string;
+      aggregateConcurrencyLimit: number;
+    };
+
 type LeaseState = {
-  jobId: string;
+  leaseId: string;
   token: string;
   expiresAt: number;
   maxTokens: number;
+  maxRequests: number;
+  maxConcurrency: number;
+  requestCount: number;
+  binding: InferenceLeaseBinding;
   ledger: InferenceUsageLedger;
   persistedUsageIds: Set<string>;
   active: number;
@@ -36,6 +61,7 @@ type LeaseState = {
   controllers: Set<AbortController>;
   idleWaiters: Set<() => void>;
   expiryTimer: NodeJS.Timeout;
+  revocation?: Promise<void>;
 };
 
 type BrokerOptions = {
@@ -47,6 +73,12 @@ type BrokerOptions = {
   onUsageFinalized?: (
     record: InferenceRequestUsage,
     snapshot: InferenceUsageLedgerSnapshot,
+    binding: InferenceLeaseBinding,
+  ) => Promise<void>;
+  onLeaseRevoked?: (
+    leaseId: string,
+    binding: InferenceLeaseBinding,
+    reason: string,
   ) => Promise<void>;
 };
 
@@ -197,11 +229,18 @@ async function readBounded(
 
 export function normalizeCodexResponsesBody(
   value: unknown,
+  pin: { model: string; reasoning: string } = {
+    model: "gpt-5.6-sol",
+    reasoning: "high",
+  },
+  rejectOverrides = false,
 ): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("request body must be a JSON object");
   const body = { ...(value as Record<string, unknown>) };
-  body.model = "gpt-5.6-sol";
+  if (rejectOverrides && body.model !== undefined && body.model !== pin.model)
+    throw new Error("request model does not match the pinned lease");
+  body.model = pin.model;
   body.stream = true;
   body.store = false;
   delete body.temperature;
@@ -211,9 +250,15 @@ export function normalizeCodexResponsesBody(
     body.reasoning && typeof body.reasoning === "object"
       ? (body.reasoning as Record<string, unknown>)
       : {};
+  if (
+    rejectOverrides &&
+    reasoning.effort !== undefined &&
+    reasoning.effort !== pin.reasoning
+  )
+    throw new Error("request reasoning does not match the pinned lease");
   body.reasoning = {
     ...reasoning,
-    effort: "high",
+    effort: pin.reasoning,
     summary: reasoning.summary ?? "auto",
   };
   const include = Array.isArray(body.include) ? body.include : [];
@@ -234,6 +279,7 @@ export class ProductionInferenceBroker {
     rejectedRequests: 0,
     abortedUpstreams: 0,
     usagePersistenceFailures: 0,
+    revocationPersistenceFailures: 0,
     sawStreamingResponse: false,
     sawToolCallEvent: false,
     sawHighReasoning: false,
@@ -251,21 +297,47 @@ export class ProductionInferenceBroker {
 
   async createLease(
     jobId: string,
-    budget: { wallClockMs: number; maxTokens?: number },
+    budget: {
+      wallClockMs: number;
+      maxTokens?: number;
+      maxRequests?: number;
+      maxConcurrency?: number;
+    },
+    bindingValue?: InferenceLeaseBinding,
   ): Promise<InferenceLease> {
     await this.listen();
+    const binding: InferenceLeaseBinding = bindingValue ?? {
+      kind: "root",
+      jobId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      reasoning: "high",
+    };
+    if (binding.jobId !== jobId)
+      throw new Error("inference lease binding has the wrong job");
+    if (
+      binding.kind === "child" &&
+      (!this.options.onUsageFinalized || !this.options.onLeaseRevoked)
+    )
+      throw new Error(
+        "child inference leases require durable usage and revocation callbacks",
+      );
     const token = randomBytes(32).toString("base64url");
-    const expiryTimer = setTimeout(
-      () => void this.revoke(token),
-      budget.wallClockMs,
-    );
+    const leaseId = randomUUID();
+    const expiryTimer = setTimeout(() => {
+      void this.revoke(token, "expired").catch(() => undefined);
+    }, budget.wallClockMs);
     expiryTimer.unref();
     const maxTokens = budget.maxTokens ?? Number.MAX_SAFE_INTEGER;
     const state: LeaseState = {
-      jobId,
+      leaseId,
       token,
       expiresAt: Date.now() + budget.wallClockMs,
       maxTokens,
+      maxRequests: budget.maxRequests ?? Number.MAX_SAFE_INTEGER,
+      maxConcurrency: budget.maxConcurrency ?? this.maxConcurrency,
+      requestCount: 0,
+      binding,
       ledger: new InferenceUsageLedger(maxTokens),
       persistedUsageIds: new Set(),
       active: 0,
@@ -277,11 +349,15 @@ export class ProductionInferenceBroker {
     this.leases.set(token, state);
     const address = this.server.address() as AddressInfo;
     return {
-      endpoint: new URL(`http://127.0.0.1:${address.port}/v1/`),
+      leaseId,
+      endpoint: new URL(
+        `http://127.0.0.1:${address.port}/v1/leases/${leaseId}/`,
+      ),
       opaqueToken: token,
+      tokenSha256: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(state.expiresAt),
       usage: () => state.ledger.snapshot(),
-      revoke: async () => this.revoke(token),
+      revoke: async (reason = "revoked") => this.revoke(token, reason),
     };
   }
 
@@ -290,7 +366,11 @@ export class ProductionInferenceBroker {
   }
 
   async close(): Promise<void> {
-    for (const token of this.leases.keys()) await this.revoke(token);
+    await Promise.all(
+      [...this.leases.keys()].map((token) =>
+        this.revoke(token, "broker closed"),
+      ),
+    );
     if (this.server.listening)
       await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
@@ -303,13 +383,17 @@ export class ProductionInferenceBroker {
     await this.listening;
   }
 
-  private async revoke(token: string): Promise<void> {
+  private async revoke(token: string, reason: string): Promise<void> {
     const lease = this.leases.get(token);
     if (!lease) return;
-    if (lease.revoked) {
-      await this.waitForIdle(lease);
-      return;
-    }
+    lease.revocation ??= this.finishRevocation(lease, reason);
+    await lease.revocation;
+  }
+
+  private async finishRevocation(
+    lease: LeaseState,
+    reason: string,
+  ): Promise<void> {
     clearTimeout(lease.expiryTimer);
     lease.revoked = true;
     for (const controller of lease.controllers) {
@@ -317,7 +401,15 @@ export class ProductionInferenceBroker {
       controller.abort();
     }
     await this.waitForIdle(lease);
-    if (this.leases.get(token) === lease) this.leases.delete(token);
+    try {
+      await this.options.onLeaseRevoked?.(lease.leaseId, lease.binding, reason);
+    } catch (error) {
+      this.counters.revocationPersistenceFailures += 1;
+      throw error;
+    } finally {
+      if (this.leases.get(lease.token) === lease)
+        this.leases.delete(lease.token);
+    }
   }
 
   private async waitForIdle(lease: LeaseState): Promise<void> {
@@ -329,7 +421,10 @@ export class ProductionInferenceBroker {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (request.method !== "POST" || request.url !== "/v1/responses") {
+    const route = request.url?.match(
+      /^\/v1\/leases\/([0-9a-f-]{36})\/responses$/,
+    );
+    if (request.method !== "POST" || !route) {
       jsonError(response, 404, "not found");
       return;
     }
@@ -338,7 +433,12 @@ export class ProductionInferenceBroker {
       ? authorization.slice(7)
       : "";
     const lease = this.leases.get(token);
-    if (!lease || lease.revoked || Date.now() >= lease.expiresAt) {
+    if (
+      !lease ||
+      lease.leaseId !== route[1] ||
+      lease.revoked ||
+      Date.now() >= lease.expiresAt
+    ) {
       this.counters.rejectedRequests += 1;
       jsonError(response, 401, "invalid, expired, or revoked job token");
       return;
@@ -356,9 +456,14 @@ export class ProductionInferenceBroker {
     }
     let body: Record<string, unknown>;
     try {
-      body = normalizeCodexResponsesBody(JSON.parse(raw.toString("utf8")));
+      const parsed = JSON.parse(raw.toString("utf8"));
+      body = normalizeCodexResponsesBody(
+        parsed,
+        { model: lease.binding.model, reasoning: lease.binding.reasoning },
+        lease.binding.kind === "child",
+      );
     } catch {
-      jsonError(response, 400, "invalid JSON request body");
+      jsonError(response, 400, "invalid or unpinned JSON request body");
       return;
     }
     if (lease.revoked || Date.now() >= lease.expiresAt) {
@@ -368,7 +473,11 @@ export class ProductionInferenceBroker {
     }
     if (
       lease.ledger.snapshot().observedUsage.totalTokens >= lease.maxTokens ||
-      lease.active >= this.maxConcurrency
+      lease.requestCount >= lease.maxRequests ||
+      lease.active >= lease.maxConcurrency ||
+      (lease.binding.kind === "child" &&
+        this.activeChildRequests(lease.binding.jobId) >=
+          lease.binding.aggregateConcurrencyLimit)
     ) {
       this.counters.rejectedRequests += 1;
       jsonError(response, 429, "job inference budget or concurrency exceeded");
@@ -379,6 +488,7 @@ export class ProductionInferenceBroker {
     const controller = new AbortController();
     lease.controllers.add(controller);
     lease.active += 1;
+    lease.requestCount += 1;
     this.counters.authorizedRequests += 1;
     request.once("aborted", () => controller.abort());
     response.once("close", () => {
@@ -401,6 +511,7 @@ export class ProductionInferenceBroker {
           await this.options.onUsageFinalized(
             finalized,
             lease.ledger.snapshot(),
+            lease.binding,
           );
           lease.persistedUsageIds.add(finalized.requestId);
         } catch (error) {
@@ -538,5 +649,17 @@ export class ProductionInferenceBroker {
         lease.idleWaiters.clear();
       }
     }
+  }
+
+  private activeChildRequests(jobId: string): number {
+    let active = 0;
+    for (const lease of this.leases.values())
+      if (
+        !lease.revoked &&
+        lease.binding.kind === "child" &&
+        lease.binding.jobId === jobId
+      )
+        active += lease.active;
+    return active;
   }
 }

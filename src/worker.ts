@@ -396,8 +396,27 @@ async function main(): Promise<void> {
         accountId: auth.accountId,
         maxConcurrency: 1,
         maxRequestBytes: 4 * 1024 * 1024,
-        onUsageFinalized: async (record, inference) => {
-          state = await store.recordInferenceUsage(jobId, record, inference);
+        onUsageFinalized: async (record, inference, binding) => {
+          if (binding.kind === "child") {
+            const recorded = await store.recordChildInferenceUsage(jobId, {
+              childId: binding.childId,
+              attemptId: binding.attemptId,
+              request: record,
+              ledger: inference,
+            });
+            state = recorded.state;
+          } else {
+            state = await store.recordInferenceUsage(jobId, record, inference);
+          }
+        },
+        onLeaseRevoked: async (leaseId, binding, reason) => {
+          if (binding.kind === "child")
+            await store.revokeChildInferenceLease(jobId, {
+              childId: binding.childId,
+              attemptId: binding.attemptId,
+              leaseId,
+              reason,
+            });
         },
       });
       inferenceLease = await inferenceBroker.createLease(jobId, {

@@ -74,6 +74,17 @@ export function sqlStep(statement: string): MigrationStep {
   });
 }
 
+export function dataStep(
+  identity: string,
+  apply: (database: ControlDatabase) => void,
+): MigrationStep {
+  if (!identity) throw new Error("migration data step needs an identity");
+  return Object.freeze({
+    checksumSource: JSON.stringify({ kind: "data", identity }),
+    apply,
+  });
+}
+
 export function defineControlMigration(definition: {
   version: number;
   name: string;

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -83,6 +83,19 @@ import {
   NativeRlmSpawnHandleSchema,
   type NativeRlmSpawnHandle,
 } from "./children.js";
+import {
+  ChildInferenceAllocationSchema,
+  ChildInferenceLeaseRecordSchema,
+  ChildInferencePolicySchema,
+  ChildInferenceUsageSnapshotSchema,
+  DEFAULT_CHILD_INFERENCE_POLICY,
+  assertChildInferenceAllowed,
+  childTokenPool,
+  type ChildInferenceAllocation,
+  type ChildInferenceLeaseRecord,
+  type ChildInferencePolicy,
+  type ChildInferenceUsageSnapshot,
+} from "./child-inference.js";
 
 const LIFECYCLE_EVENT_TYPES = new Set(["state_changed", "agent_completed"]);
 const projectionQueues = new Map<string, Promise<void>>();
@@ -245,6 +258,38 @@ type ChildIntegrationRow = {
   completed_at: string | null;
 };
 
+type ChildInferencePolicyRow = {
+  job_id: string;
+  policy_json: string;
+  policy_sha256: string;
+  created_at: string;
+};
+
+type ChildInferenceAllocationRow = {
+  attempt_id: string;
+  child_id: string;
+  job_id: string;
+  allocation_json: string;
+  token_limit: number;
+  allocated_at: string;
+};
+
+type ChildInferenceLeaseRow = {
+  lease_id: string;
+  attempt_id: string;
+  token_sha256: string;
+  status: "active" | "revoked";
+  issued_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  revoke_reason: string | null;
+};
+
+type ChildInferenceUsageRow = {
+  request_id: string;
+  usage_json: string;
+};
+
 export type CompleteChildAttemptInput = {
   childId: string;
   attemptId: string;
@@ -262,6 +307,14 @@ export type ChildMutationInput = {
 export type BindChildRuntimeInput = ChildMutationInput & {
   attemptId: string;
   nativeHandle: NativeRlmSpawnHandle;
+};
+
+export type RecordChildInferenceLeaseInput = ChildMutationInput & {
+  attemptId: string;
+  leaseId: string;
+  tokenSha256: string;
+  issuedAt: string;
+  expiresAt: string;
 };
 
 export type RecordChildWorktreeInput = ChildMutationInput & {
@@ -957,10 +1010,14 @@ export class JobStore {
   async enableChildTree(
     jobId: string,
     policyValue: ChildTreePolicy = DEFAULT_CHILD_TREE_POLICY,
+    inferencePolicyValue: ChildInferencePolicy = DEFAULT_CHILD_INFERENCE_POLICY,
   ): Promise<ChildTreeSnapshot> {
     await this.ensureImported(jobId);
     const policy = ChildTreePolicySchema.parse(policyValue);
+    const inferencePolicy =
+      ChildInferencePolicySchema.parse(inferencePolicyValue);
     const policyDigest = canonicalDigest(policy);
+    const inferencePolicyDigest = canonicalDigest(inferencePolicy);
     const now = new Date().toISOString();
     const event = this.transaction("enable_child_tree", () => {
       const state = this.readStateFromDatabase(jobId);
@@ -976,8 +1033,20 @@ export class JobStore {
       if (existing) {
         if (existing.policy_sha256 !== policyDigest)
           throw new Error("child tree policy is immutable");
+        if (
+          this.childInferencePolicyRow(jobId).policy_sha256 !==
+          inferencePolicyDigest
+        )
+          throw new Error("child inference policy is immutable");
         return undefined;
       }
+      const request = JobRequestSchema.parse(
+        parseSqliteJson(this.jobRow(jobId).request_json, "job request"),
+      );
+      if (inferencePolicy.aggregateMaxTokens !== request.budget.maxTokens)
+        throw new Error(
+          "child inference aggregate budget must equal the confirmed job budget",
+        );
       this.database
         .prepare(
           `INSERT INTO child_trees(
@@ -985,9 +1054,13 @@ export class JobStore {
            ) VALUES (?, ?, ?, 0, ?, ?)`,
         )
         .run(jobId, sqliteJson(policy), policyDigest, now, now);
-      const request = JobRequestSchema.parse(
-        parseSqliteJson(this.jobRow(jobId).request_json, "job request"),
-      );
+      this.database
+        .prepare(
+          `INSERT INTO child_inference_policies(
+             job_id, policy_json, policy_sha256, created_at
+           ) VALUES (?, ?, ?, ?)`,
+        )
+        .run(jobId, sqliteJson(inferencePolicy), inferencePolicyDigest, now);
       this.database
         .prepare(
           `INSERT INTO child_wave_bases(job_id, wave, base_sha, created_at)
@@ -996,9 +1069,12 @@ export class JobStore {
         .run(jobId, request.baseSha, now);
       const created = this.newEvent(jobId, "child_tree_enabled", {
         policyDigest,
+        inferencePolicyDigest,
         maxChildren: policy.maxChildren,
         maxActiveChildren: policy.maxActiveChildren,
         maxDepth: policy.maxDepth,
+        aggregateMaxTokens: inferencePolicy.aggregateMaxTokens,
+        rootReservePercent: inferencePolicy.rootReservePercent,
       });
       this.insertEvent(created);
       return created;
@@ -1547,6 +1623,14 @@ export class JobStore {
           sqliteJson(envelope.inference),
           now,
         );
+      const allocation = this.allocateChildInference(
+        jobId,
+        envelope.childId,
+        attemptId,
+        envelope.inference,
+        envelope.budget,
+        now,
+      );
       this.advanceChildTreeRevision(jobId, now);
       this.insertEvent(
         this.newEvent(jobId, "child_admitted", {
@@ -1557,6 +1641,12 @@ export class JobStore {
           criticality: envelope.criticality,
           wave: envelope.wave,
           envelopeDigest,
+          inference: {
+            provider: allocation.provider,
+            model: allocation.model,
+            reasoning: allocation.reasoning,
+            tokenLimit: allocation.tokenLimit,
+          },
         }),
       );
       return this.logicalChildFromDatabase(envelope.childId);
@@ -1583,6 +1673,9 @@ export class JobStore {
       const prior = this.currentChildAttemptFromDatabase(input.childId);
       if (prior.status !== "failed" && prior.status !== "interrupted")
         throw new Error("only failed or interrupted children may be retried");
+      const priorLease = this.childInferenceLeaseRow(prior.attempt_id);
+      if (priorLease?.status === "active")
+        throw new Error("child retry requires the prior lease to be revoked");
       this.assertChildActiveSlot(jobId, policy.maxActiveChildren);
       if (prior.ordinal >= policy.maxAttemptsPerChild)
         throw new Error("child retry limit reached");
@@ -1610,6 +1703,14 @@ export class JobStore {
           sqliteJson(inference),
           now,
         );
+      const allocation = this.allocateChildInference(
+        jobId,
+        input.childId,
+        attemptId,
+        inference,
+        envelope.budget,
+        now,
+      );
       this.database
         .prepare(
           `UPDATE logical_children
@@ -1626,12 +1727,257 @@ export class JobStore {
           attemptNumber: prior.ordinal + 1,
           model: inference.model,
           reasoning: inference.reasoning,
+          tokenLimit: allocation.tokenLimit,
         }),
       );
       return this.logicalChildFromDatabase(input.childId);
     });
     await this.projectEvents(jobId);
     return child;
+  }
+
+  async recordChildInferenceLease(
+    jobId: string,
+    input: RecordChildInferenceLeaseInput,
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    if (!/^[a-f0-9]{64}$/.test(input.tokenSha256))
+      throw new Error("child inference lease token digest is invalid");
+    const lease = ChildInferenceLeaseRecordSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      leaseId: input.leaseId,
+      attemptId: input.attemptId,
+      childId: input.childId,
+      jobId,
+      status: "active",
+      issuedAt: input.issuedAt,
+      expiresAt: input.expiresAt,
+    });
+    if (Date.parse(lease.expiresAt) <= Date.now())
+      throw new Error("child inference lease is already expired");
+    const child = this.transaction("record_child_inference_lease", () => {
+      this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child inference lease attempt is stale");
+      if (attempt.status !== "active")
+        throw new Error("child inference leases require an active attempt");
+      const allocation = this.childInferenceAllocationFromRow(
+        this.childInferenceAllocationRow(input.attemptId),
+      );
+      if (
+        Date.parse(lease.expiresAt) - Date.parse(lease.issuedAt) >
+        allocation.wallClockMs
+      )
+        throw new Error("child inference lease exceeds its wall-clock budget");
+      const policy = this.childInferencePolicy(jobId);
+      assertChildInferenceAllowed(policy, allocation);
+      if (
+        allocation.tokenLimit > policy.maxTokensPerAttempt ||
+        allocation.requestLimit > policy.maxRequestsPerAttempt ||
+        allocation.concurrencyLimit > policy.maxConcurrencyPerAttempt ||
+        allocation.wallClockMs > policy.maxWallClockMsPerAttempt
+      )
+        throw new Error(
+          "child inference allocation no longer matches host policy",
+        );
+      if (this.childInferenceLeaseRow(input.attemptId))
+        throw new Error("child attempt already has an inference lease");
+      this.database
+        .prepare(
+          `INSERT INTO child_inference_leases(
+             lease_id, attempt_id, token_sha256, status,
+             issued_at, expires_at, revoked_at, revoke_reason
+           ) VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+        )
+        .run(
+          lease.leaseId,
+          lease.attemptId,
+          input.tokenSha256,
+          lease.issuedAt,
+          lease.expiresAt,
+        );
+      this.bumpChildRevision(jobId, input.childId, lease.issuedAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_inference_lease_issued", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          leaseId: input.leaseId,
+          expiresAt: input.expiresAt,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async revokeChildInferenceLease(
+    jobId: string,
+    input: {
+      childId: string;
+      attemptId: string;
+      leaseId: string;
+      reason: string;
+    },
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const reason = input.reason.slice(0, 256);
+    if (!reason)
+      throw new Error("child inference lease revocation needs a reason");
+    const now = new Date().toISOString();
+    const child = this.transaction("revoke_child_inference_lease", () => {
+      const allocation = this.childInferenceAllocationFromRow(
+        this.childInferenceAllocationRow(input.attemptId),
+      );
+      const row = this.childInferenceLeaseRow(input.attemptId);
+      if (
+        !row ||
+        row.lease_id !== input.leaseId ||
+        allocation.childId !== input.childId ||
+        allocation.jobId !== jobId
+      )
+        throw new Error("child inference lease identity mismatch");
+      if (row.status !== "active")
+        return this.logicalChildFromDatabase(input.childId);
+      this.database
+        .prepare(
+          `UPDATE child_inference_leases
+           SET status = 'revoked', revoked_at = ?, revoke_reason = ?
+           WHERE lease_id = ? AND status = 'active'`,
+        )
+        .run(now, reason, input.leaseId);
+      this.bumpChildRevision(jobId, input.childId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_inference_lease_revoked", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          leaseId: input.leaseId,
+          reason,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async recordChildInferenceUsage(
+    jobId: string,
+    input: {
+      childId: string;
+      attemptId: string;
+      request: InferenceRequestUsage;
+      ledger: ChildInferenceUsageSnapshot;
+    },
+  ): Promise<{ child: LogicalChild; state: JobState }> {
+    await this.ensureImported(jobId);
+    const request = InferenceRequestUsageSchema.parse(input.request);
+    const ledger = ChildInferenceUsageSnapshotSchema.parse(input.ledger);
+    const ledgerRecord = ledger.requests.find(
+      (candidate) => candidate.requestId === request.requestId,
+    );
+    if (!ledgerRecord || !sameInferenceAccounting(ledgerRecord, request))
+      throw new Error("child inference ledger omitted finalized request");
+    const result = this.transaction("record_child_inference_usage", () => {
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.job_id !== jobId || attempt.attempt_id !== input.attemptId)
+        throw new Error("child inference usage attempt is stale");
+      const allocation = this.childInferenceAllocationFromRow(
+        this.childInferenceAllocationRow(input.attemptId),
+      );
+      if (ledger.budget.tokenLimit !== allocation.tokenLimit)
+        throw new Error("child inference usage token limit changed");
+      const existing = this.database
+        .prepare(
+          `SELECT usage_json FROM child_inference_usage
+           WHERE attempt_id = ? AND request_id = ?`,
+        )
+        .get(input.attemptId, request.requestId) as
+        | { usage_json: string }
+        | undefined;
+      if (existing) {
+        const prior = InferenceRequestUsageSchema.parse(
+          parseSqliteJson(existing.usage_json, "child inference usage"),
+        );
+        if (!sameInferenceAccounting(prior, request))
+          throw new Error(
+            `conflicting child usage accounting for request ${request.requestId}`,
+          );
+        return {
+          child: this.logicalChildFromDatabase(input.childId),
+          state: this.readStateFromDatabase(jobId),
+        };
+      }
+      this.database
+        .prepare(
+          `INSERT INTO child_inference_usage(
+             attempt_id, request_id, usage_json
+           ) VALUES (?, ?, ?)`,
+        )
+        .run(input.attemptId, request.requestId, sqliteJson(request));
+      const aggregateRequest = InferenceRequestUsageSchema.parse({
+        ...request,
+        requestId: `child:${input.attemptId}:${createHash("sha256")
+          .update(request.requestId)
+          .digest("hex")}`,
+      });
+      this.database
+        .prepare(
+          "INSERT INTO inference_usage(job_id, request_id, usage_json) VALUES (?, ?, ?)",
+        )
+        .run(jobId, aggregateRequest.requestId, sqliteJson(aggregateRequest));
+      const current = this.readStateFromDatabase(jobId);
+      const policy = this.childInferencePolicy(jobId);
+      if (
+        current.inference &&
+        current.inference.budget.tokenLimit !== policy.aggregateMaxTokens
+      )
+        throw new Error("aggregate inference usage token limit changed");
+      const requests = [
+        ...(current.inference?.requests ?? []),
+        aggregateRequest,
+      ];
+      const inference = InferenceUsageLedgerSchema.parse({
+        requests,
+        ...summarizeInferenceUsage(requests, policy.aggregateMaxTokens),
+      });
+      const now = new Date().toISOString();
+      const state = JobStateSchema.parse({
+        ...current,
+        inference,
+        revision: current.revision + 1,
+        updatedAt: now,
+      });
+      this.database
+        .prepare(
+          "UPDATE jobs SET state_json = ?, updated_at = ? WHERE job_id = ?",
+        )
+        .run(sqliteJson(state), now, jobId);
+      this.bumpChildRevision(jobId, input.childId, now);
+      this.insertEvent(
+        this.newEvent(jobId, "child_inference_usage_recorded", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          requestId: request.requestId,
+          completeness: request.completeness,
+          observedTotalTokens: request.usage?.totalTokens ?? 0,
+        }),
+      );
+      return {
+        child: this.logicalChildFromDatabase(input.childId),
+        state,
+      };
+    });
+    await this.projectState(result.state);
+    await this.projectEvents(jobId);
+    if (result.state.inference)
+      await this.writeArtifact(
+        jobId,
+        "inference-usage.json",
+        `${JSON.stringify(result.state.inference, null, 2)}\n`,
+      );
+    return { child: result.child, state: result.state };
   }
 
   async requestChildCancellation(
@@ -1740,6 +2086,10 @@ export class JobStore {
         throw new Error("child attempt is stale");
       if (attempt.status !== "active" && attempt.status !== "cancelling")
         throw new Error("child attempt is already terminal");
+      if (this.childInferenceLeaseRow(attempt.attempt_id)?.status === "active")
+        throw new Error(
+          "child attempt cannot become terminal while its inference lease is active",
+        );
       if (attempt.status === "cancelling" && evidence.outcome !== "cancelled")
         throw new Error("a cancelling child must finish as cancelled");
       if (evidence.outcome === "cancelled" && attempt.status !== "cancelling")
@@ -2442,6 +2792,114 @@ export class JobStore {
     return row;
   }
 
+  private childInferencePolicyRow(jobId: string): ChildInferencePolicyRow {
+    const row = this.database
+      .prepare(
+        `SELECT job_id, policy_json, policy_sha256, created_at
+         FROM child_inference_policies WHERE job_id = ?`,
+      )
+      .get(jobId) as ChildInferencePolicyRow | undefined;
+    if (!row)
+      throw new Error("experimental child inference policy is not enabled");
+    return row;
+  }
+
+  private childInferencePolicy(jobId: string): ChildInferencePolicy {
+    const row = this.childInferencePolicyRow(jobId);
+    const policy = ChildInferencePolicySchema.parse(
+      parseSqliteJson(row.policy_json, "child inference policy"),
+    );
+    if (canonicalDigest(policy) !== row.policy_sha256)
+      throw new Error("stored child inference policy digest mismatch");
+    return policy;
+  }
+
+  private childInferenceAllocationRow(
+    attemptId: string,
+  ): ChildInferenceAllocationRow {
+    const row = this.database
+      .prepare(
+        `SELECT attempt_id, child_id, job_id, allocation_json, token_limit,
+                allocated_at
+         FROM child_inference_allocations WHERE attempt_id = ?`,
+      )
+      .get(attemptId) as ChildInferenceAllocationRow | undefined;
+    if (!row)
+      throw new Error(`child attempt ${attemptId} has no inference allocation`);
+    return row;
+  }
+
+  private childInferenceAllocationFromRow(
+    row: ChildInferenceAllocationRow,
+  ): ChildInferenceAllocation {
+    const allocation = ChildInferenceAllocationSchema.parse(
+      parseSqliteJson(row.allocation_json, "child inference allocation"),
+    );
+    if (
+      allocation.attemptId !== row.attempt_id ||
+      allocation.childId !== row.child_id ||
+      allocation.jobId !== row.job_id ||
+      allocation.tokenLimit !== row.token_limit ||
+      allocation.allocatedAt !== row.allocated_at
+    )
+      throw new Error("stored child inference allocation identity mismatch");
+    return allocation;
+  }
+
+  private childInferenceLeaseRow(
+    attemptId: string,
+  ): ChildInferenceLeaseRow | undefined {
+    return this.database
+      .prepare(
+        `SELECT lease_id, attempt_id, token_sha256, status, issued_at,
+                expires_at, revoked_at, revoke_reason
+         FROM child_inference_leases WHERE attempt_id = ?`,
+      )
+      .get(attemptId) as ChildInferenceLeaseRow | undefined;
+  }
+
+  private childInferenceLeaseFromRow(
+    row: ChildInferenceLeaseRow,
+    allocation: ChildInferenceAllocation,
+  ): ChildInferenceLeaseRecord {
+    return ChildInferenceLeaseRecordSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      leaseId: row.lease_id,
+      attemptId: row.attempt_id,
+      childId: allocation.childId,
+      jobId: allocation.jobId,
+      status: row.status,
+      issuedAt: row.issued_at,
+      expiresAt: row.expires_at,
+      ...(row.revoked_at ? { revokedAt: row.revoked_at } : {}),
+      ...(row.revoke_reason ? { revokeReason: row.revoke_reason } : {}),
+    });
+  }
+
+  private childInferenceUsage(
+    allocation: ChildInferenceAllocation,
+  ): ChildInferenceUsageSnapshot | undefined {
+    const rows = this.database
+      .prepare(
+        `SELECT request_id, usage_json FROM child_inference_usage
+         WHERE attempt_id = ? ORDER BY rowid`,
+      )
+      .all(allocation.attemptId) as ChildInferenceUsageRow[];
+    if (rows.length === 0) return undefined;
+    const requests = rows.map((row) => {
+      const request = InferenceRequestUsageSchema.parse(
+        parseSqliteJson(row.usage_json, "child inference usage"),
+      );
+      if (request.requestId !== row.request_id)
+        throw new Error("stored child inference usage identity mismatch");
+      return request;
+    });
+    return ChildInferenceUsageSnapshotSchema.parse({
+      requests,
+      ...summarizeInferenceUsage(requests, allocation.tokenLimit),
+    });
+  }
+
   private logicalChildRow(
     childId: string,
     required = true,
@@ -2634,6 +3092,11 @@ export class JobStore {
     const worktreeRow = this.childWorktreeRow(row.attempt_id, false);
     const proposalRow = this.childProposalRow(row.attempt_id, false);
     const integrationRow = this.childIntegrationRow(row.attempt_id, false);
+    const inferenceAllocation = this.childInferenceAllocationFromRow(
+      this.childInferenceAllocationRow(row.attempt_id),
+    );
+    const inferenceLeaseRow = this.childInferenceLeaseRow(row.attempt_id);
+    const inferenceUsage = this.childInferenceUsage(inferenceAllocation);
     return ChildAttemptSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       attemptId: row.attempt_id,
@@ -2657,6 +3120,16 @@ export class JobStore {
       ...(integrationRow
         ? { integration: this.childIntegrationFromRow(integrationRow) }
         : {}),
+      inferenceAllocation,
+      ...(inferenceLeaseRow
+        ? {
+            inferenceLease: this.childInferenceLeaseFromRow(
+              inferenceLeaseRow,
+              inferenceAllocation,
+            ),
+          }
+        : {}),
+      ...(inferenceUsage ? { inferenceUsage } : {}),
       ...(row.terminal_evidence_json
         ? {
             terminalEvidence: parseSqliteJson(
@@ -2726,6 +3199,8 @@ export class JobStore {
     );
     if (canonicalDigest(policy) !== row.policy_sha256)
       throw new Error("stored child tree policy digest mismatch");
+    const inferencePolicyRow = this.childInferencePolicyRow(jobId);
+    const inferencePolicy = this.childInferencePolicy(jobId);
     const children = (
       this.database
         .prepare(
@@ -2747,6 +3222,8 @@ export class JobStore {
       jobId,
       policy,
       policyDigest: row.policy_sha256,
+      inferencePolicy,
+      inferencePolicyDigest: inferencePolicyRow.policy_sha256,
       revision: row.revision,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -2775,6 +3252,68 @@ export class JobStore {
     return ChildTreePolicySchema.parse(
       parseSqliteJson(row.policy_json, "child tree policy"),
     );
+  }
+
+  private allocateChildInference(
+    jobId: string,
+    childId: string,
+    attemptId: string,
+    inference: ChildSpawnEnvelope["inference"],
+    budget: ChildSpawnEnvelope["budget"],
+    allocatedAt: string,
+  ): ChildInferenceAllocation {
+    const policy = this.childInferencePolicy(jobId);
+    assertChildInferenceAllowed(policy, inference);
+    if (budget.maxTokens > policy.maxTokensPerAttempt)
+      throw new Error("child token allocation exceeds the per-attempt ceiling");
+    if (budget.maxTurns > policy.maxRequestsPerAttempt)
+      throw new Error(
+        "child request allocation exceeds the per-attempt ceiling",
+      );
+    if (budget.wallClockMs > policy.maxWallClockMsPerAttempt)
+      throw new Error(
+        "child wall-time allocation exceeds the per-attempt ceiling",
+      );
+    const allocated = (
+      this.database
+        .prepare(
+          `SELECT COALESCE(SUM(token_limit), 0) AS tokens
+           FROM child_inference_allocations WHERE job_id = ?`,
+        )
+        .get(jobId) as { tokens: number }
+    ).tokens;
+    if (allocated + budget.maxTokens > childTokenPool(policy))
+      throw new Error("child token allocation would consume the root reserve");
+    const allocation = ChildInferenceAllocationSchema.parse({
+      schemaVersion: SCHEMA_VERSION,
+      attemptId,
+      childId,
+      jobId,
+      provider: inference.provider,
+      model: inference.model,
+      reasoning: inference.reasoning,
+      tokenLimit: budget.maxTokens,
+      requestLimit: budget.maxTurns,
+      concurrencyLimit: policy.maxConcurrencyPerAttempt,
+      wallClockMs: budget.wallClockMs,
+      allocatedAt,
+    });
+    this.database
+      .prepare(
+        `INSERT INTO child_inference_allocations(
+           attempt_id, child_id, job_id, allocation_json, token_limit,
+           allocated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        attemptId,
+        childId,
+        jobId,
+        sqliteJson(allocation),
+        allocation.tokenLimit,
+        allocatedAt,
+      );
+    return allocation;
   }
 
   private assertChildMutation(
@@ -2817,6 +3356,20 @@ export class JobStore {
          WHERE job_id = ?`,
       )
       .run(updatedAt, jobId);
+  }
+
+  private bumpChildRevision(
+    jobId: string,
+    childId: string,
+    updatedAt: string,
+  ): void {
+    this.database
+      .prepare(
+        `UPDATE logical_children
+         SET revision = revision + 1, updated_at = ? WHERE child_id = ?`,
+      )
+      .run(updatedAt, childId);
+    this.advanceChildTreeRevision(jobId, updatedAt);
   }
 
   private assertChildrenJoined(jobId: string): void {

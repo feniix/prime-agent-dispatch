@@ -1,6 +1,7 @@
 import { readFile, realpath } from "node:fs/promises";
 import { z } from "zod";
 import { GateSchema, SCHEMA_VERSION } from "./schemas.js";
+import { ChildInferencePolicySchema } from "./child-inference.js";
 
 export const DEFAULT_MINIMUM_EVIDENCE = [
   "result.json",
@@ -74,6 +75,7 @@ export const HostConfigSchema = z
       executable: z.string().min(1),
       releaseArtifact: z.string().min(1),
     }),
+    multiChild: ChildInferencePolicySchema.optional(),
     retention: RetentionPolicySchema.default(DEFAULT_RETENTION_POLICY),
     repositories: z
       .array(
@@ -111,6 +113,7 @@ export async function resolveHostRepositoryPolicy(
           executable: config.prime.executable,
           releaseArtifact: config.prime.releaseArtifact,
         },
+        ...(config.multiChild ? { multiChild: config.multiChild } : {}),
       };
     }
   }
