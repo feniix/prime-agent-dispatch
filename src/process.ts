@@ -129,6 +129,7 @@ export async function git(
   options: {
     timeoutMs?: number;
     maxOutputBytes?: number;
+    trimOutput?: boolean;
     signal?: AbortSignal;
     terminationGraceMs?: number;
   } = {},
@@ -152,5 +153,5 @@ export async function git(
       `git ${args[0] ?? ""} failed: ${result.stderr.trim() || result.stdout.trim()}`,
     );
   }
-  return result.stdout.trim();
+  return options.trimOutput === false ? result.stdout : result.stdout.trim();
 }

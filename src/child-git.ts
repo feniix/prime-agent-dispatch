@@ -17,6 +17,12 @@ import { JobStore, type ChildMutationInput } from "./store.js";
 
 type GitControl = { signal?: AbortSignal; terminationGraceMs?: number };
 
+function rollbackControl(control: GitControl): GitControl {
+  return control.terminationGraceMs === undefined
+    ? {}
+    : { terminationGraceMs: control.terminationGraceMs };
+}
+
 export type PreparedChildWorktree = {
   child: LogicalChild;
   identity: ChildWorktreeIdentity;
@@ -26,10 +32,9 @@ export class ChildGitCoordinator {
   constructor(private readonly store: JobStore) {}
 
   async prepare(
-    childValue: LogicalChild,
+    child: LogicalChild,
     control: GitControl = {},
   ): Promise<PreparedChildWorktree> {
-    const child = childValue;
     const attempt = child.attempts.at(-1);
     if (!attempt || attempt.status !== "active")
       throw new Error("only an active child attempt may receive a worktree");
@@ -48,17 +53,20 @@ export class ChildGitCoordinator {
       envelope.childId,
       attempt.ordinal,
     );
+    const admittedPath = childWorktreePath(
+      this.store.root,
+      envelope.parentJobId,
+      envelope.childId,
+    );
+    const admittedBranch = childBranchName(
+      envelope.parentJobId,
+      envelope.childId,
+    );
     if (envelope.worktree.repositoryPath !== request.canonicalRepoPath)
       throw new Error("child repository differs from the confirmed repository");
-    if (
-      attempt.ordinal === 1 &&
-      envelope.worktree.worktreePath !== expectedPath
-    )
+    if (envelope.worktree.worktreePath !== admittedPath)
       throw new Error("child worktree path differs from its owned path");
-    if (
-      attempt.ordinal === 1 &&
-      envelope.worktree.branchName !== expectedBranch
-    )
+    if (envelope.worktree.branchName !== admittedBranch)
       throw new Error("child branch differs from its owned branch");
 
     const repositoryPath = await realpath(request.canonicalRepoPath);
@@ -124,16 +132,32 @@ export class ChildGitCoordinator {
       );
       return { child: updated, identity };
     } catch (error) {
+      let recorded = false;
+      try {
+        const current = await this.currentChild(
+          envelope.parentJobId,
+          envelope.childId,
+        );
+        recorded =
+          current.attempts.at(-1)?.worktree?.attemptId === attempt.attemptId;
+      } catch (persistenceCheckError) {
+        throw new AggregateError(
+          [error, persistenceCheckError],
+          "child worktree provisioning failed and durable ownership could not be checked; Git state was preserved",
+        );
+      }
+      if (recorded) throw error;
+      const cleanupControl = rollbackControl(control);
       try {
         await git(
           repositoryPath,
           ["worktree", "remove", "--force", expectedPath],
-          control,
+          cleanupControl,
         );
         await git(
           repositoryPath,
           ["update-ref", "-d", `refs/heads/${expectedBranch}`, baseSha],
-          control,
+          cleanupControl,
         );
       } catch (cleanupError) {
         throw new AggregateError(
@@ -200,6 +224,7 @@ export class ChildGitCoordinator {
         {
           ...control,
           maxOutputBytes: CHILD_PROPOSAL_DIFF_MAX_BYTES,
+          trimOutput: false,
         },
       );
       if (!proposalDiff) throw new Error("commit proposal has no tree diff");
@@ -264,6 +289,47 @@ export class ChildGitCoordinator {
         `root worktree must be clean before child integration: ${truncateUtf8(rootStatus, 4_096)}`,
       );
 
+    await this.store.readChildProposalDiff(jobId, input.attemptId);
+    let commits: string[] = [];
+    if (proposal.proposalSha) {
+      const mergeBase = await git(
+        request.canonicalRepoPath,
+        ["merge-base", proposal.baseSha, proposal.proposalSha],
+        control,
+      );
+      if (mergeBase !== proposal.baseSha)
+        throw new Error(
+          "recorded child proposal no longer descends from its base",
+        );
+      const mergeCommits = await git(
+        request.canonicalRepoPath,
+        [
+          "rev-list",
+          "--min-parents=2",
+          `${proposal.baseSha}..${proposal.proposalSha}`,
+        ],
+        control,
+      );
+      if (mergeCommits)
+        throw new Error("child proposal history contains merge commits");
+      commits = (
+        await git(
+          request.canonicalRepoPath,
+          [
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            `${proposal.baseSha}..${proposal.proposalSha}`,
+          ],
+          control,
+        )
+      )
+        .split("\n")
+        .filter(Boolean);
+      if (commits.length === 0)
+        throw new Error("recorded child proposal has no commits to integrate");
+    }
+
     const integrationId = randomUUID();
     await this.store.beginChildIntegration(jobId, {
       ...input,
@@ -279,52 +345,33 @@ export class ChildGitCoordinator {
         rootAfterSha: root.headSha,
         completedAt: new Date().toISOString(),
       });
-
-    const mergeBase = await git(
-      request.canonicalRepoPath,
-      ["merge-base", proposal.baseSha, proposal.proposalSha],
-      control,
-    );
-    if (mergeBase !== proposal.baseSha)
-      throw new Error(
-        "recorded child proposal no longer descends from its base",
-      );
-    const commits = (
-      await git(
-        request.canonicalRepoPath,
-        [
-          "rev-list",
-          "--reverse",
-          "--topo-order",
-          `${proposal.baseSha}..${proposal.proposalSha}`,
-        ],
-        control,
-      )
-    )
-      .split("\n")
-      .filter(Boolean);
-    if (commits.length === 0)
-      throw new Error("recorded child proposal has no commits to integrate");
     try {
       await git(root.worktreePath, ["cherry-pick", "--no-commit", ...commits], {
         ...control,
       });
     } catch (error) {
-      const conflictPaths = (
-        await git(
-          root.worktreePath,
-          ["diff", "--name-only", "--diff-filter=U"],
-          control,
+      const cleanupControl = rollbackControl(control);
+      let conflictPaths: string[] = [];
+      let conflictCaptureError: unknown;
+      try {
+        conflictPaths = (
+          await git(
+            root.worktreePath,
+            ["diff", "--name-only", "--diff-filter=U"],
+            control,
+          )
         )
-      )
-        .split("\n")
-        .filter(Boolean)
-        .slice(0, 100);
+          .split("\n")
+          .filter(Boolean)
+          .slice(0, 100);
+      } catch (captureError) {
+        conflictCaptureError = captureError;
+      }
       try {
         await git(
           root.worktreePath,
           ["reset", "--merge", root.headSha],
-          control,
+          cleanupControl,
         );
       } catch (rollbackError) {
         throw new AggregateError(
@@ -335,15 +382,25 @@ export class ChildGitCoordinator {
       const restoredHead = await git(
         root.worktreePath,
         ["rev-parse", "HEAD"],
-        control,
+        cleanupControl,
       );
       const restoredStatus = await git(
         root.worktreePath,
         ["status", "--porcelain=v1", "--untracked-files=all"],
-        control,
+        cleanupControl,
       );
       if (restoredHead !== root.headSha || restoredStatus)
         throw new Error("conflicted integration did not restore the root tree");
+      if (conflictCaptureError)
+        throw new AggregateError(
+          [error, conflictCaptureError],
+          "child integration failed; conflict evidence could not be captured after root rollback",
+        );
+      if (conflictPaths.length === 0)
+        throw new Error(
+          "child integration failed without Git conflict evidence; root rollback completed",
+          { cause: error },
+        );
       return await this.store.completeChildIntegration(jobId, {
         integrationId,
         status: "conflicted",
@@ -367,8 +424,13 @@ export class ChildGitCoordinator {
       await git(
         root.worktreePath,
         [
+          "-c",
+          "user.name=Prime Dispatch",
+          "-c",
+          "user.email=prime-dispatch@local.invalid",
+          "-c",
+          "commit.gpgsign=false",
           "commit",
-          "--no-gpg-sign",
           "-m",
           `Integrate child ${child.envelope.name} proposal`,
         ],

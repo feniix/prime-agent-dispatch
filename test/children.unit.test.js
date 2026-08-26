@@ -256,7 +256,7 @@ test("spawn envelopes are digest-bound and immutable in SQLite", async () => {
   database.close();
 });
 
-test("verification joins all attempts and discarded children must be cancelled", async () => {
+test("verification joins all attempts and active children must be cancelled before discard", async () => {
   const { store, request } = await fixture();
   const tree = await store.enableChildTree(request.jobId);
   let child = await store.admitChild(

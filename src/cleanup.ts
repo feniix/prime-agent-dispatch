@@ -345,8 +345,15 @@ export class CleanupManager {
           }));
           const ownershipUnsafe =
             "unsafe" in identity ? identity.unsafe : undefined;
-          const reason = unsafe ?? ownershipUnsafe;
-          if (!("worktree" in identity)) {
+          let proposalUnsafe: string | undefined;
+          if (attempt.proposal)
+            try {
+              await this.store.readChildProposalDiff(jobId, attempt.attemptId);
+            } catch (error) {
+              proposalUnsafe = `child proposal evidence is invalid: ${String(error)}`;
+            }
+          const reason = unsafe ?? proposalUnsafe ?? ownershipUnsafe;
+          if (!("worktree" in identity && identity.worktree)) {
             add({
               jobId,
               kind: "worktree",
@@ -365,54 +372,55 @@ export class CleanupManager {
               estimatedBytes: 0,
               candidate: false,
             });
-            continue;
           }
-          add({
-            jobId,
-            kind: "worktree",
-            target: recorded.worktreePath,
-            decision: !reason && expired ? "delete" : "keep",
-            reason:
-              reason ??
-              (expired
-                ? `terminal ${state.status} retention age elapsed`
-                : `terminal ${state.status} retention age has not elapsed`),
-            expected: {
-              owner: "child",
-              childId: recorded.childId,
-              attemptId: recorded.attemptId,
-              attemptOrdinal: recorded.attemptOrdinal,
-              stateRevision: state.revision,
-              status: state.status,
-              ...identity.worktree,
-            },
-            estimatedBytes: identity.worktree.bytes,
-            candidate: !reason,
-          });
-          add({
-            jobId,
-            kind: "branch",
-            target: recorded.branchName,
-            decision: !reason && expired ? "delete" : "keep",
-            reason:
-              reason ??
-              (expired
-                ? "owned child worktree is scheduled before its local branch"
-                : `terminal ${state.status} retention age has not elapsed`),
-            expected: {
-              owner: "child",
-              childId: recorded.childId,
-              attemptId: recorded.attemptId,
-              attemptOrdinal: recorded.attemptOrdinal,
-              stateRevision: state.revision,
-              status: state.status,
-              repoPath: request.canonicalRepoPath,
-              branchName: recorded.branchName,
-              head: identity.branch.head,
-            },
-            estimatedBytes: 0,
-            candidate: !reason,
-          });
+          if ("worktree" in identity && identity.worktree)
+            add({
+              jobId,
+              kind: "worktree",
+              target: recorded.worktreePath,
+              decision: !reason && expired ? "delete" : "keep",
+              reason:
+                reason ??
+                (expired
+                  ? `terminal ${state.status} retention age elapsed`
+                  : `terminal ${state.status} retention age has not elapsed`),
+              expected: {
+                owner: "child",
+                childId: recorded.childId,
+                attemptId: recorded.attemptId,
+                attemptOrdinal: recorded.attemptOrdinal,
+                stateRevision: state.revision,
+                status: state.status,
+                ...identity.worktree,
+              },
+              estimatedBytes: identity.worktree.bytes,
+              candidate: !reason,
+            });
+          if ("branch" in identity)
+            add({
+              jobId,
+              kind: "branch",
+              target: recorded.branchName,
+              decision: !reason && expired ? "delete" : "keep",
+              reason:
+                reason ??
+                (expired
+                  ? "owned child worktree is scheduled before its local branch"
+                  : `terminal ${state.status} retention age has not elapsed`),
+              expected: {
+                owner: "child",
+                childId: recorded.childId,
+                attemptId: recorded.attemptId,
+                attemptOrdinal: recorded.attemptOrdinal,
+                stateRevision: state.revision,
+                status: state.status,
+                repoPath: request.canonicalRepoPath,
+                branchName: recorded.branchName,
+                head: identity.branch.head,
+              },
+              estimatedBytes: 0,
+              candidate: !reason,
+            });
         }
       }
     }
@@ -833,7 +841,7 @@ export class CleanupManager {
     recorded: ChildWorktreeIdentity,
     repoPath: string,
   ): Promise<{
-    worktree: {
+    worktree?: {
       canonicalPath: string;
       repoPath: string;
       branchName: string;
@@ -878,9 +886,7 @@ export class CleanupManager {
       expectedPath,
       ownedRoot,
     );
-    if (!identity.worktree)
-      throw new Error("recorded child worktree is missing");
-    return { worktree: identity.worktree, branch: identity.branch };
+    return identity;
   }
 
   private async registeredWorktreeIdentity(
@@ -902,32 +908,55 @@ export class CleanupManager {
   }> {
     let worktree;
     if (worktreePath) {
-      const canonicalPath = await realpath(worktreePath);
-      if (canonicalPath !== expectedPath || !isInside(ownedRoot, canonicalPath))
-        throw new Error("worktree canonical path changed");
-      const [
-        top,
-        actualBranchName,
-        head,
-        commonDir,
-        repositoryCommonDir,
-        inventory,
-      ] = await Promise.all([
-        git(canonicalPath, ["rev-parse", "--show-toplevel"]),
-        git(canonicalPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
-        git(canonicalPath, ["rev-parse", "HEAD"]),
-        git(canonicalPath, ["rev-parse", "--git-common-dir"]),
-        git(repoPath, ["rev-parse", "--git-common-dir"]),
-        inventoryPath(canonicalPath),
-      ]);
-      if (
-        (await realpath(top)) !== canonicalPath ||
-        actualBranchName !== branchName ||
-        (await realpath(resolve(canonicalPath, commonDir))) !==
-          (await realpath(resolve(repoPath, repositoryCommonDir)))
-      )
-        throw new Error("worktree registration or branch identity changed");
-      worktree = { canonicalPath, repoPath, branchName, head, ...inventory };
+      let canonicalPath: string | undefined;
+      try {
+        canonicalPath = await realpath(worktreePath);
+      } catch (error) {
+        if (!missing(error)) throw error;
+      }
+      if (!canonicalPath) {
+        const registered = await git(repoPath, [
+          "worktree",
+          "list",
+          "--porcelain",
+        ]);
+        if (
+          registered
+            .split("\n")
+            .some((line) => line === `worktree ${worktreePath}`)
+        )
+          throw new Error("missing worktree path remains registered");
+      }
+      if (canonicalPath) {
+        if (
+          canonicalPath !== expectedPath ||
+          !isInside(ownedRoot, canonicalPath)
+        )
+          throw new Error("worktree canonical path changed");
+        const [
+          top,
+          actualBranchName,
+          head,
+          commonDir,
+          repositoryCommonDir,
+          inventory,
+        ] = await Promise.all([
+          git(canonicalPath, ["rev-parse", "--show-toplevel"]),
+          git(canonicalPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+          git(canonicalPath, ["rev-parse", "HEAD"]),
+          git(canonicalPath, ["rev-parse", "--git-common-dir"]),
+          git(repoPath, ["rev-parse", "--git-common-dir"]),
+          inventoryPath(canonicalPath),
+        ]);
+        if (
+          (await realpath(top)) !== canonicalPath ||
+          actualBranchName !== branchName ||
+          (await realpath(resolve(canonicalPath, commonDir))) !==
+            (await realpath(resolve(repoPath, repositoryCommonDir)))
+        )
+          throw new Error("worktree registration or branch identity changed");
+        worktree = { canonicalPath, repoPath, branchName, head, ...inventory };
+      }
     }
     const branchHead = await git(repoPath, [
       "rev-parse",
