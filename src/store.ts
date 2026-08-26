@@ -277,8 +277,6 @@ type ChildInferenceAllocationRow = {
 type ChildInferenceLeaseRow = {
   lease_id: string;
   attempt_id: string;
-  child_id: string;
-  job_id: string;
   token_sha256: string;
   status: "active" | "revoked";
   issued_at: string;
@@ -1755,8 +1753,8 @@ export class JobStore {
       issuedAt: input.issuedAt,
       expiresAt: input.expiresAt,
     });
-    if (lease.expiresAt <= lease.issuedAt)
-      throw new Error("child inference lease must expire after issuance");
+    if (Date.parse(lease.expiresAt) <= Date.now())
+      throw new Error("child inference lease is already expired");
     const child = this.transaction("record_child_inference_lease", () => {
       this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
@@ -1767,6 +1765,11 @@ export class JobStore {
       const allocation = this.childInferenceAllocationFromRow(
         this.childInferenceAllocationRow(input.attemptId),
       );
+      if (
+        Date.parse(lease.expiresAt) - Date.parse(lease.issuedAt) >
+        allocation.wallClockMs
+      )
+        throw new Error("child inference lease exceeds its wall-clock budget");
       const policy = this.childInferencePolicy(jobId);
       assertChildInferenceAllowed(policy, allocation);
       if (
@@ -1783,15 +1786,13 @@ export class JobStore {
       this.database
         .prepare(
           `INSERT INTO child_inference_leases(
-             lease_id, attempt_id, child_id, job_id, token_sha256, status,
+             lease_id, attempt_id, token_sha256, status,
              issued_at, expires_at, revoked_at, revoke_reason
-           ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+           ) VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL)`,
         )
         .run(
           lease.leaseId,
           lease.attemptId,
-          lease.childId,
-          lease.jobId,
           input.tokenSha256,
           lease.issuedAt,
           lease.expiresAt,
@@ -1813,7 +1814,8 @@ export class JobStore {
 
   async revokeChildInferenceLease(
     jobId: string,
-    input: ChildMutationInput & {
+    input: {
+      childId: string;
       attemptId: string;
       leaseId: string;
       reason: string;
@@ -1825,16 +1827,19 @@ export class JobStore {
       throw new Error("child inference lease revocation needs a reason");
     const now = new Date().toISOString();
     const child = this.transaction("revoke_child_inference_lease", () => {
-      this.assertChildMutation(jobId, input);
+      const allocation = this.childInferenceAllocationFromRow(
+        this.childInferenceAllocationRow(input.attemptId),
+      );
       const row = this.childInferenceLeaseRow(input.attemptId);
       if (
         !row ||
         row.lease_id !== input.leaseId ||
-        row.child_id !== input.childId
+        allocation.childId !== input.childId ||
+        allocation.jobId !== jobId
       )
         throw new Error("child inference lease identity mismatch");
       if (row.status !== "active")
-        throw new Error("child inference lease is already revoked");
+        return this.logicalChildFromDatabase(input.childId);
       this.database
         .prepare(
           `UPDATE child_inference_leases
@@ -1902,22 +1907,15 @@ export class JobStore {
         return {
           child: this.logicalChildFromDatabase(input.childId),
           state: this.readStateFromDatabase(jobId),
-          inserted: false,
         };
       }
       this.database
         .prepare(
           `INSERT INTO child_inference_usage(
-             attempt_id, request_id, job_id, child_id, usage_json
-           ) VALUES (?, ?, ?, ?, ?)`,
+             attempt_id, request_id, usage_json
+           ) VALUES (?, ?, ?)`,
         )
-        .run(
-          input.attemptId,
-          request.requestId,
-          jobId,
-          input.childId,
-          sqliteJson(request),
-        );
+        .run(input.attemptId, request.requestId, sqliteJson(request));
       const aggregateRequest = InferenceRequestUsageSchema.parse({
         ...request,
         requestId: `child:${input.attemptId}:${createHash("sha256")
@@ -1969,19 +1967,16 @@ export class JobStore {
       return {
         child: this.logicalChildFromDatabase(input.childId),
         state,
-        inserted: true,
       };
     });
-    if (result.inserted) {
-      await this.projectState(result.state);
-      await this.projectEvents(jobId);
-      if (result.state.inference)
-        await this.writeArtifact(
-          jobId,
-          "inference-usage.json",
-          `${JSON.stringify(result.state.inference, null, 2)}\n`,
-        );
-    }
+    await this.projectState(result.state);
+    await this.projectEvents(jobId);
+    if (result.state.inference)
+      await this.writeArtifact(
+        jobId,
+        "inference-usage.json",
+        `${JSON.stringify(result.state.inference, null, 2)}\n`,
+      );
     return { child: result.child, state: result.state };
   }
 
@@ -2856,8 +2851,8 @@ export class JobStore {
   ): ChildInferenceLeaseRow | undefined {
     return this.database
       .prepare(
-        `SELECT lease_id, attempt_id, child_id, job_id, token_sha256, status,
-                issued_at, expires_at, revoked_at, revoke_reason
+        `SELECT lease_id, attempt_id, token_sha256, status, issued_at,
+                expires_at, revoked_at, revoke_reason
          FROM child_inference_leases WHERE attempt_id = ?`,
       )
       .get(attemptId) as ChildInferenceLeaseRow | undefined;
@@ -2865,13 +2860,14 @@ export class JobStore {
 
   private childInferenceLeaseFromRow(
     row: ChildInferenceLeaseRow,
+    allocation: ChildInferenceAllocation,
   ): ChildInferenceLeaseRecord {
     return ChildInferenceLeaseRecordSchema.parse({
       schemaVersion: SCHEMA_VERSION,
       leaseId: row.lease_id,
       attemptId: row.attempt_id,
-      childId: row.child_id,
-      jobId: row.job_id,
+      childId: allocation.childId,
+      jobId: allocation.jobId,
       status: row.status,
       issuedAt: row.issued_at,
       expiresAt: row.expires_at,
@@ -3126,7 +3122,12 @@ export class JobStore {
         : {}),
       inferenceAllocation,
       ...(inferenceLeaseRow
-        ? { inferenceLease: this.childInferenceLeaseFromRow(inferenceLeaseRow) }
+        ? {
+            inferenceLease: this.childInferenceLeaseFromRow(
+              inferenceLeaseRow,
+              inferenceAllocation,
+            ),
+          }
         : {}),
       ...(inferenceUsage ? { inferenceUsage } : {}),
       ...(row.terminal_evidence_json

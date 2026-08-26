@@ -409,6 +409,15 @@ async function main(): Promise<void> {
             state = await store.recordInferenceUsage(jobId, record, inference);
           }
         },
+        onLeaseRevoked: async (leaseId, binding, reason) => {
+          if (binding.kind === "child")
+            await store.revokeChildInferenceLease(jobId, {
+              childId: binding.childId,
+              attemptId: binding.attemptId,
+              leaseId,
+              reason,
+            });
+        },
       });
       inferenceLease = await inferenceBroker.createLease(jobId, {
         wallClockMs: request.budget.wallClockMs,

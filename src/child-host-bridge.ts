@@ -198,7 +198,9 @@ export class BoundedRlmHostBridge {
         }
       }
       if (inferenceLease) {
-        await inferenceLease.revoke().catch(() => undefined);
+        await inferenceLease
+          .revoke("native child startup failed")
+          .catch(() => undefined);
         if (leaseRecorded) {
           const tree = await this.store.readChildTree(this.jobId);
           const current = tree?.children.find(
@@ -209,8 +211,6 @@ export class BoundedRlmHostBridge {
               .revokeChildInferenceLease(this.jobId, {
                 childId: envelope.childId,
                 attemptId: current.attempts.at(-1)!.attemptId,
-                expectedChildRevision: current.revision,
-                envelopeDigest: current.envelopeDigest,
                 leaseId: inferenceLease.leaseId,
                 reason: "native child startup failed",
               })

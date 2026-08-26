@@ -75,13 +75,7 @@ export const HostConfigSchema = z
       executable: z.string().min(1),
       releaseArtifact: z.string().min(1),
     }),
-    multiChild: z
-      .object({
-        experimental: z.literal(true),
-        inference: ChildInferencePolicySchema,
-      })
-      .strict()
-      .optional(),
+    multiChild: ChildInferencePolicySchema.optional(),
     retention: RetentionPolicySchema.default(DEFAULT_RETENTION_POLICY),
     repositories: z
       .array(

@@ -198,6 +198,7 @@ test("child usage and retry identity remain separate while job totals count each
     envelope(request.jobId, "retry-usage"),
   );
   const firstAttempt = child.attempts[0];
+  const issuedAt = new Date();
   child = await store.recordChildInferenceLease(request.jobId, {
     childId: child.envelope.childId,
     attemptId: firstAttempt.attemptId,
@@ -205,8 +206,8 @@ test("child usage and retry identity remain separate while job totals count each
     envelopeDigest: child.envelopeDigest,
     leaseId: randomUUID(),
     tokenSha256: digest("opaque-child-token"),
-    issuedAt: "2026-08-26T12:01:00.000Z",
-    expiresAt: "2026-08-26T12:02:00.000Z",
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: new Date(issuedAt.getTime() + 60_000).toISOString(),
   });
   const usage = {
     requestId: "provider-response-1",
@@ -241,8 +242,6 @@ test("child usage and retry identity remain separate while job totals count each
   child = await store.revokeChildInferenceLease(request.jobId, {
     childId: child.envelope.childId,
     attemptId: firstAttempt.attemptId,
-    expectedChildRevision: child.revision,
-    envelopeDigest: child.envelopeDigest,
     leaseId: child.attempts[0].inferenceLease.leaseId,
     reason: "first attempt finished",
   });
@@ -348,6 +347,8 @@ test("child broker leases reject cross-token routes and client model overrides",
     upstream: fake.url,
     accessToken: "provider-secret",
     accountId: "account-secret",
+    onUsageFinalized: async () => {},
+    onLeaseRevoked: async () => {},
   });
   const first = await broker.createLease(
     "broker-job",
@@ -389,6 +390,70 @@ test("child broker leases reject cross-token routes and client model overrides",
   }
 });
 
+test("broker expiry durably revokes the child lease exactly once", async () => {
+  const { store, request } = await fixture("child-lease-expiry");
+  let tree = await store.enableChildTree(
+    request.jobId,
+    DEFAULT_CHILD_TREE_POLICY,
+    policy(),
+  );
+  let child = await store.admitChild(
+    request.jobId,
+    tree.revision,
+    envelope(request.jobId, "expiring-lease"),
+  );
+  const attempt = child.attempts[0];
+  const revoked = deferred();
+  const broker = new ProductionInferenceBroker({
+    upstream: new URL("http://127.0.0.1:1/responses"),
+    accessToken: "unused",
+    accountId: "unused",
+    onUsageFinalized: async () => {},
+    onLeaseRevoked: async (leaseId, binding, reason) => {
+      if (binding.kind !== "child") return;
+      child = await store.revokeChildInferenceLease(request.jobId, {
+        childId: binding.childId,
+        attemptId: binding.attemptId,
+        leaseId,
+        reason,
+      });
+      revoked.resolve();
+    },
+  });
+  const lease = await broker.createLease(
+    request.jobId,
+    { wallClockMs: 200, maxTokens: 200 },
+    childBinding(request.jobId, child.envelope.childId, attempt.attemptId),
+  );
+  child = await store.recordChildInferenceLease(request.jobId, {
+    childId: child.envelope.childId,
+    attemptId: attempt.attemptId,
+    expectedChildRevision: child.revision,
+    envelopeDigest: child.envelopeDigest,
+    leaseId: lease.leaseId,
+    tokenSha256: lease.tokenSha256,
+    issuedAt: new Date(lease.expiresAt.getTime() - 200).toISOString(),
+    expiresAt: lease.expiresAt.toISOString(),
+  });
+  try {
+    await settleWithin(revoked.promise, "the expired lease to be persisted");
+    const persisted = child.attempts[0].inferenceLease;
+    assert.equal(persisted.status, "revoked");
+    assert.equal(persisted.revokeReason, "expired");
+    const revision = child.revision;
+    child = await store.revokeChildInferenceLease(request.jobId, {
+      childId: child.envelope.childId,
+      attemptId: attempt.attemptId,
+      leaseId: lease.leaseId,
+      reason: "duplicate expiry callback",
+    });
+    assert.equal(child.revision, revision);
+  } finally {
+    await broker.close();
+    store.close();
+  }
+});
+
 test("aggregate child concurrency is three and revocation aborts only its lease", async () => {
   const releases = Array.from({ length: 4 }, () => deferred());
   const starts = Array.from({ length: 4 }, () => deferred());
@@ -413,6 +478,8 @@ test("aggregate child concurrency is three and revocation aborts only its lease"
     upstream: fake.url,
     accessToken: "secret",
     accountId: "account",
+    onUsageFinalized: async () => {},
+    onLeaseRevoked: async () => {},
   });
   const leases = await Promise.all(
     Array.from({ length: 4 }, () =>

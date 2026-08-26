@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import {
+  canonicalDigest,
   CONTROL_DATABASE_NAME,
   CONTROL_SCHEMA_VERSION,
   inspectControlMigrations,
@@ -119,6 +120,9 @@ test("schema v7 backfills existing child attempts with immutable inference autho
   const at = "2026-08-26T12:00:00.000Z";
   insertSentinelJob(fixture, jobId);
   fixture
+    .prepare("UPDATE jobs SET request_json = ? WHERE job_id = ?")
+    .run(JSON.stringify({ budget: { maxTokens: 5_000 } }), jobId);
+  fixture
     .prepare(
       `INSERT INTO child_trees(
          job_id, policy_json, policy_sha256, revision, created_at, updated_at
@@ -172,6 +176,23 @@ test("schema v7 backfills existing child attempts with immutable inference autho
   assert.equal(allocation.tokenLimit, 1234);
   assert.equal(allocation.requestLimit, 7);
   assert.equal(allocation.model, "gpt-5.6-sol");
+  const inferencePolicy = JSON.parse(
+    fixture
+      .prepare(
+        "SELECT policy_json FROM child_inference_policies WHERE job_id = ?",
+      )
+      .get(jobId).policy_json,
+  );
+  assert.equal(inferencePolicy.aggregateMaxTokens, 5_000);
+  assert.equal(inferencePolicy.maxTokensPerAttempt, 1_234);
+  assert.equal(
+    fixture
+      .prepare(
+        "SELECT policy_sha256 FROM child_inference_policies WHERE job_id = ?",
+      )
+      .get(jobId).policy_sha256,
+    canonicalDigest(inferencePolicy),
+  );
   assert.equal(
     fixture
       .prepare(

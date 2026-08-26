@@ -20,20 +20,17 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
         releaseArtifact: "/trusted/prime.tgz",
       },
       multiChild: {
+        schemaVersion: 1,
         experimental: true,
-        inference: {
-          schemaVersion: 1,
-          experimental: true,
-          provider: "openai",
-          models: [{ model: "gpt-5.6-sol", reasoning: ["high"] }],
-          aggregateMaxTokens: 1_000,
-          rootReservePercent: 30,
-          maxTokensPerAttempt: 700,
-          maxRequestsPerAttempt: 4,
-          aggregateMaxConcurrency: 3,
-          maxConcurrencyPerAttempt: 1,
-          maxWallClockMsPerAttempt: 60_000,
-        },
+        provider: "openai",
+        models: [{ model: "gpt-5.6-sol", reasoning: ["high"] }],
+        aggregateMaxTokens: 1_000,
+        rootReservePercent: 30,
+        maxTokensPerAttempt: 700,
+        maxRequestsPerAttempt: 4,
+        aggregateMaxConcurrency: 3,
+        maxConcurrencyPerAttempt: 1,
+        maxWallClockMsPerAttempt: 60_000,
       },
       repositories: [
         {
@@ -61,8 +58,8 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
   assert.equal(policy.gates[0].command, "/usr/bin/test");
   assert.equal(policy.fixture, true);
   assert.deepEqual(policy.repoRoots, [root]);
-  assert.equal(policy.multiChild.inference.provider, "openai");
-  assert.deepEqual(policy.multiChild.inference.models, [
+  assert.equal(policy.multiChild.provider, "openai");
+  assert.deepEqual(policy.multiChild.models, [
     { model: "gpt-5.6-sol", reasoning: ["high"] },
   ]);
   await assert.rejects(

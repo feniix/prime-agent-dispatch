@@ -22,9 +22,8 @@ export type InferenceLease = {
   opaqueToken: string;
   tokenSha256: string;
   expiresAt: Date;
-  binding: InferenceLeaseBinding;
   usage(): InferenceUsageLedgerSnapshot;
-  revoke(): Promise<void>;
+  revoke(reason?: string): Promise<void>;
 };
 
 export type InferenceLeaseBinding =
@@ -48,7 +47,6 @@ export type InferenceLeaseBinding =
 
 type LeaseState = {
   leaseId: string;
-  jobId: string;
   token: string;
   expiresAt: number;
   maxTokens: number;
@@ -63,6 +61,7 @@ type LeaseState = {
   controllers: Set<AbortController>;
   idleWaiters: Set<() => void>;
   expiryTimer: NodeJS.Timeout;
+  revocation?: Promise<void>;
 };
 
 type BrokerOptions = {
@@ -75,6 +74,11 @@ type BrokerOptions = {
     record: InferenceRequestUsage,
     snapshot: InferenceUsageLedgerSnapshot,
     binding: InferenceLeaseBinding,
+  ) => Promise<void>;
+  onLeaseRevoked?: (
+    leaseId: string,
+    binding: InferenceLeaseBinding,
+    reason: string,
   ) => Promise<void>;
 };
 
@@ -275,6 +279,7 @@ export class ProductionInferenceBroker {
     rejectedRequests: 0,
     abortedUpstreams: 0,
     usagePersistenceFailures: 0,
+    revocationPersistenceFailures: 0,
     sawStreamingResponse: false,
     sawToolCallEvent: false,
     sawHighReasoning: false,
@@ -310,17 +315,22 @@ export class ProductionInferenceBroker {
     };
     if (binding.jobId !== jobId)
       throw new Error("inference lease binding has the wrong job");
+    if (
+      binding.kind === "child" &&
+      (!this.options.onUsageFinalized || !this.options.onLeaseRevoked)
+    )
+      throw new Error(
+        "child inference leases require durable usage and revocation callbacks",
+      );
     const token = randomBytes(32).toString("base64url");
     const leaseId = randomUUID();
-    const expiryTimer = setTimeout(
-      () => void this.revoke(token),
-      budget.wallClockMs,
-    );
+    const expiryTimer = setTimeout(() => {
+      void this.revoke(token, "expired").catch(() => undefined);
+    }, budget.wallClockMs);
     expiryTimer.unref();
     const maxTokens = budget.maxTokens ?? Number.MAX_SAFE_INTEGER;
     const state: LeaseState = {
       leaseId,
-      jobId,
       token,
       expiresAt: Date.now() + budget.wallClockMs,
       maxTokens,
@@ -346,9 +356,8 @@ export class ProductionInferenceBroker {
       opaqueToken: token,
       tokenSha256: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(state.expiresAt),
-      binding,
       usage: () => state.ledger.snapshot(),
-      revoke: async () => this.revoke(token),
+      revoke: async (reason = "revoked") => this.revoke(token, reason),
     };
   }
 
@@ -357,7 +366,11 @@ export class ProductionInferenceBroker {
   }
 
   async close(): Promise<void> {
-    for (const token of this.leases.keys()) await this.revoke(token);
+    await Promise.all(
+      [...this.leases.keys()].map((token) =>
+        this.revoke(token, "broker closed"),
+      ),
+    );
     if (this.server.listening)
       await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
@@ -370,13 +383,17 @@ export class ProductionInferenceBroker {
     await this.listening;
   }
 
-  private async revoke(token: string): Promise<void> {
+  private async revoke(token: string, reason: string): Promise<void> {
     const lease = this.leases.get(token);
     if (!lease) return;
-    if (lease.revoked) {
-      await this.waitForIdle(lease);
-      return;
-    }
+    lease.revocation ??= this.finishRevocation(lease, reason);
+    await lease.revocation;
+  }
+
+  private async finishRevocation(
+    lease: LeaseState,
+    reason: string,
+  ): Promise<void> {
     clearTimeout(lease.expiryTimer);
     lease.revoked = true;
     for (const controller of lease.controllers) {
@@ -384,7 +401,15 @@ export class ProductionInferenceBroker {
       controller.abort();
     }
     await this.waitForIdle(lease);
-    if (this.leases.get(token) === lease) this.leases.delete(token);
+    try {
+      await this.options.onLeaseRevoked?.(lease.leaseId, lease.binding, reason);
+    } catch (error) {
+      this.counters.revocationPersistenceFailures += 1;
+      throw error;
+    } finally {
+      if (this.leases.get(lease.token) === lease)
+        this.leases.delete(lease.token);
+    }
   }
 
   private async waitForIdle(lease: LeaseState): Promise<void> {

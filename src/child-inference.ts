@@ -149,6 +149,12 @@ export const ChildInferenceLeaseRecordSchema = z
   })
   .strict()
   .superRefine((lease, context) => {
+    if (lease.expiresAt <= lease.issuedAt)
+      context.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "child inference lease must expire after issuance",
+      });
     if ((lease.status === "revoked") !== Boolean(lease.revokedAt))
       context.addIssue({
         code: "custom",
