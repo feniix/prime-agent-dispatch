@@ -1062,6 +1062,7 @@ export class JobStore {
              ON integration.attempt_id = attempt.attempt_id
            WHERE child.job_id = ?
              AND child.wave < ?
+             AND child.decision != 'discarded'
              AND attempt.ordinal = (
                SELECT MAX(latest.ordinal) FROM child_attempts AS latest
                WHERE latest.child_id = child.child_id
@@ -1138,17 +1139,24 @@ export class JobStore {
       )
         throw new Error("child worktree repository changed after admission");
       if (
+        envelope.worktree.worktreePath !==
+        childWorktreePath(this.root, jobId, input.childId)
+      )
+        throw new Error(
+          "admitted child worktree path is outside its owned path",
+        );
+      if (
         identity.worktreePath !==
-          childWorktreePath(this.root, jobId, input.childId, attempt.ordinal) ||
-        (attempt.ordinal === 1 &&
-          identity.worktreePath !== envelope.worktree.worktreePath)
+        childWorktreePath(this.root, jobId, input.childId, attempt.ordinal)
       )
         throw new Error("child worktree path is outside its owned path");
       if (
+        envelope.worktree.branchName !== childBranchName(jobId, input.childId)
+      )
+        throw new Error("admitted child branch is outside its owned namespace");
+      if (
         identity.branchName !==
-          childBranchName(jobId, input.childId, attempt.ordinal) ||
-        (attempt.ordinal === 1 &&
-          identity.branchName !== envelope.worktree.branchName)
+        childBranchName(jobId, input.childId, attempt.ordinal)
       )
         throw new Error("child branch does not match its owned branch");
       if (
@@ -1218,8 +1226,8 @@ export class JobStore {
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.attempt_id !== input.attemptId)
         throw new Error("child attempt is stale");
-      if (attempt.status !== "active" && attempt.status !== "succeeded")
-        throw new Error("only active or successful attempts may propose work");
+      if (attempt.status !== "active")
+        throw new Error("only active attempts may propose work");
       if (
         proposal.jobId !== jobId ||
         proposal.childId !== input.childId ||
@@ -1289,7 +1297,7 @@ export class JobStore {
       startedAt: input.startedAt,
     });
     this.transaction("begin_child_integration", () => {
-      this.assertChildMutation(jobId, input);
+      const child = this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (
         attempt.attempt_id !== input.attemptId ||
@@ -1298,6 +1306,17 @@ export class JobStore {
         throw new Error(
           "only the successful current child attempt may integrate",
         );
+      if (child.decision !== "pending")
+        throw new Error("only a pending child proposal may integrate");
+      if (
+        this.database
+          .prepare(
+            `SELECT 1 FROM child_integrations
+             WHERE job_id = ? AND status = 'applying' LIMIT 1`,
+          )
+          .get(jobId)
+      )
+        throw new Error("another child integration is already applying");
       const proposal = this.childProposalRow(input.attemptId);
       if ((proposal.proposal_sha ?? undefined) !== integration.proposalSha)
         throw new Error("child integration proposal SHA changed");
@@ -1462,19 +1481,18 @@ export class JobStore {
         const dependency = this.logicalChildRow(dependencyId, false);
         if (!dependency || dependency.job_id !== jobId)
           throw new Error("child dependency has the wrong parent");
+        if (dependency.decision === "discarded")
+          throw new Error("child dependency was discarded by the root");
         const dependencyEnvelope = ChildSpawnEnvelopeSchema.parse(
           parseSqliteJson(dependency.envelope_json, "child spawn envelope"),
         );
         if (dependencyEnvelope.wave >= envelope.wave)
           throw new Error("child dependency cycle or invalid dependency wave");
-        if (
-          this.currentChildAttemptFromDatabase(dependency.child_id).status !==
-          "succeeded"
-        )
-          throw new Error("child dependencies must succeed before admission");
         const dependencyAttempt = this.currentChildAttemptFromDatabase(
           dependency.child_id,
         );
+        if (dependencyAttempt.status !== "succeeded")
+          throw new Error("child dependencies must succeed before admission");
         const proposal = this.childProposalRow(
           dependencyAttempt.attempt_id,
           false,
@@ -1782,19 +1800,34 @@ export class JobStore {
     await this.ensureImported(jobId);
     const now = new Date().toISOString();
     const child = this.transaction("decide_child_result", () => {
-      this.assertChildMutation(jobId, input);
-      const status = this.currentChildAttemptFromDatabase(input.childId).status;
-      if (input.decision === "selected" && status !== "succeeded")
-        throw new Error("only a successful child result may be selected");
-      if (input.decision === "discarded" && status !== "cancelled")
-        throw new Error("discarded children require terminal cancellation");
+      const row = this.assertChildMutation(jobId, input);
+      if (row.decision !== "pending")
+        throw new Error("child result already has a terminal decision");
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (input.decision === "selected" && attempt.status !== "succeeded")
+        throw new Error("only a successful child result may be selected");
       const proposal = this.childProposalRow(attempt.attempt_id, false);
+      const integration = this.childIntegrationRow(attempt.attempt_id, false);
+      if (
+        input.decision === "discarded" &&
+        attempt.status !== "cancelled" &&
+        attempt.status !== "succeeded"
+      )
+        throw new Error(
+          "only cancelled or successful child results may be discarded",
+        );
+      if (
+        input.decision === "discarded" &&
+        integration &&
+        integration.status !== "conflicted"
+      )
+        throw new Error(
+          "applying or integrated child proposals cannot be discarded",
+        );
       if (
         input.decision === "selected" &&
         proposal &&
-        this.childIntegrationRow(attempt.attempt_id, false)?.status !==
-          "integrated"
+        integration?.status !== "integrated"
       )
         throw new Error("child proposal must be integrated before selection");
       this.database
@@ -2810,6 +2843,7 @@ export class JobStore {
            LEFT JOIN child_integrations AS integration
              ON integration.attempt_id = attempt.attempt_id
            WHERE child.job_id = ?
+             AND child.decision != 'discarded'
              AND attempt.status = 'succeeded'
              AND attempt.ordinal = (
                SELECT MAX(latest.ordinal) FROM child_attempts AS latest

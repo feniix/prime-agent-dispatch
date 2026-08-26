@@ -21,7 +21,9 @@ directory substitution. A proposal is an immutable record containing its
 outcome, base, commit when applicable, and a bounded binary-safe base-to-HEAD
 patch with its digest. Recording it does not alter the root branch. The patch
 remains authoritative SQLite evidence after Git cleanup removes the proposal's
-last branch reference.
+last branch reference. Writable proposal history must be linear; merge commits
+are rejected before integration because replaying them would require an
+unreviewed mainline choice.
 
 ## Root-owned integration
 
@@ -34,13 +36,15 @@ application records the new root HEAD and selects the child result.
 Conflicts are terminal integration evidence, not an implicit merge. The
 coordinator records bounded conflict paths and an error summary, restores the
 exact pre-integration root commit, leaves the child proposal intact, and keeps
-the result pending for root resolution. An `applying` record left by a crash is
-deliberately fail-closed; recovery must reconcile durable evidence with Git
-before another integration is attempted.
+the result pending for root resolution. The root may explicitly discard a
+successful proposal that it chose not to integrate or that reached a terminal
+conflict; applying and integrated proposals cannot be relabeled. An `applying`
+record left by a crash is deliberately fail-closed; recovery must reconcile
+durable evidence with Git before another integration is attempted.
 
 Successful `no_change` and `read_only` proposals complete an integration record
 with the unchanged root HEAD. Trusted verification cannot start while a current
-successful child proposal is unintegrated.
+successful child proposal is neither integrated nor explicitly discarded.
 
 ## Dependency waves and cleanup
 
