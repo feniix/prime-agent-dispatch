@@ -1,6 +1,7 @@
 export * from "./agent.js";
 export * from "./cleanup.js";
 export * from "./children.js";
+export * from "./child-inference.js";
 export * from "./child-host-bridge.js";
 export * from "./child-git.js";
 export * from "./dispatcher.js";

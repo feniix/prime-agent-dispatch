@@ -3,6 +3,12 @@ import { join } from "node:path";
 import canonicalize from "canonicalize";
 import { z } from "zod";
 import { BudgetSchema, SCHEMA_VERSION } from "./schemas.js";
+import {
+  ChildInferenceAllocationSchema,
+  ChildInferenceLeaseRecordSchema,
+  ChildInferencePolicySchema,
+  ChildInferenceUsageSnapshotSchema,
+} from "./child-inference.js";
 
 export const CHILD_TREE_MAX_CHILDREN = 5 as const;
 export const CHILD_TREE_MAX_ACTIVE = 3 as const;
@@ -272,6 +278,9 @@ export const ChildAttemptSchema = z
     worktree: ChildWorktreeIdentitySchema.optional(),
     proposal: ChildProposalSchema.optional(),
     integration: ChildIntegrationSchema.optional(),
+    inferenceAllocation: ChildInferenceAllocationSchema,
+    inferenceLease: ChildInferenceLeaseRecordSchema.optional(),
+    inferenceUsage: ChildInferenceUsageSnapshotSchema.optional(),
     terminalEvidence: ChildTerminalEvidenceSchema.optional(),
   })
   .strict();
@@ -298,6 +307,8 @@ export const ChildTreeSnapshotSchema = z
     jobId: z.string().min(1),
     policy: ChildTreePolicySchema,
     policyDigest: DigestSchema,
+    inferencePolicy: ChildInferencePolicySchema,
+    inferencePolicyDigest: DigestSchema,
     revision: z.number().int().nonnegative(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),

@@ -109,6 +109,89 @@ for (
   });
 }
 
+test("schema v7 backfills existing child attempts with immutable inference authority", async () => {
+  const root = await temporaryRoot("v7-child-inference");
+  const fixture = databaseAt(root);
+  migrateControlDatabase(fixture, { targetVersion: 7 });
+  const jobId = "fixture-v7-child";
+  const childId = "11111111-1111-4111-8111-111111111111";
+  const attemptId = "22222222-2222-4222-8222-222222222222";
+  const at = "2026-08-26T12:00:00.000Z";
+  insertSentinelJob(fixture, jobId);
+  fixture
+    .prepare(
+      `INSERT INTO child_trees(
+         job_id, policy_json, policy_sha256, revision, created_at, updated_at
+       ) VALUES (?, '{}', ?, 0, ?, ?)`,
+    )
+    .run(jobId, "a".repeat(64), at, at);
+  fixture
+    .prepare(
+      `INSERT INTO logical_children(
+         child_id, job_id, name, envelope_json, envelope_sha256, criticality,
+         wave, decision, revision, created_at, updated_at
+       ) VALUES (?, ?, 'legacy-child', ?, ?, 'required', 1, 'pending', 0, ?, ?)`,
+    )
+    .run(
+      childId,
+      jobId,
+      JSON.stringify({
+        budget: { maxTokens: 1234, maxTurns: 7, wallClockMs: 45_000 },
+      }),
+      "b".repeat(64),
+      at,
+      at,
+    );
+  fixture
+    .prepare(
+      `INSERT INTO child_attempts(
+         attempt_id, child_id, job_id, ordinal, previous_attempt_id, status,
+         inference_json, native_child_id, native_handle_json, started_at,
+         completed_at, terminal_evidence_json
+       ) VALUES (?, ?, ?, 1, NULL, 'active', ?, NULL, NULL, ?, NULL, NULL)`,
+    )
+    .run(
+      attemptId,
+      childId,
+      jobId,
+      JSON.stringify({
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        reasoning: "high",
+      }),
+      at,
+    );
+  migrateControlDatabase(fixture);
+  const allocation = JSON.parse(
+    fixture
+      .prepare(
+        "SELECT allocation_json FROM child_inference_allocations WHERE attempt_id = ?",
+      )
+      .get(attemptId).allocation_json,
+  );
+  assert.equal(allocation.tokenLimit, 1234);
+  assert.equal(allocation.requestLimit, 7);
+  assert.equal(allocation.model, "gpt-5.6-sol");
+  assert.equal(
+    fixture
+      .prepare(
+        "SELECT COUNT(*) AS count FROM child_inference_policies WHERE job_id = ?",
+      )
+      .get(jobId).count,
+    1,
+  );
+  assert.throws(
+    () =>
+      fixture
+        .prepare(
+          "UPDATE child_inference_allocations SET token_limit = 1 WHERE attempt_id = ?",
+        )
+        .run(attemptId),
+    /allocation is immutable/,
+  );
+  fixture.close();
+});
+
 test("concurrent startup records each migration exactly once", async () => {
   const root = await temporaryRoot("concurrent");
   const moduleUrl = pathToFileURL(join(repositoryRoot, "dist/index.js")).href;

@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -17,18 +17,45 @@ import {
 } from "./schemas.js";
 
 export type InferenceLease = {
+  leaseId: string;
   endpoint: URL;
   opaqueToken: string;
+  tokenSha256: string;
   expiresAt: Date;
+  binding: InferenceLeaseBinding;
   usage(): InferenceUsageLedgerSnapshot;
   revoke(): Promise<void>;
 };
 
+export type InferenceLeaseBinding =
+  | {
+      kind: "root";
+      jobId: string;
+      provider: string;
+      model: string;
+      reasoning: string;
+    }
+  | {
+      kind: "child";
+      jobId: string;
+      childId: string;
+      attemptId: string;
+      provider: string;
+      model: string;
+      reasoning: string;
+      aggregateConcurrencyLimit: number;
+    };
+
 type LeaseState = {
+  leaseId: string;
   jobId: string;
   token: string;
   expiresAt: number;
   maxTokens: number;
+  maxRequests: number;
+  maxConcurrency: number;
+  requestCount: number;
+  binding: InferenceLeaseBinding;
   ledger: InferenceUsageLedger;
   persistedUsageIds: Set<string>;
   active: number;
@@ -47,6 +74,7 @@ type BrokerOptions = {
   onUsageFinalized?: (
     record: InferenceRequestUsage,
     snapshot: InferenceUsageLedgerSnapshot,
+    binding: InferenceLeaseBinding,
   ) => Promise<void>;
 };
 
@@ -197,11 +225,18 @@ async function readBounded(
 
 export function normalizeCodexResponsesBody(
   value: unknown,
+  pin: { model: string; reasoning: string } = {
+    model: "gpt-5.6-sol",
+    reasoning: "high",
+  },
+  rejectOverrides = false,
 ): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("request body must be a JSON object");
   const body = { ...(value as Record<string, unknown>) };
-  body.model = "gpt-5.6-sol";
+  if (rejectOverrides && body.model !== undefined && body.model !== pin.model)
+    throw new Error("request model does not match the pinned lease");
+  body.model = pin.model;
   body.stream = true;
   body.store = false;
   delete body.temperature;
@@ -211,9 +246,15 @@ export function normalizeCodexResponsesBody(
     body.reasoning && typeof body.reasoning === "object"
       ? (body.reasoning as Record<string, unknown>)
       : {};
+  if (
+    rejectOverrides &&
+    reasoning.effort !== undefined &&
+    reasoning.effort !== pin.reasoning
+  )
+    throw new Error("request reasoning does not match the pinned lease");
   body.reasoning = {
     ...reasoning,
-    effort: "high",
+    effort: pin.reasoning,
     summary: reasoning.summary ?? "auto",
   };
   const include = Array.isArray(body.include) ? body.include : [];
@@ -251,10 +292,26 @@ export class ProductionInferenceBroker {
 
   async createLease(
     jobId: string,
-    budget: { wallClockMs: number; maxTokens?: number },
+    budget: {
+      wallClockMs: number;
+      maxTokens?: number;
+      maxRequests?: number;
+      maxConcurrency?: number;
+    },
+    bindingValue?: InferenceLeaseBinding,
   ): Promise<InferenceLease> {
     await this.listen();
+    const binding: InferenceLeaseBinding = bindingValue ?? {
+      kind: "root",
+      jobId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      reasoning: "high",
+    };
+    if (binding.jobId !== jobId)
+      throw new Error("inference lease binding has the wrong job");
     const token = randomBytes(32).toString("base64url");
+    const leaseId = randomUUID();
     const expiryTimer = setTimeout(
       () => void this.revoke(token),
       budget.wallClockMs,
@@ -262,10 +319,15 @@ export class ProductionInferenceBroker {
     expiryTimer.unref();
     const maxTokens = budget.maxTokens ?? Number.MAX_SAFE_INTEGER;
     const state: LeaseState = {
+      leaseId,
       jobId,
       token,
       expiresAt: Date.now() + budget.wallClockMs,
       maxTokens,
+      maxRequests: budget.maxRequests ?? Number.MAX_SAFE_INTEGER,
+      maxConcurrency: budget.maxConcurrency ?? this.maxConcurrency,
+      requestCount: 0,
+      binding,
       ledger: new InferenceUsageLedger(maxTokens),
       persistedUsageIds: new Set(),
       active: 0,
@@ -277,9 +339,14 @@ export class ProductionInferenceBroker {
     this.leases.set(token, state);
     const address = this.server.address() as AddressInfo;
     return {
-      endpoint: new URL(`http://127.0.0.1:${address.port}/v1/`),
+      leaseId,
+      endpoint: new URL(
+        `http://127.0.0.1:${address.port}/v1/leases/${leaseId}/`,
+      ),
       opaqueToken: token,
+      tokenSha256: createHash("sha256").update(token).digest("hex"),
       expiresAt: new Date(state.expiresAt),
+      binding,
       usage: () => state.ledger.snapshot(),
       revoke: async () => this.revoke(token),
     };
@@ -329,7 +396,10 @@ export class ProductionInferenceBroker {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    if (request.method !== "POST" || request.url !== "/v1/responses") {
+    const route = request.url?.match(
+      /^\/v1\/leases\/([0-9a-f-]{36})\/responses$/,
+    );
+    if (request.method !== "POST" || !route) {
       jsonError(response, 404, "not found");
       return;
     }
@@ -338,7 +408,12 @@ export class ProductionInferenceBroker {
       ? authorization.slice(7)
       : "";
     const lease = this.leases.get(token);
-    if (!lease || lease.revoked || Date.now() >= lease.expiresAt) {
+    if (
+      !lease ||
+      lease.leaseId !== route[1] ||
+      lease.revoked ||
+      Date.now() >= lease.expiresAt
+    ) {
       this.counters.rejectedRequests += 1;
       jsonError(response, 401, "invalid, expired, or revoked job token");
       return;
@@ -356,9 +431,14 @@ export class ProductionInferenceBroker {
     }
     let body: Record<string, unknown>;
     try {
-      body = normalizeCodexResponsesBody(JSON.parse(raw.toString("utf8")));
+      const parsed = JSON.parse(raw.toString("utf8"));
+      body = normalizeCodexResponsesBody(
+        parsed,
+        { model: lease.binding.model, reasoning: lease.binding.reasoning },
+        lease.binding.kind === "child",
+      );
     } catch {
-      jsonError(response, 400, "invalid JSON request body");
+      jsonError(response, 400, "invalid or unpinned JSON request body");
       return;
     }
     if (lease.revoked || Date.now() >= lease.expiresAt) {
@@ -368,7 +448,11 @@ export class ProductionInferenceBroker {
     }
     if (
       lease.ledger.snapshot().observedUsage.totalTokens >= lease.maxTokens ||
-      lease.active >= this.maxConcurrency
+      lease.requestCount >= lease.maxRequests ||
+      lease.active >= lease.maxConcurrency ||
+      (lease.binding.kind === "child" &&
+        this.activeChildRequests(lease.binding.jobId) >=
+          lease.binding.aggregateConcurrencyLimit)
     ) {
       this.counters.rejectedRequests += 1;
       jsonError(response, 429, "job inference budget or concurrency exceeded");
@@ -379,6 +463,7 @@ export class ProductionInferenceBroker {
     const controller = new AbortController();
     lease.controllers.add(controller);
     lease.active += 1;
+    lease.requestCount += 1;
     this.counters.authorizedRequests += 1;
     request.once("aborted", () => controller.abort());
     response.once("close", () => {
@@ -401,6 +486,7 @@ export class ProductionInferenceBroker {
           await this.options.onUsageFinalized(
             finalized,
             lease.ledger.snapshot(),
+            lease.binding,
           );
           lease.persistedUsageIds.add(finalized.requestId);
         } catch (error) {
@@ -538,5 +624,17 @@ export class ProductionInferenceBroker {
         lease.idleWaiters.clear();
       }
     }
+  }
+
+  private activeChildRequests(jobId: string): number {
+    let active = 0;
+    for (const lease of this.leases.values())
+      if (
+        !lease.revoked &&
+        lease.binding.kind === "child" &&
+        lease.binding.jobId === jobId
+      )
+        active += lease.active;
+    return active;
   }
 }
