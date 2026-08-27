@@ -78,8 +78,8 @@ usage.
   still requires both a selected host repository and hash-bound operator
   confirmation. Trusted host policy can explicitly opt out with
   `multiChild: false`.
-- The SDK is loaded from the pinned installed Prime artifact only for this
-  experimental path. Complete dependency-tree integrity remains issue #2.
+- The SDK now loads from the complete checksum-pinned runtime implemented by
+  issue #2.
 - Current-user execution is not filesystem, process, or network containment.
   Issues #3 and #12 still block broader selected-repository rollout.
 - The broker can stop admitting new requests at the observed aggregate or

@@ -75,6 +75,7 @@ Final local evidence on 2026-08-21:
 - Cleanup is an explicit operator action; it is not a background scheduler.
 - The minimum evidence set can exceed the configured byte ceiling. Cleanup
   reports the deficit and refuses silent evidence loss.
-- Selected real-repository rollout still depends on the self-contained pinned
-  Prime runtime and an explicit operator decision.
+- The self-contained pinned Prime runtime formerly required for selected
+  real-repository rollout is now implemented; rollout still requires an
+  explicit operator decision.
 - OS filesystem, process, and network containment remain deferred.

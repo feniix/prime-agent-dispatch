@@ -26,17 +26,11 @@ integration boundary.
   reviewed confirmation hash.
 - Cancellation IPC waits for the configured grace period plus a bounded
   escalation margin, and result reads reconcile terminal intent first.
+- Prime launches only from a self-contained platform-specific runtime whose
+  complete manifest, dependency tree, host identity, and artifact digest are
+  verified before atomic publication.
 
 ## Deferred issue candidates
-
-### [Build a self-contained checksum-pinned Prime runtime](https://github.com/feniix/prime-dispatch-prototype/issues/2)
-
-The official Prime Agent `0.7.2` archive is checksum-pinned, and the configured
-entrypoint is checked separately. The official archive does not contain its
-runtime `node_modules`, however, so this does not verify every file loaded by
-Node. A follow-up must produce and pin a platform-specific dependency artifact,
-copy both artifacts into private storage before hashing, extract into a new
-private directory, and run a full startup smoke test from that directory.
 
 ### [Add OS-level containment for enforceable network and process policy](https://github.com/feniix/prime-dispatch-prototype/issues/3)
 

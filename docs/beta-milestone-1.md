@@ -2,7 +2,7 @@
 
 Verdict: **COMPLETE for the disposable-fixture CLI scope**.
 
-The milestone connects the existing detached JSON/Zod control plane to Prime Agent `0.7.2`, the Codex subscription through OpenClaw's public auth runtime, a scoped production inference broker, trusted host repository policy, immutable confirmation, local worktree/gates/commit/report, and bounded cancellation. The official release archive and configured Prime entrypoint are checksum-checked. The upstream archive omits runtime dependencies, so complete loaded dependency-tree integrity remains deferred. It does not install the later Discord/OpenClaw adapter and does not claim host containment.
+The milestone connected the existing detached JSON/Zod control plane to Prime Agent `0.7.2`, the Codex subscription through OpenClaw's public auth runtime, a scoped production inference broker, trusted host repository policy, immutable confirmation, local worktree/gates/commit/report, and bounded cancellation. At milestone close, the official release archive and configured Prime entrypoint were checksum-checked while complete loaded dependency-tree integrity remained deferred. Issue #2 later replaced that path with the self-contained Prime 0.8.0 runtime. This milestone did not install the later Discord/OpenClaw adapter and did not claim host containment.
 
 ## Implemented flow
 
@@ -63,7 +63,9 @@ A final adversarial review produced additional RED/GREEN slices before integrati
 - Unsafe-local current-user execution is not a sandbox and retains normal host networking.
 - Git remote blocking and a hard single-process/root boundary cannot be enforced by environment variables while Prime has IPython and normal host networking.
 - Token usage is observable only after an upstream response, so one response can overshoot remaining budget and aborted usage can be absent.
-- The official Prime archive lacks runtime dependencies; a separately checksum-pinned self-contained runtime is required for complete launch integrity.
+- The official Prime archive lacked runtime dependencies; the separately
+  checksum-pinned self-contained runtime required for complete launch integrity
+  is now implemented by issue #2.
 - Worker death is preserved as interrupted; automatic transcript resume is deferred.
 - The Discord/OpenClaw adapter and editable status card are outside Milestone 1.
 - Storage quota/eviction and container execution remain later milestones.
