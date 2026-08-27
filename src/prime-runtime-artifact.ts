@@ -595,7 +595,12 @@ async function verifyPublishedRuntime(
   const canonicalPublication = await realpath(publication);
   for (const [archivePath, entry] of expected) {
     signal?.throwIfAborted();
+    const archiveEntry = archiveEntries.get(archivePath);
+    const expectedType = entry.type === "directory" ? "Directory" : "File";
+    if (archiveEntry?.type !== expectedType || archiveEntry.mode !== entry.mode)
+      throw new Error(`Prime runtime archive metadata mismatch: ${entry.path}`);
     const path = join(publication, ...archivePath.split("/"));
+    if (allowLinkCreation) await chmod(path, entry.mode);
     const metadata = await lstat(path);
     const canonical = await realpath(path);
     if (!contained(canonicalPublication, canonical))
@@ -802,6 +807,8 @@ export async function preparePrimeRuntime(options: {
     });
     options.signal?.throwIfAborted();
     const manifestPath = join(publication, "prime-runtime-manifest.json");
+    await chmod(manifestPath, 0o644);
+    await chmod(join(publication, "runtime"), 0o755);
     const manifestMetadata = await lstat(manifestPath);
     if (
       !manifestMetadata.isFile() ||

@@ -16,6 +16,10 @@ import {
   type OpenClawLifecycleDependencies,
   type OpenClawPluginConfig,
 } from "./openclaw-install.js";
+import {
+  buildOpenClawPackage,
+  installOpenClawPackage,
+} from "./openclaw-package.js";
 
 const execFileAsync = promisify(execFile);
 const defaultSourceRoot = resolve(
@@ -103,6 +107,12 @@ function dependencies(options: CommonOptions): OpenClawLifecycleDependencies {
           env: process.env,
         },
       );
+    },
+    async readOpenClawVersion() {
+      const { stdout, stderr } = await runOpenClaw(["--version"]);
+      const match = `${stdout}\n${stderr}`.match(/\b(\d{4}\.\d+\.\d+)\b/);
+      if (!match) throw new Error("could not determine OpenClaw version");
+      return match[1]!;
     },
     async readConfigValue(path) {
       try {
@@ -227,6 +237,112 @@ withCommonOptions(
           hostConfigSource: options.hostConfigSource,
           ...(options.stateSource ? { stateSource: options.stateSource } : {}),
           ...(options.releaseId ? { releaseId: options.releaseId } : {}),
+          restartGateway: Boolean(options.restartGateway),
+          ...pluginConfig(options),
+        },
+        dependencies(options),
+      ),
+    );
+  },
+);
+
+program
+  .command("package-build")
+  .description(
+    "build a checksum-manifested online or offline deployment package",
+  )
+  .requiredOption("--variant <variant>", "online or offline", (value) => {
+    if (value !== "online" && value !== "offline")
+      throw new Error("package variant must be online or offline");
+    return value;
+  })
+  .requiredOption("--source-commit <sha>", "full source Git commit SHA")
+  .requiredOption("--openclaw-version <version>")
+  .requiredOption("--release-id <id>")
+  .requiredOption(
+    "--prime-runtime <path>",
+    "verified target-native Prime runtime",
+  )
+  .requiredOption("--prime-runtime-sha256 <digest>")
+  .option("--prime-runtime-url <url>", "HTTPS runtime URL for online packages")
+  .option("--source-root <path>", "built repository root", defaultSourceRoot)
+  .requiredOption("--output <path>")
+  .action(
+    async (options: {
+      variant: "online" | "offline";
+      sourceCommit: string;
+      openclawVersion: string;
+      releaseId: string;
+      primeRuntime: string;
+      primeRuntimeSha256: string;
+      primeRuntimeUrl?: string;
+      sourceRoot: string;
+      output: string;
+    }) => {
+      const { stdout: sourceHead } = await execFileAsync(
+        "git",
+        ["-C", options.sourceRoot, "rev-parse", "HEAD"],
+        {
+          encoding: "utf8",
+          timeout: 30_000,
+          maxBuffer: 64 * 1024,
+        },
+      );
+      if (sourceHead.trim() !== options.sourceCommit)
+        throw new Error(
+          `source commit mismatch: expected ${options.sourceCommit}, got ${sourceHead.trim()}`,
+        );
+      const built = await buildOpenClawPackage({
+        variant: options.variant,
+        sourceRoot: options.sourceRoot,
+        sourceCommit: options.sourceCommit,
+        openclawVersion: options.openclawVersion,
+        releaseId: options.releaseId,
+        primeRuntimeArtifact: options.primeRuntime,
+        primeRuntimeSha256: options.primeRuntimeSha256,
+        ...(options.primeRuntimeUrl
+          ? { primeRuntimeUrl: options.primeRuntimeUrl }
+          : {}),
+        output: options.output,
+      });
+      print({
+        artifactPath: built.artifactPath,
+        artifactSha256: built.artifactSha256,
+        manifestSha256: built.manifestSha256,
+        variant: built.manifest.variant,
+        releaseId: built.manifest.releaseId,
+        target: built.manifest.target,
+        prime: built.manifest.prime,
+        entryCount: built.manifest.entries.length,
+      });
+    },
+  );
+
+withCommonOptions(
+  program
+    .command("package-install")
+    .description("verify and install a local deployment package")
+    .requiredOption("--package <path>")
+    .requiredOption("--package-sha256 <digest>")
+    .requiredOption("--host-config-source <path>")
+    .option("--state-source <path>", "one-time state migration source"),
+).action(
+  async (
+    options: CommonOptions & {
+      package: string;
+      packageSha256: string;
+      hostConfigSource: string;
+      stateSource?: string;
+    },
+  ) => {
+    print(
+      await installOpenClawPackage(
+        {
+          openclawStateDir: options.openclawStateDir,
+          packagePath: options.package,
+          packageSha256: options.packageSha256,
+          hostConfigSource: options.hostConfigSource,
+          ...(options.stateSource ? { stateSource: options.stateSource } : {}),
           restartGateway: Boolean(options.restartGateway),
           ...pluginConfig(options),
         },

@@ -11,6 +11,7 @@ export * from "./inference.js";
 export * from "./lease.js";
 export * from "./openclaw-auth.js";
 export * from "./openclaw-install.js";
+export * from "./openclaw-package.js";
 export * from "./policy.js";
 export * from "./prime-runtime.js";
 export * from "./prime-runtime-artifact.js";

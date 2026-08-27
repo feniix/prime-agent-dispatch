@@ -72,6 +72,46 @@ node dist/openclaw-host.js install \
   --restart-gateway
 ```
 
+## Build deployment packages
+
+Build the repository and plugin first. The offline builder performs fresh lockfile-pinned production installs in private staging; it does not copy the checkout's development dependencies. The supplied Prime runtime is fully prepared and supplies the package target identity, so package each target on its native builder.
+
+```bash
+corepack pnpm run build
+corepack pnpm run test:adapter
+
+node dist/openclaw-host.js package-build \
+  --variant offline \
+  --source-commit "$(git rev-parse HEAD)" \
+  --openclaw-version 2026.7.1 \
+  --release-id <release-id> \
+  --prime-runtime <target-runtime.tgz> \
+  --prime-runtime-sha256 <runtime-sha256> \
+  --output <offline-package.tgz>
+
+node dist/openclaw-host.js package-build \
+  --variant online \
+  --source-commit "$(git rev-parse HEAD)" \
+  --openclaw-version 2026.7.1 \
+  --release-id <release-id> \
+  --prime-runtime <target-runtime.tgz> \
+  --prime-runtime-sha256 <runtime-sha256> \
+  --prime-runtime-url <https-runtime-url> \
+  --output <online-package.tgz>
+```
+
+The emitted JSON includes the mandatory archive SHA-256. Preserve it outside the archive. Install either variant through the same lifecycle:
+
+```bash
+node dist/openclaw-host.js package-install \
+  --package <package.tgz> \
+  --package-sha256 <package-sha256> \
+  --host-config-source <host-policy.json> \
+  --openclaw-state-dir "$OPENCLAW_STATE_DIR"
+```
+
+The installer rejects target OS, architecture, or exact Node-version mismatches. Online packages install production dependencies and fetch the checksum-pinned Prime runtime. Offline packages perform neither operation. Both copy the runtime into the immutable release and rewrite host policy to `prime-dispatch/current/prime/runtime.tgz`.
+
 On the first durable installation only, migrate an existing state directory:
 
 ```bash

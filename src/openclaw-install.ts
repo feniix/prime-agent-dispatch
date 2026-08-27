@@ -101,6 +101,7 @@ export type OpenClawPluginConfig = {
 
 export type OpenClawLifecycleDependencies = {
   installProductionDependencies(path: string): Promise<void>;
+  readOpenClawVersion(): Promise<string>;
   readConfigValue(path: string): Promise<unknown>;
   applyConfigPatch(
     patch: Record<string, unknown>,
@@ -123,6 +124,8 @@ export type InstallOpenClawOptions = PlanOpenClawInstallOptions & {
   hostConfigSource: string;
   stateSource?: string;
   restartGateway?: boolean;
+  dependencyMode?: "install" | "vendored";
+  primeRuntimeSource?: string;
 };
 
 export type ActiveOpenClawOptions = OpenClawPluginConfig & {
@@ -150,6 +153,7 @@ type ReleaseMetadata = {
   releaseId: string;
   sourceDigest: string;
   publishedDigest?: string;
+  managedPrimeRuntimeSha256?: string;
   preparedAt: string;
 };
 
@@ -232,7 +236,16 @@ export async function installOpenClaw(
   const releaseLock = await acquireInstallLock(layout);
   try {
     const sourceRoot = await realpath(options.sourceRoot);
-    const sourceDigest = await digestReleaseSource(sourceRoot);
+    const primeRuntimeSource = options.primeRuntimeSource
+      ? await realpath(options.primeRuntimeSource)
+      : undefined;
+    const managedPrimeRuntimeSha256 = primeRuntimeSource
+      ? await sha256RegularFile(primeRuntimeSource)
+      : undefined;
+    const sourceDigest = await digestReleaseSource(
+      sourceRoot,
+      primeRuntimeSource,
+    );
     const releaseId = options.releaseId ?? sourceDigest.slice(0, 16);
     validateReleaseId(releaseId);
     const releaseRoot = join(layout.releasesRoot, releaseId);
@@ -286,6 +299,9 @@ export async function installOpenClaw(
       sourceDigest,
       layout,
       dependencies,
+      options.dependencyMode ?? "install",
+      primeRuntimeSource,
+      managedPrimeRuntimeSha256,
     );
     const hostConfigRestore = await installHostConfig(
       options.hostConfigSource,
@@ -414,8 +430,13 @@ export async function rollbackOpenClaw(
       "current",
     );
     let extensionRestore: PathRestore | undefined;
+    let hostConfigRestore: (() => Promise<void>) | undefined;
     let next: InstallManifest;
     try {
+      hostConfigRestore = await activateManagedPrimeRuntime(
+        layout,
+        await readReleaseMetadata(targetRoot),
+      );
       extensionRestore = await switchDirectoryLink(
         layout.extensionPath,
         relative(dirname(layout.extensionPath), join(targetRoot, "plugin")),
@@ -440,6 +461,7 @@ export async function rollbackOpenClaw(
         () => undefined,
       );
       await dependencies.refreshPluginRegistry().catch(() => undefined);
+      await hostConfigRestore?.().catch(() => undefined);
       throw error;
     }
     if (options.restartGateway) {
@@ -568,6 +590,23 @@ export async function auditOpenClawInstall(
     if (!(await pathExists(layout.installManifestPath)))
       violations.push("install manifest is missing");
     return violations;
+  }
+  const activeReleaseMetadata = await readReleaseMetadata(
+    join(layout.releasesRoot, manifest.currentRelease),
+  ).catch(() => undefined);
+  if (activeReleaseMetadata?.managedPrimeRuntimeSha256) {
+    const hostConfig = await readFile(layout.hostConfigPath, "utf8")
+      .then((raw) => HostConfigSchema.parse(JSON.parse(raw)))
+      .catch(() => undefined);
+    if (
+      hostConfig?.prime.runtimeArtifact !==
+        join(layout.currentLink, "prime", "runtime.tgz") ||
+      hostConfig.prime.runtimeArtifactSha256 !==
+        activeReleaseMetadata.managedPrimeRuntimeSha256
+    )
+      violations.push(
+        "host config does not match the active managed Prime runtime",
+      );
   }
   for (const release of manifest.releases) {
     const releaseRoot = join(layout.releasesRoot, release.id);
@@ -864,6 +903,9 @@ async function prepareRelease(
   sourceDigest: string,
   layout: OpenClawInstallLayout,
   dependencies: OpenClawLifecycleDependencies,
+  dependencyMode: "install" | "vendored",
+  primeRuntimeSource: string | undefined,
+  managedPrimeRuntimeSha256: string | undefined,
 ): Promise<ReleaseMetadata> {
   if (await pathExists(releaseRoot)) {
     if (!(await releaseMatches(releaseRoot, releaseId, sourceDigest)))
@@ -891,14 +933,32 @@ async function prepareRelease(
       "pnpm-workspace.yaml",
       "README.md",
     ]);
-    await dependencies.installProductionDependencies(runtimeRoot);
-    await dependencies.installProductionDependencies(pluginRoot);
+    if (dependencyMode === "vendored") {
+      await copyRequiredEntries(sourceRoot, runtimeRoot, ["node_modules"]);
+      await copyRequiredEntries(
+        join(sourceRoot, "openclaw-plugin"),
+        pluginRoot,
+        ["node_modules"],
+      );
+    } else {
+      await dependencies.installProductionDependencies(runtimeRoot);
+      await dependencies.installProductionDependencies(pluginRoot);
+    }
+    if (primeRuntimeSource) {
+      const primeRoot = join(staging, "prime");
+      await mkdir(primeRoot, { mode: 0o700 });
+      await cp(primeRuntimeSource, join(primeRoot, "runtime.tgz"), {
+        force: false,
+        errorOnExist: true,
+      });
+    }
     const publishedDigest = await digestPublishedRelease(staging);
     const metadata: ReleaseMetadata = {
       schemaVersion: INSTALL_SCHEMA_VERSION,
       releaseId,
       sourceDigest,
       publishedDigest,
+      ...(managedPrimeRuntimeSha256 ? { managedPrimeRuntimeSha256 } : {}),
       preparedAt: dependencies.now().toISOString(),
     };
     await atomicWriteFile(
@@ -940,10 +1000,15 @@ async function copyRequiredEntries(
   }
 }
 
-async function digestReleaseSource(sourceRoot: string): Promise<string> {
+async function digestReleaseSource(
+  sourceRoot: string,
+  primeRuntimeSource?: string,
+): Promise<string> {
   const hash = createHash("sha256");
   for (const entry of RELEASE_SOURCE_PATHS)
     await digestPath(join(sourceRoot, entry.source), entry.label, hash);
+  if (primeRuntimeSource)
+    await digestPath(primeRuntimeSource, "prime/runtime.tgz", hash);
   return hash.digest("hex");
 }
 
@@ -953,6 +1018,12 @@ async function digestPreparedReleaseSource(
   const hash = createHash("sha256");
   for (const entry of RELEASE_SOURCE_PATHS)
     await digestPath(join(releaseRoot, entry.prepared), entry.label, hash);
+  if (await pathExists(join(releaseRoot, "prime", "runtime.tgz")))
+    await digestPath(
+      join(releaseRoot, "prime", "runtime.tgz"),
+      "prime/runtime.tgz",
+      hash,
+    );
   return hash.digest("hex");
 }
 
@@ -971,7 +1042,23 @@ async function digestPublishedRelease(releaseRoot: string): Promise<string> {
     canonicalReleaseRoot,
     hash,
   );
+  if (await pathExists(join(releaseRoot, "prime")))
+    await digestPublishedPath(
+      join(releaseRoot, "prime"),
+      "prime",
+      canonicalReleaseRoot,
+      hash,
+    );
   return hash.digest("hex");
+}
+
+async function sha256RegularFile(path: string): Promise<string> {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink())
+    throw new Error(`managed Prime runtime must be a regular file: ${path}`);
+  return createHash("sha256")
+    .update(await readFile(path))
+    .digest("hex");
 }
 
 async function digestPublishedPath(
@@ -1064,6 +1151,9 @@ async function readReleaseMetadata(
     (value.publishedDigest !== undefined &&
       (typeof value.publishedDigest !== "string" ||
         !/^[a-f0-9]{64}$/.test(value.publishedDigest))) ||
+    (value.managedPrimeRuntimeSha256 !== undefined &&
+      (typeof value.managedPrimeRuntimeSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(value.managedPrimeRuntimeSha256))) ||
     typeof value.preparedAt !== "string"
   )
     throw new Error(`release metadata is invalid in ${releaseRoot}`);
@@ -1138,6 +1228,38 @@ async function hostConfigMatches(
   } catch {
     return false;
   }
+}
+
+async function activateManagedPrimeRuntime(
+  layout: OpenClawInstallLayout,
+  targetMetadata: ReleaseMetadata,
+): Promise<() => Promise<void>> {
+  const previous = await readFile(layout.hostConfigPath);
+  const config = HostConfigSchema.parse(JSON.parse(previous.toString("utf8")));
+  const managedPath = join(layout.currentLink, "prime", "runtime.tgz");
+  if (!targetMetadata.managedPrimeRuntimeSha256) {
+    if (config.prime.runtimeArtifact === managedPath)
+      throw new Error(
+        `release ${targetMetadata.releaseId} has no managed Prime runtime`,
+      );
+    return async () => undefined;
+  }
+  const next = HostConfigSchema.parse({
+    ...config,
+    prime: {
+      runtimeArtifact: managedPath,
+      runtimeArtifactSha256: targetMetadata.managedPrimeRuntimeSha256,
+    },
+  });
+  await atomicWriteFile(
+    layout.hostConfigPath,
+    `${JSON.stringify(next, null, 2)}\n`,
+  );
+  await chmod(layout.hostConfigPath, 0o600);
+  return async () => {
+    await atomicWriteFile(layout.hostConfigPath, previous.toString("utf8"));
+    await chmod(layout.hostConfigPath, 0o600);
+  };
 }
 
 async function initializeState(
