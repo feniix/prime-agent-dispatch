@@ -84,22 +84,20 @@ export type RetentionPolicy = z.infer<typeof RetentionPolicySchema>;
 export const HostConfigSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),
-    repoRoots: z.array(z.string().min(1)).min(1),
+    repoRoots: z.array(z.string().min(1)),
     prime: z.object({
       runtimeArtifact: z.string().min(1),
       runtimeArtifactSha256: z.string().regex(/^[a-f0-9]{64}$/),
     }),
     multiChild: HostMultiChildPolicySchema,
     retention: RetentionPolicySchema.default(DEFAULT_RETENTION_POLICY),
-    repositories: z
-      .array(
-        z.object({
-          path: z.string().min(1),
-          fixture: z.boolean().default(false),
-          gates: z.array(GateSchema).min(1),
-        }),
-      )
-      .min(1),
+    repositories: z.array(
+      z.object({
+        path: z.string().min(1),
+        fixture: z.boolean().default(false),
+        gates: z.array(GateSchema).min(1),
+      }),
+    ),
   })
   .strict();
 export type HostConfig = z.infer<typeof HostConfigSchema>;

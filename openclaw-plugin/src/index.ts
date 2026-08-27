@@ -1,7 +1,10 @@
 import { execFile } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
@@ -15,19 +18,63 @@ import {
   type PrimeDispatchPluginConfig,
   type TrustedToolContext,
 } from "./adapter.js";
+import {
+  initializeNativePlugin,
+  type NativeHostPolicy,
+} from "./installation.js";
 
 const execFileAsync = promisify(execFile);
+const defaultPluginRoot = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+
+const gateJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["name", "command", "args", "timeoutMs"],
+  properties: {
+    name: { type: "string", minLength: 1 },
+    command: { type: "string", minLength: 1 },
+    args: { type: "array", items: { type: "string" } },
+    timeoutMs: { type: "integer", minimum: 1 },
+  },
+} as const;
 
 const configJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["cliPath", "stateRoot", "hostConfigPath"],
   properties: {
     cliPath: { type: "string", minLength: 1 },
     stateRoot: { type: "string", minLength: 1 },
     hostConfigPath: { type: "string", minLength: 1 },
     openclawStateDir: { type: "string", minLength: 1 },
     openclawConfigPath: { type: "string", minLength: 1 },
+    hostPolicy: {
+      type: "object",
+      additionalProperties: false,
+      required: ["repoRoots", "repositories"],
+      properties: {
+        repoRoots: {
+          type: "array",
+          items: { type: "string", minLength: 1 },
+        },
+        multiChild: { const: false },
+        repositories: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["path", "gates"],
+            properties: {
+              path: { type: "string", minLength: 1 },
+              fixture: { type: "boolean", default: false },
+              gates: { type: "array", minItems: 1, items: gateJsonSchema },
+            },
+          },
+        },
+      },
+    },
     confirmationTtlMs: {
       type: "integer",
       minimum: 10_000,
@@ -56,8 +103,16 @@ const plugin = definePluginEntry({
   configSchema: { jsonSchema: configJsonSchema },
   register(api) {
     const config = parseConfig(api.pluginConfig);
+    let initialization: Promise<void> | undefined;
+    const ensureInitialized = () => {
+      if (!config.nativeInstallation) return Promise.resolve();
+      return (initialization ??= initializeNativePlugin(
+        config.nativeInstallation,
+      ));
+    };
     const adapter = new PrimeDispatchAdapter(config, {
       runCli: async (args) => {
+        await ensureInitialized();
         const { stdout } = await execFileAsync(
           process.execPath,
           [config.cliPath, ...args],
@@ -320,8 +375,9 @@ const plugin = definePluginEntry({
     };
     api.registerService({
       id: "prime-dispatch-notifications",
-      start() {
-        void pumpNotifications();
+      async start() {
+        await ensureInitialized();
+        await pumpNotifications();
         notificationTimer = setInterval(
           () => void pumpNotifications(),
           config.notificationPollMs ?? 2_000,
@@ -517,24 +573,57 @@ function registerSimpleTool(
   );
 }
 
-function parseConfig(
+type ResolvedPluginConfig = PrimeDispatchPluginConfig & {
+  nativeInstallation?: {
+    pluginRoot: string;
+    openclawStateDir: string;
+    hostConfigPath: string;
+    stateRoot: string;
+    hostPolicy?: NativeHostPolicy;
+  };
+};
+
+export function parseConfig(
   value: Record<string, unknown> | undefined,
-): PrimeDispatchPluginConfig {
+  pluginRoot = defaultPluginRoot,
+): ResolvedPluginConfig {
   const config = value ?? {};
-  for (const key of ["cliPath", "stateRoot", "hostConfigPath"] as const) {
-    if (typeof config[key] !== "string" || !config[key])
-      throw new Error(`Prime Dispatch plugin config requires ${key}`);
-  }
+  const configuredCliPath = stringValue(config.cliPath);
+  const configuredHostConfigPath = stringValue(config.hostConfigPath);
+  if (Boolean(configuredCliPath) !== Boolean(configuredHostConfigPath))
+    throw new Error(
+      "Prime Dispatch cliPath and hostConfigPath must be configured together",
+    );
+  const openclawStateDir =
+    stringValue(config.openclawStateDir) ?? resolveStateDir();
+  const cliPath =
+    configuredCliPath ?? join(pluginRoot, "runtime", "dist", "cli.js");
+  const stateRoot =
+    stringValue(config.stateRoot) ??
+    join(openclawStateDir, "prime-dispatch", "state");
+  const hostConfigPath =
+    configuredHostConfigPath ??
+    join(openclawStateDir, "prime-dispatch", "config", "host.json");
+  const nativeInstallation =
+    configuredCliPath === undefined
+      ? {
+          pluginRoot,
+          openclawStateDir,
+          hostConfigPath,
+          stateRoot,
+          ...(config.hostPolicy
+            ? { hostPolicy: parseNativeHostPolicy(config.hostPolicy) }
+            : {}),
+        }
+      : undefined;
   return {
-    cliPath: config.cliPath as string,
-    stateRoot: config.stateRoot as string,
-    hostConfigPath: config.hostConfigPath as string,
-    ...(typeof config.openclawStateDir === "string"
-      ? { openclawStateDir: config.openclawStateDir }
-      : {}),
-    ...(typeof config.openclawConfigPath === "string"
-      ? { openclawConfigPath: config.openclawConfigPath }
-      : {}),
+    cliPath,
+    stateRoot,
+    hostConfigPath,
+    openclawStateDir,
+    openclawConfigPath:
+      stringValue(config.openclawConfigPath) ??
+      join(openclawStateDir, "openclaw.json"),
     confirmationTtlMs:
       typeof config.confirmationTtlMs === "number"
         ? config.confirmationTtlMs
@@ -547,7 +636,73 @@ function parseConfig(
       typeof config.notificationPollMs === "number"
         ? config.notificationPollMs
         : 2_000,
+    ...(nativeInstallation ? { nativeInstallation } : {}),
   };
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function parseNativeHostPolicy(value: unknown): NativeHostPolicy {
+  if (!record(value)) throw new Error("Prime Dispatch host policy is invalid");
+  const repoRoots = value.repoRoots;
+  const multiChild = value.multiChild;
+  const repositories = value.repositories;
+  if (
+    !Array.isArray(repoRoots) ||
+    repoRoots.some((path) => typeof path !== "string" || !path) ||
+    (multiChild !== undefined && multiChild !== false) ||
+    !Array.isArray(repositories)
+  )
+    throw new Error("Prime Dispatch host policy is invalid");
+  return {
+    repoRoots,
+    ...(multiChild === false ? { multiChild: false } : {}),
+    repositories: repositories.map((repository) => {
+      if (
+        !record(repository) ||
+        typeof repository.path !== "string" ||
+        !repository.path ||
+        (repository.fixture !== undefined &&
+          typeof repository.fixture !== "boolean") ||
+        !Array.isArray(repository.gates) ||
+        repository.gates.length === 0
+      )
+        throw new Error("Prime Dispatch host policy is invalid");
+      return {
+        path: repository.path,
+        ...(repository.fixture === undefined
+          ? {}
+          : { fixture: repository.fixture }),
+        gates: repository.gates.map((gate) => {
+          if (
+            !record(gate) ||
+            typeof gate.name !== "string" ||
+            !gate.name ||
+            typeof gate.command !== "string" ||
+            !gate.command ||
+            !Array.isArray(gate.args) ||
+            gate.args.some((argument) => typeof argument !== "string") ||
+            typeof gate.timeoutMs !== "number" ||
+            !Number.isInteger(gate.timeoutMs) ||
+            gate.timeoutMs < 1
+          )
+            throw new Error("Prime Dispatch host policy is invalid");
+          return {
+            name: gate.name,
+            command: gate.command,
+            args: gate.args,
+            timeoutMs: gate.timeoutMs,
+          };
+        }),
+      };
+    }),
+  };
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function buildCliEnvironment(

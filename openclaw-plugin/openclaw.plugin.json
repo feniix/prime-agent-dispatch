@@ -9,13 +9,54 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["cliPath", "stateRoot", "hostConfigPath"],
     "properties": {
       "cliPath": { "type": "string", "minLength": 1 },
       "stateRoot": { "type": "string", "minLength": 1 },
       "hostConfigPath": { "type": "string", "minLength": 1 },
       "openclawStateDir": { "type": "string", "minLength": 1 },
       "openclawConfigPath": { "type": "string", "minLength": 1 },
+      "hostPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repoRoots", "repositories"],
+        "properties": {
+          "repoRoots": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "multiChild": { "const": false },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "gates"],
+              "properties": {
+                "path": { "type": "string", "minLength": 1 },
+                "fixture": { "type": "boolean", "default": false },
+                "gates": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "command", "args", "timeoutMs"],
+                    "properties": {
+                      "name": { "type": "string", "minLength": 1 },
+                      "command": { "type": "string", "minLength": 1 },
+                      "args": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      },
+                      "timeoutMs": { "type": "integer", "minimum": 1 }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "confirmationTtlMs": {
         "type": "integer",
         "minimum": 10000,

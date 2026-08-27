@@ -118,6 +118,32 @@ test("trusted host config defaults repositories to non-fixtures and multi-child 
   assert.equal("multiChild" in singleRoot, false);
 });
 
+test("an empty native-install policy is valid and denies every repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-host-config-empty-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  const path = join(root, "host.json");
+  await writeFile(
+    path,
+    JSON.stringify({
+      schemaVersion: 1,
+      repoRoots: [],
+      prime: {
+        runtimeArtifact: "/managed/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
+      },
+      repositories: [],
+    }),
+  );
+  const config = await loadHostConfig(path);
+  assert.deepEqual(config.repoRoots, []);
+  assert.deepEqual(config.repositories, []);
+  await assert.rejects(
+    () => resolveHostRepositoryPolicy(config, repo),
+    /not present in trusted host configuration/,
+  );
+});
+
 test("trusted retention policy cannot discard the minimum explanatory evidence set", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-host-config-retention-"));
   const path = join(root, "host.json");

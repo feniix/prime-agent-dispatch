@@ -5,6 +5,7 @@ import plugin, {
   confirmationCommandFailure,
   createDiscordRefreshHandler,
   createNotificationDelivery,
+  parseConfig,
   statusCommandResult,
   trustedContext,
   trustedCommandContext,
@@ -12,6 +13,76 @@ import plugin, {
 import { confirmationContextHash } from "./adapter.js";
 
 describe("Prime Dispatch OpenClaw plugin", () => {
+  it("derives native managed paths from the active OpenClaw profile", () => {
+    expect(
+      parseConfig(
+        { openclawStateDir: "/profiles/clean" },
+        "/extensions/prime-dispatch",
+      ),
+    ).toMatchObject({
+      cliPath: "/extensions/prime-dispatch/runtime/dist/cli.js",
+      stateRoot: "/profiles/clean/prime-dispatch/state",
+      hostConfigPath: "/profiles/clean/prime-dispatch/config/host.json",
+      openclawConfigPath: "/profiles/clean/openclaw.json",
+      nativeInstallation: {
+        pluginRoot: "/extensions/prime-dispatch",
+        openclawStateDir: "/profiles/clean",
+        stateRoot: "/profiles/clean/prime-dispatch/state",
+        hostConfigPath: "/profiles/clean/prime-dispatch/config/host.json",
+      },
+    });
+  });
+
+  it("rejects malformed host policy when schema validation is bypassed", () => {
+    expect(() =>
+      parseConfig(
+        {
+          openclawStateDir: "/profiles/clean",
+          hostPolicy: {
+            repoRoots: ["/source"],
+            repositories: [{ path: "/source/repo", gates: [] }],
+          },
+        },
+        "/extensions/prime-dispatch",
+      ),
+    ).toThrow("Prime Dispatch host policy is invalid");
+  });
+
+  it("passes the single-root host policy opt-out to native installation", () => {
+    expect(
+      parseConfig(
+        {
+          openclawStateDir: "/profiles/clean",
+          hostPolicy: {
+            repoRoots: ["/source"],
+            multiChild: false,
+            repositories: [
+              {
+                path: "/source/repo",
+                fixture: true,
+                gates: [
+                  {
+                    name: "test",
+                    command: "npm",
+                    args: ["test"],
+                    timeoutMs: 60_000,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        "/extensions/prime-dispatch",
+      ).nativeInstallation?.hostPolicy,
+    ).toMatchObject({ multiChild: false });
+  });
+
+  it("rejects a partial legacy path override", () => {
+    expect(() =>
+      parseConfig({ cliPath: "/legacy/cli.js" }, "/extensions/prime-dispatch"),
+    ).toThrow("cliPath and hostConfigPath must be configured together");
+  });
+
   it("passes the configured OpenClaw profile to the standalone control plane", () => {
     expect(
       buildCliEnvironment(
