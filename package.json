@@ -30,6 +30,7 @@
     "commander": "15.0.0",
     "eventsource-parser": "4.0.0",
     "kysely": "0.29.5",
+    "tar": "7.5.22",
     "zod": "4.0.17"
   },
   "devDependencies": {

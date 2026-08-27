@@ -203,8 +203,8 @@ test("CLI rejects --yes for host-configured real Prime jobs", async () => {
       schemaVersion: 1,
       repoRoots: [root],
       prime: {
-        executable: "/trusted/prime.js",
-        releaseArtifact: "/trusted/prime.tgz",
+        runtimeArtifact: "/trusted/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
       },
       repositories: [
         {

@@ -219,8 +219,8 @@ test("gated SDK host composes native admission, waves, leases, proposals, and jo
       },
       agent: {
         kind: "prime-rpc",
-        executable: "/fake/dist/bundle/cli.js",
-        releaseArtifact: "/fake/prime.tgz",
+        runtimeArtifact: "/fake/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
       },
       budget: {
         wallClockMs: 60_000,

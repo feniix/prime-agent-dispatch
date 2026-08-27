@@ -8,16 +8,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import {
   buildPrimeEnvironment,
-  PRIME_AGENT_VERSION,
   PrimeJsonlRpcBackend,
+  preparePrimeRuntime,
   primeRpcLaunchArguments,
   readProcessStartIdentity,
   writePrimeModelsConfig,
 } from "../dist/index.js";
+import { livePrimeRuntime } from "./live-prime-runtime.js";
 
 const exec = promisify(execFile);
 const live = process.env.PRIME_DISPATCH_LIVE_ACCEPTANCE === "1";
-const primeAgentRoot = `/var/lib/evie-agent/downloads/prime-agent-${PRIME_AGENT_VERSION}`;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -258,6 +258,12 @@ test(
     const sessionDir = join(homeDir, "sessions");
     const runtimeTmpDir = await mkdtemp("/tmp/prime-dispatch.");
     const controller = new AbortController();
+    const runtime = await livePrimeRuntime();
+    const prepared = await preparePrimeRuntime({
+      artifactPath: runtime.runtimeArtifact,
+      expectedArtifactSha256: runtime.runtimeArtifactSha256,
+      cacheDir: join(root, "runtimes"),
+    });
     let backend;
     let broker;
     context.after(async () => {
@@ -277,9 +283,7 @@ test(
       brokerBaseUrl: broker.baseUrl,
       scopedToken: "live-cancellation-test-token",
     });
-    const executable =
-      process.env.PRIME_AGENT_EXECUTABLE ??
-      `${primeAgentRoot}/package/dist/bundle/cli.js`;
+    const executable = prepared.executablePath;
     backend = new PrimeJsonlRpcBackend({
       kind: "prime-rpc",
       command: process.execPath,

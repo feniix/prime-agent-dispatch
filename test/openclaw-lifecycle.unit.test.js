@@ -47,8 +47,8 @@ async function fixture() {
     schemaVersion: 1,
     repoRoots: ["/fixtures"],
     prime: {
-      executable: "/runtime/prime.js",
-      releaseArtifact: "/runtime/prime.tgz",
+      runtimeArtifact: "/runtime/prime-runtime.tgz",
+      runtimeArtifactSha256: "a".repeat(64),
     },
     repositories: [
       {

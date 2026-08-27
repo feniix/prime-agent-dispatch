@@ -36,8 +36,8 @@ test(
             schemaVersion: 1,
             repoRoots: [root],
             prime: {
-              executable: "/usr/bin/true",
-              releaseArtifact: "/usr/bin/true",
+              runtimeArtifact: "/runtime/prime-runtime.tgz",
+              runtimeArtifactSha256: "a".repeat(64),
             },
             repositories: [
               {
