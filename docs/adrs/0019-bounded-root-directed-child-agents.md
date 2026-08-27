@@ -228,3 +228,8 @@ delivered root-routed steering, and the resulting attributable commit passed
 the trusted format, typecheck, test, and audit gates. See the
 [Beta Milestone 4 report](../beta-milestone-4.md) for the evidence boundary and
 remaining rollout blockers.
+
+Default enablement was separately confirmed by live job
+`20260827023052-9be6409e-e8f`: its host configuration omitted `multiChild`, the
+bounded default policy appeared in the hash-confirmed request and authoritative
+tree, and the same three-role, linked-retry workflow passed every trusted gate.

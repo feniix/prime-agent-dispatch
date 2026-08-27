@@ -62,6 +62,16 @@ complete and four with unknown usage. This is an observed-admission ceiling,
 not a hard output-token limiter; one already-admitted response may overshoot.
 Unknown usage remains explicit rather than being treated as zero.
 
+After making multi-child execution the host-configured default, live job
+`20260827023052-9be6409e-e8f` repeated the acceptance with no `multiChild`
+property in its host configuration. The default policy materialized in the
+confirmed request and authoritative tree, all three roles and the linked
+mini-to-sol retry succeeded, all four runtimes quiesced with revoked leases,
+and trusted gates passed in 146.6 seconds. The resulting attributable commit
+was `3ae0281fe7e2090c5e87d95d7324ff3c36bb19bb`; aggregate observed usage was
+204,163 tokens across 28 requests, with two failed requests retaining unknown
+usage.
+
 ## Remaining boundaries
 
 - Multi-child mode is enabled by default for host-configured Prime jobs and
