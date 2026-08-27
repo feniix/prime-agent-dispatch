@@ -3,9 +3,16 @@ status: accepted
 date: 2026-08-20
 decision-makers: [feniix]
 consulted: [ryn]
+amended-by: 0021-one-manifest-for-online-and-offline-packages.md
 ---
 
 # Use a versioned host-local lifecycle for the OpenClaw integration
+
+## Amendment: native plugin distribution
+
+[ADR-0021](0021-one-manifest-for-online-and-offline-packages.md) replaces this source-based lifecycle as the normal user-facing distribution and installation path. New deployments use online or offline native plugin archives through `openclaw plugins install <archive>`; they do not prepare releases from a source checkout or invoke this lifecycle installer.
+
+This decision remains accepted for the narrower behavior still provided by the source lifecycle: migrating and auditing legacy installations, rolling back or uninstalling releases it already owns, and development acceptance. Its integrity, state-preservation, and ownership rules continue to govern those operations. They do not define the native package layout or its installation contract.
 
 ## Context and Problem Statement
 

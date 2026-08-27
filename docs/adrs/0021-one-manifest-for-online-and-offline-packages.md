@@ -3,6 +3,7 @@ status: accepted
 date: 2026-08-27
 decision-makers: [feniix]
 consulted: [ryn]
+amends: 0016-versioned-openclaw-host-lifecycle.md
 ---
 
 # Use one manifest contract for online and offline OpenClaw packages
@@ -33,6 +34,8 @@ Online and offline packages need the same integrity, target, and runtime behavio
 ## Decision Outcome
 
 Chosen option: **one canonical manifest with online and offline modes**.
+
+This decision replaces the source-based lifecycle from [ADR-0016](0016-versioned-openclaw-host-lifecycle.md) as the normal user-facing distribution and installation path. ADR-0016 remains applicable only to legacy/source lifecycle operations and development acceptance.
 
 Both `.tgz` variants are OpenClaw plugin archives: `package.json`, `openclaw.plugin.json`, and the compiled plugin live at the archive root. They contain the compiled standalone runtime, target identity, exact accepted OpenClaw version, source commit, release id, and a sorted per-entry manifest. The published SHA-256 authenticates the complete archive before the operator passes it to OpenClaw.
 
