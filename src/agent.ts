@@ -661,6 +661,7 @@ export function createAgentBackend(
   request: JobRequest,
   jobDir: string,
   primeRuntime?: {
+    executable: string;
     homeDir: string;
     configDir: string;
     sessionDir: string;
@@ -684,7 +685,7 @@ export function createAgentBackend(
   return new PrimeJsonlRpcBackend({
     kind: "prime-rpc",
     command: process.execPath,
-    args: primeRpcLaunchArguments(request.agent.executable),
+    args: primeRpcLaunchArguments(primeRuntime.executable),
     codingAgentDir: primeRuntime.configDir,
     environment: buildPrimeEnvironment({
       jobHome: primeRuntime.homeDir,

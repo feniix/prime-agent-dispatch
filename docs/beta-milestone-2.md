@@ -72,10 +72,10 @@ Installation changes the active OpenClaw configuration and may reload the
 Gateway. It is therefore an operator deployment step, separate from package
 validation and repository merge.
 
-## Deferred work
+## Deferred work at milestone close
 
 - Self-contained pinned Prime runtime and complete dependency-tree verification
-  remain in issue #2 and gate selected real-repository rollout.
+  were deferred to issue #2 and are now implemented.
 - OS filesystem, process, and network containment remain in issue #3.
 - Checkpoint recovery and explicit safe resume remain in issue #11.
 - Transactional multi-file authority and bounded artifact retention remain

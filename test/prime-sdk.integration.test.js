@@ -75,6 +75,8 @@ function childOptions(id, sessionName, model, thinkingLevel, prompt) {
 test("SDK backend restores its process environment after quiescence", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "prime-sdk-backend-"));
   const priorTmpDir = process.env.TMPDIR;
+  const priorNodePath = process.env.NODE_PATH;
+  process.env.NODE_PATH = "/ambient/node_modules";
   const paths = {
     executable: "/fake/dist/bundle/cli.js",
     homeDir: join(temporary, "home"),
@@ -84,12 +86,14 @@ test("SDK backend restores its process environment after quiescence", async () =
     path: process.env.PATH,
   };
   let observedTmpDir;
+  let observedNodePath;
   const sdk = fakeSdk();
   sdk.createAgentSession = async () => ({
     session: {
       ...fakeSession(),
       async promptAndWait() {
         observedTmpDir = process.env.TMPDIR;
+        observedNodePath = process.env.NODE_PATH;
       },
     },
   });
@@ -110,8 +114,10 @@ test("SDK backend restores its process environment after quiescence", async () =
     new AbortController().signal,
   );
   assert.equal(observedTmpDir, paths.tmpDir);
+  assert.equal(observedNodePath, undefined);
   await backend.dispose();
   assert.equal(process.env.TMPDIR, priorTmpDir);
+  assert.equal(process.env.NODE_PATH, "/ambient/node_modules");
 
   const failed = new PrimeSdkAgentBackend(
     paths,
@@ -130,6 +136,9 @@ test("SDK backend restores its process environment after quiescence", async () =
     /SDK load failed/,
   );
   assert.equal(process.env.TMPDIR, priorTmpDir);
+  assert.equal(process.env.NODE_PATH, "/ambient/node_modules");
+  if (priorNodePath === undefined) delete process.env.NODE_PATH;
+  else process.env.NODE_PATH = priorNodePath;
   await rm(temporary, { recursive: true, force: true });
 });
 
@@ -219,8 +228,8 @@ test("gated SDK host composes native admission, waves, leases, proposals, and jo
       },
       agent: {
         kind: "prime-rpc",
-        executable: "/fake/dist/bundle/cli.js",
-        releaseArtifact: "/fake/prime.tgz",
+        runtimeArtifact: "/fake/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
       },
       budget: {
         wallClockMs: 60_000,

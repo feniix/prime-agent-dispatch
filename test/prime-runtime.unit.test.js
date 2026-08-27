@@ -1,13 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PRIME_EXECUTION_SYSTEM_PROMPT,
   PrimeJsonlRpcBackend,
-  verifyPrimeInstallation,
   writePrimeModelsConfig,
   primeRpcLaunchArguments,
 } from "../dist/index.js";
@@ -374,50 +372,6 @@ test("Prime RPC rejects oversized lines and bounds terminal summaries", async ()
   );
   assert.ok(Buffer.byteLength(result.summary) <= 64 * 1024);
   assert.ok(Buffer.byteLength(JSON.stringify(result.metadata)) <= 64 * 1024);
-});
-
-test("Prime installation verifies release artifact checksum and executable version", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-install-"));
-  const artifact = join(root, "release.tgz");
-  const executable = join(root, "prime.js");
-  await writeFile(artifact, "fixture release");
-  await writeFile(executable, 'console.log("0.8.0")\n');
-  const sha = createHash("sha256").update("fixture release").digest("hex");
-  const executableSha = createHash("sha256")
-    .update('console.log("0.8.0")\n')
-    .digest("hex");
-  await assert.doesNotReject(() =>
-    verifyPrimeInstallation({
-      artifactPath: artifact,
-      executablePath: executable,
-      expectedSha256: sha,
-      expectedExecutableSha256: executableSha,
-    }),
-  );
-  await writeFile(executable, 'console.log("0.8.0"); // substituted\n');
-  await assert.rejects(
-    () =>
-      verifyPrimeInstallation({
-        artifactPath: artifact,
-        executablePath: executable,
-        expectedSha256: sha,
-        expectedExecutableSha256: executableSha,
-      }),
-    /executable checksum mismatch/,
-  );
-  await writeFile(executable, 'console.log("0.7.4")\n');
-  await assert.rejects(
-    () =>
-      verifyPrimeInstallation({
-        artifactPath: artifact,
-        executablePath: executable,
-        expectedSha256: sha,
-        expectedExecutableSha256: createHash("sha256")
-          .update('console.log("0.7.4")\n')
-          .digest("hex"),
-      }),
-    /version mismatch/,
-  );
 });
 
 test("Prime private config contains only scoped broker token and fixed model", async () => {

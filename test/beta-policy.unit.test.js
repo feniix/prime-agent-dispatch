@@ -8,39 +8,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
-  PRIME_AGENT_EXECUTABLE_SHA256,
+  PRIME_AGENT_COMMIT,
   PRIME_AGENT_SHA256,
   PRIME_AGENT_VERSION,
   buildConfirmationSummary,
   buildPrimeEnvironment,
   buildRemoteInertGitEnvironment,
   installRemoteInertGitGuard,
-  verifyPrimeRelease,
 } from "../dist/index.js";
 
 const exec = promisify(execFile);
 
-test("configured Prime release and entrypoint checksums are verified", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prime-release-"));
-  const artifact = join(root, "prime-agent.tar.gz");
-  await writeFile(artifact, "known fixture");
-  await assert.rejects(
-    () =>
-      verifyPrimeRelease({
-        artifactPath: artifact,
-        expectedVersion: PRIME_AGENT_VERSION,
-        expectedSha256: PRIME_AGENT_SHA256,
-      }),
-    /checksum mismatch/,
-  );
+test("configured Prime compatibility target is immutable", () => {
   assert.equal(PRIME_AGENT_VERSION, "0.8.0");
+  assert.equal(PRIME_AGENT_COMMIT, "8d7deeab5861bf9d77bde3d8511046a5c799818d");
   assert.equal(
     PRIME_AGENT_SHA256,
     "f5b0093c7e0fddb73f94773d74383585456adfa84f12a4082d3098f23bb8fab6",
-  );
-  assert.equal(
-    PRIME_AGENT_EXECUTABLE_SHA256,
-    "bf73f2d622a26e67ca4448519207374c8b47c363a2685b76c91deb63b53a815a",
   );
 });
 

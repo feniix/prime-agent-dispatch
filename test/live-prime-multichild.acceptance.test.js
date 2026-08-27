@@ -5,16 +5,12 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
-import {
-  JobStore,
-  PRIME_AGENT_VERSION,
-  PrimeDispatcher,
-} from "../dist/index.js";
+import { JobStore, PrimeDispatcher } from "../dist/index.js";
+import { livePrimeRuntime } from "./live-prime-runtime.js";
 
 const exec = promisify(execFile);
 const cli = new URL("../dist/cli.js", import.meta.url).pathname;
 const live = process.env.PRIME_DISPATCH_LIVE_MULTI_CHILD_ACCEPTANCE === "1";
-const primeAgentRoot = `/var/lib/evie-agent/downloads/prime-agent-${PRIME_AGENT_VERSION}`;
 const corepackCli = resolve(
   dirname(process.execPath),
   "..",
@@ -66,6 +62,7 @@ test(
     );
     const root = await mkdtemp(join(tmpdir(), "prime-multichild-live."));
     const stateRoot = join(root, "state");
+    const prime = await livePrimeRuntime();
     const hostConfig = join(root, "host.json");
     await writeFile(
       hostConfig,
@@ -73,13 +70,7 @@ test(
         {
           schemaVersion: 1,
           repoRoots: [dirname(repository)],
-          prime: {
-            executable:
-              process.env.PRIME_AGENT_EXECUTABLE ??
-              `${primeAgentRoot}/package/dist/bundle/cli.js`,
-            releaseArtifact:
-              process.env.PRIME_AGENT_TARBALL ?? `${primeAgentRoot}.tgz`,
-          },
+          prime,
           repositories: [
             {
               path: repository,

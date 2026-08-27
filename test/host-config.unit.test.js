@@ -20,8 +20,8 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
       schemaVersion: 1,
       repoRoots: [root],
       prime: {
-        executable: "/trusted/prime.js",
-        releaseArtifact: "/trusted/prime.tgz",
+        runtimeArtifact: "/trusted/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
       },
       multiChild: {
         schemaVersion: 1,
@@ -56,8 +56,8 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
   const policy = await resolveHostRepositoryPolicy(config, repo);
   assert.deepEqual(policy.agent, {
     kind: "prime-rpc",
-    executable: "/trusted/prime.js",
-    releaseArtifact: "/trusted/prime.tgz",
+    runtimeArtifact: "/trusted/prime-runtime.tgz",
+    runtimeArtifactSha256: "a".repeat(64),
   });
   assert.equal(policy.gates[0].command, "/usr/bin/test");
   assert.equal(policy.fixture, true);
@@ -83,8 +83,8 @@ test("trusted host config defaults repositories to non-fixtures and multi-child 
       schemaVersion: 1,
       repoRoots: [root],
       prime: {
-        executable: "/trusted/prime.js",
-        releaseArtifact: "/trusted/prime.tgz",
+        runtimeArtifact: "/trusted/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
       },
       repositories: [
         {
@@ -127,8 +127,8 @@ test("trusted retention policy cannot discard the minimum explanatory evidence s
       schemaVersion: 1,
       repoRoots: [root],
       prime: {
-        executable: "/trusted/prime.js",
-        releaseArtifact: "/trusted/prime.tgz",
+        runtimeArtifact: "/trusted/prime-runtime.tgz",
+        runtimeArtifactSha256: "a".repeat(64),
       },
       retention: {
         maxTotalBytes: 0,

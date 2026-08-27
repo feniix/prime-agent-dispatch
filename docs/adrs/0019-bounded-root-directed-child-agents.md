@@ -161,9 +161,9 @@ model, budget, and execution-policy envelope.
 - The first live acceptance targets the explicitly selected
   `prime-dispatch-prototype` repository and proves implementation, test, and
   adversarial-review children through dependency-aware waves.
-- Broader repository rollout remains blocked by the self-contained runtime in
-  issue #2 and the containment decisions and implementation in issues #3 and
-  #12.
+- Issue #2 now supplies the self-contained runtime. Broader repository rollout
+  remains blocked by the containment decisions and implementation in issues #3
+  and #12.
 
 ### Implementation slices
 

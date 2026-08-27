@@ -26,8 +26,11 @@ import { git, runCommand, truncateUtf8 } from "./process.js";
 import { GlobalJobLease, type LeaseToken } from "./lease.js";
 import { ProductionInferenceBroker, type InferenceLease } from "./inference.js";
 import { resolveCodexSubscriptionAuth } from "./openclaw-auth.js";
-import { verifyPrimeInstallation } from "./release.js";
 import { writePrimeModelsConfig } from "./prime-runtime.js";
+import {
+  preparePrimeRuntime,
+  type PrimeRuntimeIdentity,
+} from "./prime-runtime-artifact.js";
 import {
   buildRemoteInertGitEnvironment,
   installRemoteInertGitGuard,
@@ -256,6 +259,7 @@ function buildTerminalResult(
     reportArtifact: join(store.jobDir(jobId), "artifacts", "report.md"),
     gateResults,
     ...(state.inference ? { inference: state.inference } : {}),
+    ...(state.primeRuntime ? { primeRuntime: state.primeRuntime } : {}),
     completedAt: new Date().toISOString(),
   };
 }
@@ -449,6 +453,8 @@ async function main(): Promise<void> {
           sessionDir: string;
           tmpDir: string;
           path: string;
+          executable: string;
+          identity: PrimeRuntimeIdentity;
         }
       | undefined;
     if (shouldRunStage(resumePlan, "model_provisioning")) {
@@ -464,6 +470,16 @@ async function main(): Promise<void> {
       shouldRunStage(resumePlan, "model_provisioning") &&
       request.agent.kind === "prime-rpc"
     ) {
+      const preparedRuntime = await preparePrimeRuntime({
+        artifactPath: request.agent.runtimeArtifact,
+        expectedArtifactSha256: request.agent.runtimeArtifactSha256,
+        cacheDir: join(stateRoot, "runtimes"),
+        signal: controller.signal,
+        terminationGraceMs: request.budget.cancellationGraceMs,
+      });
+      state = await store.updateState(jobId, "provisioning", {
+        primeRuntime: preparedRuntime.identity,
+      });
       const auth = await abortable(
         resolveCodexSubscriptionAuth(),
         controller.signal,
@@ -539,23 +555,31 @@ async function main(): Promise<void> {
         "/usr/bin/git",
         process.env.PATH ?? "/usr/bin:/bin",
       );
-      primeRuntime = { homeDir, configDir, sessionDir, tmpDir, path };
-      await verifyPrimeInstallation({
-        artifactPath: request.agent.releaseArtifact,
-        executablePath: request.agent.executable,
-        signal: controller.signal,
-        terminationGraceMs: request.budget.cancellationGraceMs,
-      });
+      primeRuntime = {
+        homeDir,
+        configDir,
+        sessionDir,
+        tmpDir,
+        path,
+        executable: preparedRuntime.executablePath,
+        identity: preparedRuntime.identity,
+      };
     }
     if (shouldRunStage(resumePlan, "model_provisioning"))
       await store.completeCheckpoint(
         jobId,
         attempt.attemptId,
         "model:provision",
-        { runtimeVerified: true },
+        {
+          runtimeVerified: true,
+          ...(primeRuntime ? { primeRuntime: primeRuntime.identity } : {}),
+        },
       );
     assertJobActive();
-    state = await store.updateState(jobId, "running", execution);
+    state = await store.updateState(jobId, "running", {
+      ...execution,
+      ...(primeRuntime ? { primeRuntime: primeRuntime.identity } : {}),
+    });
     let agentResult = resumePlan?.agentResult;
     if (shouldRunStage(resumePlan, "prime_execution")) {
       agent =
@@ -564,17 +588,11 @@ async function main(): Promise<void> {
         inferenceBroker &&
         primeRuntime
           ? new PrimeSdkAgentBackend(
-              {
-                executable: request.agent.executable,
-                ...primeRuntime,
-              },
+              primeRuntime,
               new GatedPrimeSubagentHost(
                 store,
                 request,
-                {
-                  executable: request.agent.executable,
-                  ...primeRuntime,
-                },
+                primeRuntime,
                 inferenceBroker,
               ),
             )

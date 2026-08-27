@@ -11,6 +11,8 @@ import {
   inspectControlMigrations,
   openControlDatabase,
 } from "./sqlite.js";
+import { buildPrimeRuntimeArtifact } from "./prime-runtime-artifact.js";
+import { PRIME_AGENT_COMMIT, PRIME_AGENT_VERSION } from "./release.js";
 
 type CommonOptions = { stateRoot?: string };
 
@@ -79,6 +81,41 @@ const program = new Command()
   .description("Detached single-root Prime job control")
   .showHelpAfterError()
   .showSuggestionAfterError();
+
+program
+  .command("runtime-build")
+  .description("build one reproducible self-contained Prime runtime artifact")
+  .requiredOption("--source <path>", "complete Prime package directory")
+  .requiredOption("--release-artifact <path>", "official pinned Prime release")
+  .requiredOption("--lockfile <path>", "pnpm lockfile used for dependencies")
+  .requiredOption("--output <path>", "new .tgz artifact path")
+  .option(
+    "--entrypoint <path>",
+    "entrypoint relative to source",
+    "dist/bundle/cli.js",
+  )
+  .action(async (options) => {
+    const built = await buildPrimeRuntimeArtifact({
+      sourceDir: resolve(options.source),
+      releaseArtifact: resolve(options.releaseArtifact),
+      lockfile: resolve(options.lockfile),
+      output: resolve(options.output),
+      entrypoint: options.entrypoint,
+      primeVersion: PRIME_AGENT_VERSION,
+      primeCommit: PRIME_AGENT_COMMIT,
+    });
+    print({
+      artifactPath: built.artifactPath,
+      artifactSha256: built.artifactSha256,
+      manifestSha256: built.manifestSha256,
+      primeVersion: built.manifest.primeVersion,
+      primeCommit: built.manifest.primeCommit,
+      platform: built.manifest.platform,
+      architecture: built.manifest.architecture,
+      nodeVersion: built.manifest.nodeVersion,
+      entries: built.manifest.entries.length,
+    });
+  });
 
 withStateRoot(
   program

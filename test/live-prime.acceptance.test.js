@@ -5,16 +5,12 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import {
-  JobStore,
-  PRIME_AGENT_VERSION,
-  PrimeDispatcher,
-} from "../dist/index.js";
+import { JobStore, PrimeDispatcher } from "../dist/index.js";
+import { livePrimeRuntime } from "./live-prime-runtime.js";
 
 const exec = promisify(execFile);
 const cli = new URL("../dist/cli.js", import.meta.url).pathname;
 const live = process.env.PRIME_DISPATCH_LIVE_ACCEPTANCE === "1";
-const primeAgentRoot = `/var/lib/evie-agent/downloads/prime-agent-${PRIME_AGENT_VERSION}`;
 
 async function git(cwd, ...args) {
   return (await exec("git", ["-C", cwd, ...args])).stdout.trim();
@@ -27,6 +23,7 @@ test(
     const root = await mkdtemp(join(tmpdir(), "prime-m1-live."));
     const repo = join(root, "repo");
     const stateRoot = join(root, "state");
+    const prime = await livePrimeRuntime();
     await mkdir(repo);
     await git(repo, "init", "-b", "main");
     await writeFile(join(repo, "README.md"), "beta milestone fixture\n");
@@ -55,13 +52,8 @@ test(
         {
           schemaVersion: 1,
           repoRoots: [root],
-          prime: {
-            executable:
-              process.env.PRIME_AGENT_EXECUTABLE ??
-              `${primeAgentRoot}/package/dist/bundle/cli.js`,
-            releaseArtifact:
-              process.env.PRIME_AGENT_TARBALL ?? `${primeAgentRoot}.tgz`,
-          },
+          prime,
+          multiChild: false,
           repositories: [
             {
               path: repo,
@@ -151,6 +143,12 @@ test(
       /example\.invalid/,
     );
     const result = await dispatcher.result(jobId);
+    assert.deepEqual(result.primeRuntime, state.primeRuntime);
+    assert.equal(
+      result.primeRuntime.artifactSha256,
+      prime.runtimeArtifactSha256,
+    );
+    assert.match(result.primeRuntime.entrypointSha256, /^[a-f0-9]{64}$/);
     assert.equal(result.gateResults[0].ok, true);
     assert.ok(result.inference);
     assert.ok(result.inference.requestCounts.total >= 2);

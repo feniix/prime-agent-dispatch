@@ -86,8 +86,8 @@ export const HostConfigSchema = z
     schemaVersion: z.literal(SCHEMA_VERSION),
     repoRoots: z.array(z.string().min(1)).min(1),
     prime: z.object({
-      executable: z.string().min(1),
-      releaseArtifact: z.string().min(1),
+      runtimeArtifact: z.string().min(1),
+      runtimeArtifactSha256: z.string().regex(/^[a-f0-9]{64}$/),
     }),
     multiChild: HostMultiChildPolicySchema,
     retention: RetentionPolicySchema.default(DEFAULT_RETENTION_POLICY),
@@ -124,8 +124,8 @@ export async function resolveHostRepositoryPolicy(
         gates: repository.gates,
         agent: {
           kind: "prime-rpc" as const,
-          executable: config.prime.executable,
-          releaseArtifact: config.prime.releaseArtifact,
+          runtimeArtifact: config.prime.runtimeArtifact,
+          runtimeArtifactSha256: config.prime.runtimeArtifactSha256,
         },
         ...(config.multiChild ? { multiChild: config.multiChild } : {}),
       };

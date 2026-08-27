@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PrimeRuntimeIdentitySchema } from "./prime-runtime-artifact.js";
 
 export const SCHEMA_VERSION = 1 as const;
 export const WORKER_PROTOCOL_VERSION = 1 as const;
@@ -85,8 +86,8 @@ export const AgentConfigSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("prime-rpc"),
-    executable: z.string().min(1),
-    releaseArtifact: z.string().min(1),
+    runtimeArtifact: z.string().min(1),
+    runtimeArtifactSha256: z.string().regex(/^[a-f0-9]{64}$/),
   }),
 ]);
 
@@ -345,6 +346,7 @@ export const JobStateSchema = z.object({
   summary: z.string().optional(),
   error: z.string().optional(),
   inference: InferenceUsageLedgerSchema.optional(),
+  primeRuntime: PrimeRuntimeIdentitySchema.optional(),
   terminalIntentStatus: z
     .enum(["succeeded", "failed", "cancelled", "interrupted"])
     .optional(),
@@ -383,6 +385,7 @@ export const JobResultSchema = z.object({
   reportArtifact: z.string().optional(),
   gateResults: z.array(GateResultSchema),
   inference: InferenceUsageLedgerSchema.optional(),
+  primeRuntime: PrimeRuntimeIdentitySchema.optional(),
   completedAt: z.string().datetime(),
 });
 export type JobResult = z.infer<typeof JobResultSchema>;
