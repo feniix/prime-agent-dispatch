@@ -544,6 +544,8 @@ export class PrimeDispatcher {
       `${workerNonce}:${reason}`,
       { reason },
     );
+    await this.store.interruptActiveChildren(state.jobId, reason);
+    await this.store.materializeChildEvidence(state.jobId);
     const token: LeaseToken | undefined = owner
       ? owner.kind === "launcher"
         ? { kind: "launcher", jobId: owner.jobId, nonce: owner.nonce }

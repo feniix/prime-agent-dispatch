@@ -16,6 +16,7 @@ This is not production-ready. The default execution backend is intentionally nam
 - **Containment:** containers are deferred. Current-user execution is explicitly unsafe-local and must be limited to trusted repositories.
 - **Beta Milestone 3:** **IMPLEMENTED for the disposable-fixture path.** Node 24's built-in SQLite owns transactional state, attempts, checkpoints, confirmations, leases, results, cursors, usage, artifact digests, and cleanup history. Explicit owner-confirmed resume continues only from mechanically proven safe evidence. Durable cleanup plans enforce host-owned age/byte policy while preserving minimum explanatory evidence. See the [Beta Milestone 3 report](docs/beta-milestone-3.md).
 - **Bounded child Git isolation:** writable child attempts receive host-derived branches and worktrees from immutable wave bases. Child commits remain proposals until the root performs an attributable integration transition; conflicts restore the root and preserve both sides. See [child proposal worktrees and root integration](docs/child-git-integration.md).
+- **Lossless child lifecycle:** cancellation intent, runtime inspection, complete subtree teardown, worker-death interruption, and resume bindings are durable and digest-bound. Bounded child evidence is protected by cleanup policy. See [child runtime lifecycle and recovery](docs/child-runtime-lifecycle.md).
 
 The project uses **pnpm exclusively**. Do not create or commit `package-lock.json` or use npm for project lifecycle commands.
 
@@ -93,6 +94,7 @@ The state root and each job have this layout:
     result.json
     report.md
     final.diff
+    children/evidence.json
     checks/
     logs/worker.log
     prime-agent/             dedicated Prime HOME/config/session directory
@@ -106,7 +108,7 @@ then persists the exact keep/delete decisions and their reasons. `cleanup-apply`
 accepts only that run id, validates the canonical snapshot and current object
 identity, and checkpoints each deletion. Nonterminal, leased, uncertain,
 corrupt, quarantined, and foreign content is never selected. Core result,
-report, diff, inference, gate, and worker-log evidence remains protected even
+report, diff, inference, child-tree, gate, and worker-log evidence remains protected even
 when that leaves a visible quota deficit.
 
 The state machine is:

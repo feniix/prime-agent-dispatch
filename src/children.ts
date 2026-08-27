@@ -262,6 +262,99 @@ export const NativeRlmSpawnHandleSchema = z
   .strict();
 export type NativeRlmSpawnHandle = z.infer<typeof NativeRlmSpawnHandleSchema>;
 
+export const ChildRuntimeProcessIdentitySchema = z
+  .object({
+    pid: z.number().int().positive(),
+    processStartIdentity: z.string().min(1).max(256),
+    role: z.enum(["session", "kernel", "forkserver", "subprocess"]),
+  })
+  .strict();
+export type ChildRuntimeProcessIdentity = z.infer<
+  typeof ChildRuntimeProcessIdentitySchema
+>;
+
+export const ChildRuntimeInspectionSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
+    handleDigest: DigestSchema,
+    status: z.enum(["live", "quiesced", "missing", "mismatched"]),
+    processes: z.array(ChildRuntimeProcessIdentitySchema).max(64),
+    checkedAt: z.string().datetime(),
+    summary: z.string().min(1).max(8_192),
+  })
+  .strict()
+  .superRefine((inspection, context) => {
+    if (inspection.status === "quiesced" && inspection.processes.length > 0)
+      context.addIssue({
+        code: "custom",
+        path: ["processes"],
+        message: "a quiesced child runtime cannot retain live processes",
+      });
+  });
+export type ChildRuntimeInspection = z.infer<
+  typeof ChildRuntimeInspectionSchema
+>;
+
+export const ChildCancellationIntentSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
+    requestedAt: z.string().datetime(),
+    gracefulDeadline: z.string().datetime(),
+    reason: z.string().min(1).max(256),
+  })
+  .strict()
+  .superRefine((intent, context) => {
+    if (Date.parse(intent.gracefulDeadline) < Date.parse(intent.requestedAt))
+      context.addIssue({
+        code: "custom",
+        path: ["gracefulDeadline"],
+        message: "child cancellation deadline precedes its request",
+      });
+  });
+export type ChildCancellationIntent = z.infer<
+  typeof ChildCancellationIntentSchema
+>;
+
+export const ChildRuntimeTeardownEvidenceSchema = z
+  .object({
+    schemaVersion: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
+    handleDigest: DigestSchema.optional(),
+    status: z.enum(["quiesced", "uncertain"]),
+    mode: z.enum([
+      "graceful",
+      "forced",
+      "already_quiescent",
+      "root_quiescence",
+      "worker_death",
+    ]),
+    processTreeQuiesced: z.boolean(),
+    registryAbsent: z.boolean(),
+    processes: z.array(ChildRuntimeProcessIdentitySchema).max(64),
+    completedAt: z.string().datetime(),
+    summary: z.string().min(1).max(8_192),
+  })
+  .strict()
+  .superRefine((evidence, context) => {
+    if (
+      evidence.status === "quiesced" &&
+      (!evidence.processTreeQuiesced || !evidence.registryAbsent)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "quiesced runtime evidence requires an absent registry and process tree",
+      });
+    if (evidence.status === "uncertain" && evidence.processTreeQuiesced)
+      context.addIssue({
+        code: "custom",
+        path: ["processTreeQuiesced"],
+        message: "uncertain runtime evidence cannot claim process-tree exit",
+      });
+  });
+export type ChildRuntimeTeardownEvidence = z.infer<
+  typeof ChildRuntimeTeardownEvidenceSchema
+>;
+
 export const ChildAttemptSchema = z
   .object({
     schemaVersion: z.literal(SCHEMA_VERSION),
@@ -281,6 +374,9 @@ export const ChildAttemptSchema = z
     inferenceAllocation: ChildInferenceAllocationSchema,
     inferenceLease: ChildInferenceLeaseRecordSchema.optional(),
     inferenceUsage: ChildInferenceUsageSnapshotSchema.optional(),
+    cancellationIntent: ChildCancellationIntentSchema.optional(),
+    runtimeInspection: ChildRuntimeInspectionSchema.optional(),
+    runtimeTeardown: ChildRuntimeTeardownEvidenceSchema.optional(),
     terminalEvidence: ChildTerminalEvidenceSchema.optional(),
   })
   .strict();

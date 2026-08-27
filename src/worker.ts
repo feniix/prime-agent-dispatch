@@ -275,6 +275,7 @@ async function finalizeTerminalOutcome(
   patch: Pick<JobState, "commitSha" | "noChanges" | "summary" | "error">,
   recoveryCheckpoint?: { attemptId: string; operationKey: string },
 ): Promise<JobState> {
+  await store.materializeChildEvidence(jobId);
   current = await syncInferenceUsage(current);
   const terminalView = { ...current, ...patch, status } satisfies JobState;
   const result = buildTerminalResult(
@@ -354,6 +355,26 @@ async function main(): Promise<void> {
   const attempt = await store.currentAttempt(jobId);
   const resumePlan = attempt.resumePlan;
   let gateResults: GateResult[] = [...(resumePlan?.gateResults ?? [])];
+  const quiesceChildrenWithRoot = async (reason: string): Promise<void> => {
+    await store.requestAllChildCancellations(jobId, reason);
+    const quiescence = await Promise.allSettled([
+      inferenceBroker?.close(),
+      agent?.abort(request.budget.cancellationGraceMs),
+    ]);
+    const failures = quiescence.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures,
+        "root and child process-tree quiescence could not be proven",
+      );
+    await store.completeRootCancelledChildren(
+      jobId,
+      `root process tree quiesced: ${reason}`,
+    );
+    await store.materializeChildEvidence(jobId);
+  };
   const requestCancellation = async (): Promise<void> => {
     cancellationRequested = true;
     cancellationPromise ??= (async () => {
@@ -365,7 +386,7 @@ async function main(): Promise<void> {
         });
       jobAbortController?.abort(new Error("cancelled by request"));
       await inferenceLease?.revoke();
-      await agent?.abort(request.budget.cancellationGraceMs);
+      await quiesceChildrenWithRoot("root cancellation requested");
     })();
     await cancellationPromise;
   };
@@ -739,6 +760,22 @@ async function main(): Promise<void> {
   } catch (error) {
     await cancellationPromise?.catch(() => undefined);
     await inferenceLease?.revoke().catch(() => undefined);
+    if (!cancellationRequested) {
+      try {
+        await quiesceChildrenWithRoot("root execution failed");
+      } catch (childError) {
+        await store.appendEvent(jobId, "child_teardown_failed", {
+          error:
+            childError instanceof Error
+              ? childError.message.slice(0, 8_192)
+              : String(childError).slice(0, 8_192),
+        });
+        throw new AggregateError(
+          [error, childError],
+          "root failed and child teardown could not be proven",
+        );
+      }
+    }
     if (error instanceof AgentRpcLineLimitError)
       await store
         .appendEvent(jobId, "agent_rpc_record_rejected", error.evidence)

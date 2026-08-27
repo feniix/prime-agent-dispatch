@@ -309,6 +309,22 @@ test("verification joins all attempts and active children must be cancelled befo
     expectedChildRevision: child.revision,
     envelopeDigest: child.envelopeDigest,
   });
+  child = await store.recordChildRuntimeTeardown(request.jobId, {
+    childId: child.envelope.childId,
+    attemptId: child.attempts.at(-1).attemptId,
+    expectedChildRevision: child.revision,
+    envelopeDigest: child.envelopeDigest,
+    evidence: {
+      schemaVersion: 1,
+      status: "quiesced",
+      mode: "already_quiescent",
+      processTreeQuiesced: true,
+      registryAbsent: true,
+      processes: [],
+      completedAt: new Date().toISOString(),
+      summary: "child had not started a native runtime",
+    },
+  });
   child = await store.completeChildAttempt(request.jobId, {
     ...completion(child, "cancelled", "root discarded this child"),
   });

@@ -214,6 +214,7 @@ function immediateRetentionPolicy() {
       "report.md",
       "final.diff",
       "inference-usage.json",
+      "children/",
       "checks/",
       "logs/worker.log",
     ],
