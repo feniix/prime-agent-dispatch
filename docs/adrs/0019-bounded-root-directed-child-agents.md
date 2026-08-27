@@ -216,3 +216,13 @@ live acceptance prove all of the following:
 - a live run against the explicitly selected prototype repository completes
   required implementation, test, and adversarial-review roles, preserves each
   evidence bundle, integrates reviewed child commits, and passes trusted gates.
+
+Confirmed on 2026-08-26 by live job `20260827020957-c3dddcb6-335`. The job used
+three logical children and four isolated attempts: the required mini-model test
+attempt failed without a trustworthy final result, and its linked sol-model
+retry succeeded. All attempt leases were revoked, all runtimes quiesced, the
+implementation proposal became the immutable wave-2 base, a fresh client
+delivered root-routed steering, and the resulting attributable commit passed
+the trusted format, typecheck, test, and audit gates. See the
+[Beta Milestone 4 report](../beta-milestone-4.md) for the evidence boundary and
+remaining rollout blockers.
