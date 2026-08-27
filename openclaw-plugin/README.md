@@ -34,14 +34,25 @@ corepack pnpm run build
 corepack pnpm run plugin:validate
 ```
 
-Do not install this package by linking its checkout into OpenClaw. Build both
-packages and use the repository's
-[`prime-dispatch-openclaw` lifecycle](../docs/openclaw-host-lifecycle.md), which
-copies a versioned release beneath the OpenClaw state directory, uses stable
-runtime/config/state paths, validates the config delta, and supports audit,
-upgrade, rollback, and state-preserving uninstall.
+Install a built online or offline artifact through OpenClaw's native plugin
+installer:
 
-The lifecycle manages an OpenClaw entry equivalent to:
+```bash
+openclaw plugins install ./prime-dispatch-openclaw-plugin-<release>-offline.tgz
+openclaw gateway restart
+```
+
+The plugin derives the active OpenClaw profile itself. It creates private
+managed runtime, configuration, and state beneath
+`$OPENCLAW_STATE_DIR/prime-dispatch`; no checkout path, `HOST_POLICY`
+environment variable, or direct Node installer is required.
+
+New installations intentionally authorize no repositories. Configure the
+standard plugin `hostPolicy` setting before launching a job; this is separate
+post-install authorization, not part of installing or loading the plugin. For
+example:
+
+The resulting OpenClaw entry is equivalent to:
 
 ```json
 {
@@ -50,11 +61,23 @@ The lifecycle manages an OpenClaw entry equivalent to:
       "prime-dispatch": {
         "enabled": true,
         "config": {
-          "cliPath": "$OPENCLAW_STATE_DIR/prime-dispatch/current/runtime/dist/cli.js",
-          "stateRoot": "$OPENCLAW_STATE_DIR/prime-dispatch/state",
-          "hostConfigPath": "$OPENCLAW_STATE_DIR/prime-dispatch/config/host.json",
-          "openclawStateDir": "$OPENCLAW_STATE_DIR",
-          "openclawConfigPath": "$OPENCLAW_STATE_DIR/openclaw.json"
+          "hostPolicy": {
+            "repoRoots": ["/absolute/path/to/source"],
+            "repositories": [
+              {
+                "path": "/absolute/path/to/source/repository",
+                "fixture": true,
+                "gates": [
+                  {
+                    "name": "test",
+                    "command": "/usr/bin/true",
+                    "args": [],
+                    "timeoutMs": 1000
+                  }
+                ]
+              }
+            ]
+          }
         }
       }
     }

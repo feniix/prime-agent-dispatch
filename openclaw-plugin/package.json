@@ -2,7 +2,6 @@
   "name": "openclaw-plugin-prime-dispatch",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
   "packageManager": "pnpm@11.21.0",
   "scripts": {
     "build": "tsc -p tsconfig.json",

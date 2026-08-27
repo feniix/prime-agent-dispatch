@@ -11,15 +11,16 @@ consulted: [ryn]
 
 The versioned OpenClaw lifecycle originally prepared releases from a built checkout, installed production dependencies from the registry on the target host, and left trusted host policy pointing at a Prime runtime outside the managed release. That is sufficient for development acceptance but not for repeatable deployment or disconnected installation.
 
-Online and offline packages need the same integrity, target, activation, upgrade, rollback, and audit behavior. Separate formats or installers would create two security boundaries and allow the paths to drift.
+Online and offline packages need the same integrity, target, and runtime behavior. They must also install through OpenClaw's public plugin installer; a private extraction and activation CLI is not a deployable OpenClaw plugin.
 
 ## Decision Drivers
 
-- Keep one parser, verifier, and lifecycle for both variants.
+- Make `openclaw plugins install <archive>` the only user-facing install entrypoint.
+- Keep one manifest and runtime-initialization path for both variants.
 - Make disconnected installation perform no network or package-manager work.
 - Bind each package to a target OS, architecture, and exact Node version.
-- Put the checksum-pinned Prime runtime inside the immutable managed release.
-- Reject archive traversal, unsupported entries, duplicate paths, unsafe links, expansion surprises, and modified payloads before lifecycle mutation.
+- Put the checksum-pinned Prime runtime under the active OpenClaw profile.
+- Emit an archive layout accepted by OpenClaw's native extractor and reject links or unsafe entries while building.
 - Keep local acceptance possible without claiming that unsigned local artifacts are ready for public distribution.
 
 ## Considered Options
@@ -33,27 +34,30 @@ Online and offline packages need the same integrity, target, activation, upgrade
 
 Chosen option: **one canonical manifest with online and offline modes**.
 
-Both `.tgz` variants contain compiled Prime Dispatch runtime/plugin sources, lockfiles, target identity, exact accepted OpenClaw version, source commit, release id, and a sorted per-entry manifest. Installation requires an out-of-band SHA-256 for the complete archive and verifies the archive plus canonical internal manifest before mutation.
+Both `.tgz` variants are OpenClaw plugin archives: `package.json`, `openclaw.plugin.json`, and the compiled plugin live at the archive root. They contain the compiled standalone runtime, target identity, exact accepted OpenClaw version, source commit, release id, and a sorted per-entry manifest. The published SHA-256 authenticates the complete archive before the operator passes it to OpenClaw.
 
-The online variant omits dependency trees and records an HTTPS URL plus checksum for the target-native Prime runtime. The target host installs lockfile-pinned production dependencies and downloads the runtime with redirects disabled and bounded streaming verification. Loopback HTTP is accepted only for local acceptance.
+The online variant omits dependency trees and records an HTTPS URL plus checksum for the target-native Prime runtime. OpenClaw installs the declared production dependencies as part of its native plugin install. On first plugin startup, Prime Dispatch downloads the runtime with redirects disabled and bounded streaming verification. Loopback HTTP is accepted only for local acceptance.
 
-The offline variant builds production dependency trees while packaging, embeds them plus the Prime runtime, and copies both into the release. Its install path does not invoke dependency installation or download code.
+The offline variant builds link-free production dependency trees while packaging and embeds them with the Prime runtime. Its root package declares no install-time dependencies, so OpenClaw performs no registry or runtime download work.
 
-Both variants rewrite the trusted host policy to the stable managed path:
+Both variants initialize the same private managed paths on plugin startup:
 
 ```text
-$OPENCLAW_STATE_DIR/prime-dispatch/current/prime/runtime.tgz
+$OPENCLAW_STATE_DIR/prime-dispatch/runtime/prime-runtime.tgz
+$OPENCLAW_STATE_DIR/prime-dispatch/config/host.json
+$OPENCLAW_STATE_DIR/prime-dispatch/state/
 ```
 
-The runtime checksum remains the policy authority. Published release digests now cover runtime, plugin, installed dependencies, and the managed Prime artifact.
+The runtime checksum remains the policy authority. A new installation creates an empty repository policy, so it loads successfully but rejects every job until the operator supplies `hostPolicy` through normal OpenClaw plugin configuration. No external policy-file path is part of installation.
 
 Target identity comes from successfully preparing the supplied Prime runtime artifact on the builder. This deliberately requires a native builder for `darwin-arm64` and `linux-x64`; cross-labeling native dependency trees is rejected as a deployment strategy.
 
 ### Consequences
 
-- Good, because online and offline installation share one verification and activation boundary.
+- Good, because users install both variants through OpenClaw's native plugin command.
 - Good, because offline installation is independently testable as zero network/package-manager work.
 - Good, because host policy no longer depends on a downloads directory after activation.
+- Good, because installation is usable before repository authority is configured and remains fail-closed.
 - Good, because artifacts are reproducible across restrictive umasks.
 - Bad, because each target needs a native package build environment and target-native Prime runtime.
 - Bad, because the offline artifact is substantially larger.
@@ -61,7 +65,7 @@ Target identity comes from successfully preparing the supplied Prime runtime art
 
 ### Confirmation
 
-Deterministic tests build both variants twice, install both through the shared lifecycle, assert that offline installation never invokes dependency installation, verify managed runtime policy and bytes, and reject whole-archive and payload tampering. Local target artifacts remain acceptance-only until the native target matrix and signing/publication controls are complete.
+Deterministic tests build both variants twice, verify their native archive roots and link-free offline trees, verify managed runtime policy and bytes, and reject runtime or target mismatches. Clean-profile acceptance installs both variants with `openclaw plugins install`, starts an isolated Gateway, and inspects the loaded tools, commands, service, and diagnostics. Local target artifacts remain acceptance-only until the native target matrix and signing/publication controls are complete.
 
 ## More Information
 

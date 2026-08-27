@@ -1,4 +1,30 @@
-# Durable OpenClaw host lifecycle
+# OpenClaw plugin deployment and legacy host lifecycle
+
+## Native plugin deployment
+
+Normal users install either deployment artifact through OpenClaw itself:
+
+```bash
+openclaw plugins install ./prime-dispatch-openclaw-plugin-<release>-offline.tgz
+openclaw gateway restart
+```
+
+The online artifact uses the identical command. OpenClaw installs its declared
+production dependencies, then the plugin downloads and verifies the pinned
+Prime runtime on first startup. The offline artifact contains link-free
+production dependencies and the Prime runtime; installation and startup make
+no network calls.
+
+The plugin derives its profile from OpenClaw and privately manages runtime,
+state, and generated host policy under `$OPENCLAW_STATE_DIR/prime-dispatch`.
+No checkout path, `HOST_POLICY` variable, or direct Node installer is needed.
+A clean installation begins with no authorized repositories. Configure
+`plugins.entries.prime-dispatch.config.hostPolicy` through normal OpenClaw
+configuration before starting a job. That is post-install job authorization,
+not an installation input.
+
+The lifecycle commands below remain for source-based development, migration,
+rollback, and audit of installations created by the earlier host lifecycle.
 
 This lifecycle implements [ADR-0016](adrs/0016-versioned-openclaw-host-lifecycle.md).
 
@@ -100,17 +126,19 @@ node dist/openclaw-host.js package-build \
   --output <online-package.tgz>
 ```
 
-The emitted JSON includes the mandatory archive SHA-256. Preserve it outside the archive. Install either variant through the same lifecycle:
+The emitted JSON includes the archive SHA-256. Verify it before installation,
+then install either variant through OpenClaw:
 
 ```bash
-node dist/openclaw-host.js package-install \
-  --package <package.tgz> \
-  --package-sha256 <package-sha256> \
-  --host-config-source <host-policy.json> \
-  --openclaw-state-dir "$OPENCLAW_STATE_DIR"
+shasum -a 256 ./artifact.tgz
+openclaw plugins install ./artifact.tgz
+openclaw gateway restart
 ```
 
-The installer rejects target OS, architecture, or exact Node-version mismatches. Online packages install production dependencies and fetch the checksum-pinned Prime runtime. Offline packages perform neither operation. Both copy the runtime into the immutable release and rewrite host policy to `prime-dispatch/current/prime/runtime.tgz`.
+Plugin startup rejects target OS, architecture, exact Node version, exact
+OpenClaw version, or Prime runtime checksum mismatches. Online packages install
+production dependencies and fetch the checksum-pinned Prime runtime. Offline
+packages perform neither network operation.
 
 On the first durable installation only, migrate an existing state directory:
 

@@ -16,10 +16,7 @@ import {
   type OpenClawLifecycleDependencies,
   type OpenClawPluginConfig,
 } from "./openclaw-install.js";
-import {
-  buildOpenClawPackage,
-  installOpenClawPackage,
-} from "./openclaw-package.js";
+import { buildNativeOpenClawPluginPackage } from "./openclaw-native-package.js";
 
 const execFileAsync = promisify(execFile);
 const defaultSourceRoot = resolve(
@@ -248,9 +245,7 @@ withCommonOptions(
 
 program
   .command("package-build")
-  .description(
-    "build a checksum-manifested online or offline deployment package",
-  )
+  .description("build a native online or offline OpenClaw plugin package")
   .requiredOption("--variant <variant>", "online or offline", (value) => {
     if (value !== "online" && value !== "offline")
       throw new Error("package variant must be online or offline");
@@ -292,7 +287,7 @@ program
         throw new Error(
           `source commit mismatch: expected ${options.sourceCommit}, got ${sourceHead.trim()}`,
         );
-      const built = await buildOpenClawPackage({
+      const built = await buildNativeOpenClawPluginPackage({
         variant: options.variant,
         sourceRoot: options.sourceRoot,
         sourceCommit: options.sourceCommit,
@@ -317,40 +312,6 @@ program
       });
     },
   );
-
-withCommonOptions(
-  program
-    .command("package-install")
-    .description("verify and install a local deployment package")
-    .requiredOption("--package <path>")
-    .requiredOption("--package-sha256 <digest>")
-    .requiredOption("--host-config-source <path>")
-    .option("--state-source <path>", "one-time state migration source"),
-).action(
-  async (
-    options: CommonOptions & {
-      package: string;
-      packageSha256: string;
-      hostConfigSource: string;
-      stateSource?: string;
-    },
-  ) => {
-    print(
-      await installOpenClawPackage(
-        {
-          openclawStateDir: options.openclawStateDir,
-          packagePath: options.package,
-          packageSha256: options.packageSha256,
-          hostConfigSource: options.hostConfigSource,
-          ...(options.stateSource ? { stateSource: options.stateSource } : {}),
-          restartGateway: Boolean(options.restartGateway),
-          ...pluginConfig(options),
-        },
-        dependencies(options),
-      ),
-    );
-  },
-);
 
 withCommonOptions(
   program.command("rollback").description("activate the previous release"),
