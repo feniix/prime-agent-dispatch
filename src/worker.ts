@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 import { createServer, type Socket } from "node:net";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   AgentRpcLineLimitError,
   createAgentBackend,
   type AgentBackend,
 } from "./agent.js";
-import { UnsafeLocalExecutionBackend } from "./execution.js";
+import {
+  finalizeWorktreeCommit,
+  UnsafeLocalExecutionBackend,
+} from "./execution.js";
 import { JobStore } from "./store.js";
 import {
   WORKER_PROTOCOL_VERSION,
@@ -38,6 +41,7 @@ import {
 } from "./recovery.js";
 import { assertResumePlanEvidence } from "./resume.js";
 import { assertChildControlTarget } from "./children.js";
+import { GatedPrimeSubagentHost, PrimeSdkAgentBackend } from "./prime-sdk.js";
 
 function readArg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -46,11 +50,12 @@ function readArg(name: string): string {
   return value;
 }
 
-const stateRoot = readArg("--state-root");
+const requestedStateRoot = readArg("--state-root");
 const jobId = readArg("--job-id");
 const launchNonce = readArg("--launch-nonce");
 const workerNonce = readArg("--worker-nonce");
-const store = new JobStore(stateRoot);
+const store = new JobStore(requestedStateRoot);
+const stateRoot = store.root;
 let controlDir: string | undefined;
 let socketPath: string | undefined;
 let agent: AgentBackend | undefined;
@@ -353,6 +358,7 @@ async function main(): Promise<void> {
   };
   let state = await store.readState(jobId);
   const attempt = await store.currentAttempt(jobId);
+  const childTree = await store.readChildTree(jobId);
   const resumePlan = attempt.resumePlan;
   let gateResults: GateResult[] = [...(resumePlan?.gateResults ?? [])];
   const quiesceChildrenWithRoot = async (reason: string): Promise<void> => {
@@ -467,7 +473,7 @@ async function main(): Promise<void> {
         upstream: new URL("https://chatgpt.com/backend-api/codex/responses"),
         accessToken: auth.accessToken,
         accountId: auth.accountId,
-        maxConcurrency: 1,
+        maxConcurrency: childTree?.inferencePolicy.aggregateMaxConcurrency ?? 1,
         maxRequestBytes: 4 * 1024 * 1024,
         onUsageFinalized: async (record, inference, binding) => {
           if (binding.kind === "child") {
@@ -519,6 +525,14 @@ async function main(): Promise<void> {
         configDir,
         brokerBaseUrl: inferenceLease.endpoint.toString(),
         scopedToken: inferenceLease.opaqueToken,
+        ...(childTree
+          ? {
+              models: childTree.inferencePolicy.models.map((model) => ({
+                id: model.model,
+                reasoning: model.reasoning,
+              })),
+            }
+          : {}),
       });
       const path = await installRemoteInertGitGuard(
         join(store.jobDir(jobId), "artifacts", "prime-agent", "bin"),
@@ -544,7 +558,27 @@ async function main(): Promise<void> {
     state = await store.updateState(jobId, "running", execution);
     let agentResult = resumePlan?.agentResult;
     if (shouldRunStage(resumePlan, "prime_execution")) {
-      agent = createAgentBackend(request, store.jobDir(jobId), primeRuntime);
+      agent =
+        childTree &&
+        request.agent.kind === "prime-rpc" &&
+        inferenceBroker &&
+        primeRuntime
+          ? new PrimeSdkAgentBackend(
+              {
+                executable: request.agent.executable,
+                ...primeRuntime,
+              },
+              new GatedPrimeSubagentHost(
+                store,
+                request,
+                {
+                  executable: request.agent.executable,
+                  ...primeRuntime,
+                },
+                inferenceBroker,
+              ),
+            )
+          : createAgentBackend(request, store.jobDir(jobId), primeRuntime);
       await store.beginCheckpoint(
         jobId,
         attempt.attemptId,
@@ -621,7 +655,10 @@ async function main(): Promise<void> {
       );
       const command = await runCommand(gate.command, gate.args, {
         cwd: execution.worktreePath,
-        env: buildRemoteInertGitEnvironment(),
+        env: buildRemoteInertGitEnvironment({
+          PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+          TMPDIR: process.env.TMPDIR ?? tmpdir(),
+        }),
         timeoutMs: gate.timeoutMs,
         maxOutputBytes: request.budget.maxOutputBytes,
         signal: controller.signal,
@@ -670,36 +707,13 @@ async function main(): Promise<void> {
         "commit",
         { baseSha: request.baseSha },
       );
-      await git(execution.worktreePath, ["add", "-A"], gitControl);
       assertJobActive();
-      const staged = await git(
-        execution.worktreePath,
-        ["diff", "--cached", "--name-only"],
-        gitControl,
-      );
-      noChanges = staged.length === 0;
-      if (!noChanges) {
-        await git(
-          execution.worktreePath,
-          [
-            "-c",
-            "user.name=Prime Dispatch",
-            "-c",
-            "user.email=prime-dispatch@local.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-m",
-            `prime dispatch ${jobId}`,
-          ],
-          gitControl,
-        );
-        commitSha = await git(
-          execution.worktreePath,
-          ["rev-parse", "HEAD"],
-          gitControl,
-        );
-      }
+      ({ commitSha, noChanges } = await finalizeWorktreeCommit({
+        worktreePath: execution.worktreePath,
+        baseSha: request.baseSha,
+        jobId,
+        control: gitControl,
+      }));
       await store.completeCheckpoint(jobId, attempt.attemptId, "git:commit", {
         ...(commitSha ? { commitSha } : {}),
         noChanges,

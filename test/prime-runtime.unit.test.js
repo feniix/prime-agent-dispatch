@@ -448,3 +448,26 @@ test("Prime private config contains only scoped broker token and fixed model", a
     "ipython",
   ]);
 });
+
+test("Prime private config exposes only the confirmed child model allowlist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-child-config-"));
+  const path = await writePrimeModelsConfig({
+    configDir: root,
+    brokerBaseUrl: "http://127.0.0.1:1234/v1",
+    scopedToken: "child-scoped-token",
+    models: [
+      { id: "gpt-5.6-sol", reasoning: ["high"] },
+      { id: "gpt-5.6-mini", reasoning: ["medium", "high"] },
+    ],
+  });
+  const config = JSON.parse(await readFile(path, "utf8"));
+  const models = config.providers["prime-dispatch-broker"].models;
+  assert.deepEqual(
+    models.map(({ id, thinkingLevelMap }) => [id, thinkingLevelMap]),
+    [
+      ["gpt-5.6-sol", { high: "high" }],
+      ["gpt-5.6-mini", { medium: "medium", high: "high" }],
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(config), /provider-secret|account-secret/);
+});

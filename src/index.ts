@@ -13,6 +13,7 @@ export * from "./openclaw-auth.js";
 export * from "./openclaw-install.js";
 export * from "./policy.js";
 export * from "./prime-runtime.js";
+export * from "./prime-sdk.js";
 export * from "./release.js";
 export * from "./repository.js";
 export * from "./recovery.js";

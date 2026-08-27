@@ -1,9 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadHostConfig, resolveHostRepositoryPolicy } from "../dist/index.js";
+import {
+  DEFAULT_CHILD_INFERENCE_POLICY,
+  loadHostConfig,
+  resolveHostRepositoryPolicy,
+} from "../dist/index.js";
 
 test("trusted host config is the only source of real-job roots, gates, and Prime paths", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-host-config-"));
@@ -68,7 +72,7 @@ test("trusted host config is the only source of real-job roots, gates, and Prime
   );
 });
 
-test("trusted host config defaults repositories to non-fixtures", async () => {
+test("trusted host config defaults repositories to non-fixtures and multi-child execution", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-host-config-live-"));
   const repo = join(root, "repo");
   await mkdir(repo);
@@ -102,6 +106,16 @@ test("trusted host config defaults repositories to non-fixtures", async () => {
     repo,
   );
   assert.equal(policy.fixture, false);
+  assert.deepEqual(policy.multiChild, DEFAULT_CHILD_INFERENCE_POLICY);
+
+  const raw = JSON.parse(await readFile(path, "utf8"));
+  raw.multiChild = false;
+  await writeFile(path, JSON.stringify(raw));
+  const singleRoot = await resolveHostRepositoryPolicy(
+    await loadHostConfig(path),
+    repo,
+  );
+  assert.equal("multiChild" in singleRoot, false);
 });
 
 test("trusted retention policy cannot discard the minimum explanatory evidence set", async () => {

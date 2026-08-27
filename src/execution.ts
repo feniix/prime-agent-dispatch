@@ -17,6 +17,49 @@ export interface ExecutionBackend {
   ): Promise<PreparedExecution>;
 }
 
+export async function finalizeWorktreeCommit(options: {
+  worktreePath: string;
+  baseSha: string;
+  jobId: string;
+  control?: { signal?: AbortSignal; terminationGraceMs?: number };
+}): Promise<{ commitSha?: string; noChanges: boolean }> {
+  await git(options.worktreePath, ["add", "-A"], options.control);
+  const staged = await git(
+    options.worktreePath,
+    ["diff", "--cached", "--name-only"],
+    options.control,
+  );
+  if (staged.length > 0)
+    await git(
+      options.worktreePath,
+      [
+        "-c",
+        "user.name=Prime Dispatch",
+        "-c",
+        "user.email=prime-dispatch@local.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        `prime dispatch ${options.jobId}`,
+      ],
+      options.control,
+    );
+  const headSha = await git(
+    options.worktreePath,
+    ["rev-parse", "HEAD"],
+    options.control,
+  );
+  const changed = await git(
+    options.worktreePath,
+    ["diff", "--name-only", `${options.baseSha}..${headSha}`],
+    options.control,
+  );
+  return changed.length === 0
+    ? { noChanges: true }
+    : { commitSha: headSha, noChanges: false };
+}
+
 export class UnsafeLocalExecutionBackend implements ExecutionBackend {
   plan(request: JobRequest, stateRoot: string): PreparedExecution {
     return {

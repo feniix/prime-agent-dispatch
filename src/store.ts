@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, realpathSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -8,7 +9,7 @@ import {
   readlink,
   rename,
 } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import {
   digestContent,
   digestFile,
@@ -465,8 +466,10 @@ export class JobStore {
   private readonly faultInjector: ((point: string) => void) | undefined;
 
   constructor(root: string, options: JobStoreOptions = {}) {
-    this.root = root;
-    this.database = openControlDatabase(root);
+    const resolvedRoot = resolve(root);
+    mkdirSync(resolvedRoot, { recursive: true, mode: 0o700 });
+    this.root = realpathSync(resolvedRoot);
+    this.database = openControlDatabase(this.root);
     this.faultInjector = options.faultInjector;
   }
 
@@ -2063,12 +2066,12 @@ export class JobStore {
       const envelope = ChildSpawnEnvelopeSchema.parse(
         parseSqliteJson(row.envelope_json, "child spawn envelope"),
       );
+      const allocation = this.childInferenceAllocationFromRow(
+        this.childInferenceAllocationRow(attempt.attempt_id),
+      );
       if (nativeHandle.name !== envelope.name)
         throw new Error("native child name does not match admitted child");
-      if (
-        nativeHandle.model !==
-        `${envelope.inference.provider}/${envelope.inference.model}`
-      )
+      if (nativeHandle.model !== `${allocation.provider}/${allocation.model}`)
         throw new Error("native child model does not match admitted child");
       this.database
         .prepare(

@@ -349,7 +349,13 @@ test("resume rejects a replacement repository at the owned worktree path", async
     { worktreePath, branchName },
   );
   await git(repo, "worktree", "remove", "--force", worktreePath);
-  await exec("git", ["clone", repo, worktreePath]);
+  await exec("git", [
+    "-c",
+    "protocol.file.allow=always",
+    "clone",
+    repo,
+    worktreePath,
+  ]);
   await git(worktreePath, "checkout", "-b", branchName, request.baseSha);
   await interrupt(store, request);
 
