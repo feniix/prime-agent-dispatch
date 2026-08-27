@@ -13,6 +13,8 @@ Code baseline: `9414ec75371aeef8cfca6c27fb9770725c437797`
 ## Evidence classification
 
 - **Repository fact:** directly verified in the reviewed source or tests.
+- **Requester-confirmed deployment fact:** supplied by the system owner and
+  used as an architecture input, but still checked during host preflight.
 - **Review-host observation:** directly observed on the workstation used for
   this assessment. It is not automatically the production topology.
 - **Upstream capability:** stated by the tool's primary documentation.
@@ -22,6 +24,62 @@ Code baseline: `9414ec75371aeef8cfca6c27fb9770725c437797`
 The implementation plan is not production evidence. PD-01 remains open until
 the deployment unknowns are resolved and the adversarial acceptance suite
 passes.
+
+## Resolved deployment context: Evie Platform on macOS
+
+The requester confirmed that the deployment platform is macOS and this work is
+for Evie Platform. The local Evie Platform baseline reviewed for integration
+grounding is `a94cdeca0a574fa044694229a4ac8a52be4a18d4`.
+
+Repository-grounded facts at that baseline:
+
+- Evie provisions dedicated Apple-silicon Mac Minis:
+  [`README.md:1`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/README.md#L1-L4).
+- OpenClaw runs as `_evie-agent` with home `/var/lib/evie-agent`, while the
+  administrative account is separate:
+  [`ansible/group_vars/all.yml:7`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/ansible/group_vars/all.yml#L7-L14).
+- `_evie-agent` has a false login shell and a 0700 home, but it intentionally
+  owns a passphrase-less SSH key and source/download directories:
+  [`ansible/roles/agent_user/tasks/main.yml:30`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/ansible/roles/agent_user/tasks/main.yml#L30-L40),
+  [`:74`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/ansible/roles/agent_user/tasks/main.yml#L74-L110),
+  and
+  [`:146`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/ansible/roles/agent_user/tasks/main.yml#L146-L163).
+- The gateway LaunchDaemon runs as `_evie-agent`; its child processes inherit
+  the agent HOME and PATH:
+  [`ansible/roles/gateway/templates/gateway.plist.j2:5`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/ansible/roles/gateway/templates/gateway.plist.j2#L5-L33).
+- Current package configuration contains neither Colima nor Docker, and the
+  current Ansible roles contain no Colima role:
+  [`ansible/group_vars/all.yml:23`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/ansible/group_vars/all.yml#L23-L38).
+- Accepted ADR-0043 moved platform services to bare-metal LaunchDaemons and
+  explicitly says this frees Colima for future agent sandboxing:
+  [`ADR-0043:29`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/docs/adr/ADR-0043-bare-metal-services-over-colima-containers.md#L29-L50)
+  and
+  [`:71`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/docs/adr/ADR-0043-bare-metal-services-over-colima-containers.md#L71-L85).
+- The same ADR records that Tart VMs cannot run Colima because nested
+  virtualization is unavailable, so real VZ acceptance testing cannot be
+  delegated to the existing Tart provisioning tests:
+  [`ADR-0043:35`](https://github.com/evie-platform/evie-platform/blob/a94cdeca0a574fa044694229a4ac8a52be4a18d4/docs/adr/ADR-0043-bare-metal-services-over-colima-containers.md#L35-L41).
+
+Security consequences:
+
+- A Prime process running directly as `_evie-agent` can read the agent's SSH
+  key, OpenClaw state, repositories, and any same-UID credential material. The
+  0700 home protects against other UIDs, not hostile code under the same UID.
+- `_evie-agent` cannot own or receive the Colima/Docker socket. Docker control
+  authority would let prompt-reachable code create arbitrary containers and
+  mounts, destroying the boundary.
+- Add a separate `_evie-runner` service account and a purpose-built Colima
+  profile. This preserves Evie's existing admin/agent split and follows its
+  LaunchDaemon deployment pattern without restoring platform services to the
+  VM.
+- Run Colima/VZ acceptance tests on physical Apple-silicon hardware. Unit and
+  fake-runtime tests can run in normal CI; Tart cannot validate the actual VM
+  boundary.
+
+Evie's README states that Notion is authoritative and Markdown ADR mirrors can
+lag. Before implementation, publish the final runtime decision to the canonical
+Evie ADR database and reconcile any newer decision not present in this local
+baseline.
 
 ## Repository facts that drive the design
 
@@ -182,7 +240,7 @@ Collection commands were read-only: `sw_vers`, `uname`, `command -v`, and
 
 Conclusions supported by this evidence:
 
-- The Linux systemd/rootless-Podman profile has not been exercised on this
+- The selected Colima/VZ profile has not been installed or exercised on this
   workstation.
 - The workstation satisfies Apple's documented macOS 26 and Apple-silicon
   prerequisites for Apple `container`, and hardware virtualization is exposed,
@@ -190,13 +248,60 @@ Conclusions supported by this evidence:
 - Podman on this host would require a Linux VM; it cannot provide a direct
   Linux-container backend on macOS.
 
-This does **not** establish that the review workstation is the intended
-deployment host. That topology decision remains required.
+This does **not** establish that the review workstation is the exact deployment
+machine. The target class is resolved to an Evie Platform Apple-silicon Mac;
+the exact host and pinned runtime identities still require target preflight.
 
 ## Upstream-documented capabilities
 
 All sources below were accessed on 2026-08-27. Pin an exact tested tool release
 when implementation begins; `latest` documentation is not a version contract.
+
+### Colima/VZ and Docker
+
+Colima v0.10.3 is the current Colima release and the v1 spike candidate as of
+the grounding date; it is not approved until the spike passes. Its pinned
+primary sources establish that:
+
+- Colima supports Apple-silicon macOS, multiple instances/profiles, and Docker
+  or containerd runtimes.
+- the Docker runtime is the default and exposes a host-side client connection;
+- `--mount none` is an explicit CLI option: the parser returns a nil mount list,
+  and the resolved configuration treats nil as no mounts;
+- this flag is security-critical because an ordinary explicit empty mount list
+  instead resolves to the user's HOME mounted read-write;
+- SSH-agent forwarding and Kubernetes are separately controlled and disabled by
+  default;
+- `vmType: vz` selects Apple's Virtualization.framework backend on supported
+  macOS releases.
+
+Sources:
+
+- [Colima v0.10.3 README](https://github.com/abiosoft/colima/blob/v0.10.3/README.md#L13-L24)
+- [Colima `--mount none` parsing](https://github.com/abiosoft/colima/blob/v0.10.3/cmd/start.go#L245-L259)
+  and
+  [mount-value conversion](https://github.com/abiosoft/colima/blob/v0.10.3/cmd/start.go#L293-L320)
+- [Colima nil-versus-empty mount semantics](https://github.com/abiosoft/colima/blob/v0.10.3/config/config.go#L122-L131)
+- [Colima VZ and default HOME-mount documentation](https://github.com/abiosoft/colima/blob/v0.10.3/embedded/defaults/colima.yaml#L154-L195)
+  and
+  [`mounts` documentation](https://github.com/abiosoft/colima/blob/v0.10.3/embedded/defaults/colima.yaml#L247-L260)
+
+Docker's primary documentation establishes a `none` network driver that leaves
+only loopback in a container, create/run controls for read-only root filesystems,
+capability removal, resource limits, tmpfs/volume mounts, users, labels, and
+pull policy, and a default seccomp profile.
+
+Sources:
+
+- [Docker none network driver](https://docs.docker.com/engine/network/drivers/none/)
+- [`docker container create`](https://docs.docker.com/reference/cli/docker/container/create/)
+- [Docker seccomp profile](https://docs.docker.com/engine/security/seccomp/)
+
+These capabilities ground the selected design, but they do not prove the
+composition. The spike still has to show that the actual profile has zero host
+mounts, `_evie-agent` cannot use the socket, attached relay streams work with
+`network=none`, resource limits hold inside the VM, and force-stopping the VM
+eliminates an untrusted process when Docker is unavailable.
 
 ### Rootless Podman and `crun`
 
@@ -221,23 +326,6 @@ Sources:
 `crun` describes itself as an OCI-runtime-spec-conforming runtime with
 libseccomp, capabilities, and systemd integration. That supports evaluating it;
 it does not prove this workload's syscall profile or teardown behavior.
-
-### systemd socket and resource control
-
-The systemd manuals document filesystem Unix-socket activation, socket mode and
-ownership controls, private execution environments, writable-path restrictions,
-and cgroup resource controls. They also document passing activation sockets to
-a service running in a different network namespace.
-
-Sources:
-
-- [`systemd.socket(5)`](https://man7.org/linux/man-pages/man5/systemd.socket.5.html)
-- [`systemd.exec(5)`](https://man7.org/linux/man-pages/man5/systemd.exec.5.html)
-- [`systemd.resource-control(5)`](https://man7.org/linux/man-pages/man5/systemd.resource-control.5.html)
-
-These sources ground the proposed service shape. The exact unit still needs a
-real-host test because `PrivateDevices`, namespace restrictions, overlay
-storage, rootless Podman, and `Delegate=` can interact.
 
 ### Unix sockets in Node
 
@@ -325,10 +413,30 @@ case.
 
 Source: [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html)
 
-This grounds the proposed native materialization helper. Node does not expose
-all `openat2()` resolution controls directly.
+This grounds the source/result materializer that runs inside the Linux guest.
+It does not apply to final materialization on macOS. That path must use and test
+Darwin directory-descriptor/no-follow operations, and v1 should reject symlink
+changes until the native helper passes adversarial race tests.
 
-## macOS runtime candidates grounded in current facts
+## macOS runtime selection grounded in current facts
+
+### Selected for the v1 spike: dedicated Colima profile
+
+Colima is the v1 spike choice because all of the following are true at once:
+
+- the deployment target is an Evie Platform Apple-silicon Mac;
+- Evie has already operated Colima/VZ and ADR-0043 explicitly reserves its
+  future use for agent sandboxing;
+- the current host configuration has removed Colima, so a new profile can be
+  purpose-built without inheriting platform-service volumes or socket exposure;
+- Colima has an explicit no-host-mount representation, while Docker supplies a
+  documented no-network container mode;
+- a dedicated profile gives cancellation a VM-level fail-closed fallback when
+  the Docker control plane cannot prove teardown.
+
+This is a selection for implementation and testing, not evidence that PD-01 is
+closed. Colima v0.10.3, the guest image, Docker Engine version, profile config,
+and relay mechanism must be pinned by the successful spike.
 
 ### Podman machine
 
@@ -347,9 +455,9 @@ default violates the Prime Dispatch boundary. A Podman-machine spike must start
 from a dedicated configuration with the default volume list empty and prove no
 host path is visible inside the VM or job container.
 
-Podman machine is a plausible way to host the Linux runner profile on the
-observed Mac, but the runner protocol and broker path must cross the VM without
-exposing the Podman API, SSH authority, or general host mounts.
+Podman machine is technically plausible, but it is not selected for v1. It
+duplicates the Linux-VM layer while discarding Evie's prior Colima operational
+experience and ADR-0043's explicit sandbox direction.
 
 ### Apple `container`
 
@@ -374,22 +482,22 @@ command reference does not establish a `network=none` equivalent with the exact
 broker-only behavior required here. The tool is also not installed. Apple
 `container` therefore remains a candidate, not the selected backend, until a
 spike proves network denial, socket-only inference, process teardown, inspect
-identity, and recovery.
+identity, and recovery. Revisit it after v1 if its stronger per-container VM
+boundary becomes worth a second backend.
 
 ## What remains ungrounded
 
-The following cannot be answered from this repository or the review
-workstation:
+The target platform and product context are resolved. The following still
+require implementation-time evidence:
 
-- Is the intended deployment host this Mac, a Linux VM on it, or a separate
-  Linux host?
-- Which exact OS, kernel, systemd, Podman, `crun`, Apple `container`, or VM
-  versions will be supported?
-- Which OS identities run OpenClaw, the adapter, the detached worker, and the
-  proposed runner?
-- Can an operator create a dedicated service account, system service/launchd
-  service, subordinate UID/GID ranges, and runtime directories?
-- Is SELinux, AppArmor, or another mandatory-access-control system available?
+- Which exact Evie Mac Mini model, CPU/RAM/disk allocation, macOS build, Colima,
+  Lima, guest kernel, Docker Engine/CLI, and image versions will be supported?
+- What UID/GID will `_evie-runner` and `_evie-prime-control` use, and which
+  existing Evie processes need runner-socket membership?
+- Which Ansible role owns `_evie-runner`, its launchd services, runtime
+  directories, and upgrade/rollback sequencing?
+- Which guest seccomp/cgroup features are effective under the pinned Colima
+  image and Docker Engine?
 - Must exact root/child commit history be preserved, or is one attributable
   final commit acceptable?
 - What repository size, file-count, symlink, non-UTF-8-path, submodule, Git LFS,
@@ -397,8 +505,8 @@ workstation:
 - What is the maximum job/child concurrency after the current global-one-job
   limit is removed?
 - Is an approved package proxy available for dependency artifact construction?
-- What recovery-time and disk-retention limits apply to runner workspaces and
-  VM images?
+- What recovery-time, VM boot-time, CPU/RAM reservation, and disk-retention
+  limits apply to runner volumes and images?
 
 These are implementation inputs, not details to invent. Record their answers in
 the containment ADR and canonical host policy.
@@ -409,46 +517,34 @@ Run this only on the intended disposable target host. All inventory commands
 are read-only; containment probes create only deliberately disposable test
 containers or VMs.
 
-### Linux inventory
-
-```sh
-uname -srmo
-cat /etc/os-release
-systemctl --version
-systemd-detect-virt
-stat -fc '%T' /sys/fs/cgroup
-cat /sys/fs/cgroup/cgroup.controllers
-podman version
-podman info --debug --format json
-crun --version
-grep '^prime-runner:' /etc/subuid /etc/subgid
-sysctl kernel.unprivileged_userns_clone
-getenforce
-aa-status --enabled
-```
-
-Capture the output as a redacted artifact. The gate fails if cgroup v2,
-rootless user namespaces, the selected OCI runtime, resource controllers, or
-the mandatory image/policy identity is absent. Do not print registry auth or
-environment secrets.
-
 ### macOS inventory
 
 ```sh
 sw_vers
 uname -srmo
 sysctl -n kern.hv_support
-container --version
-container system status
-podman version
-podman machine info
-podman machine inspect
+id _evie-agent
+id _evie-runner
+launchctl print system/com.evie.prime-colima
+launchctl print system/com.evie.prime-runner
+/opt/homebrew/bin/colima version
+sudo -u _evie-runner -H env COLIMA_PROFILE=prime-sandbox colima status
+sudo -u _evie-runner -H env COLIMA_PROFILE=prime-sandbox colima list
+sudo -u _evie-runner -H env COLIMA_PROFILE=prime-sandbox colima ssh -- mount
+sudo -u _evie-runner -H env COLIMA_PROFILE=prime-sandbox colima ssh -- cat /proc/self/cgroup
+sudo -u _evie-runner -H env DOCKER_HOST=unix:///var/lib/evie-runner/.colima/prime-sandbox/docker.sock docker version
+sudo -u _evie-runner -H env DOCKER_HOST=unix:///var/lib/evie-runner/.colima/prime-sandbox/docker.sock docker info
 ```
 
-Run only the commands for an installed candidate. For Podman machine, verify
-the machine's volume list does not contain the host home or any OpenClaw/source
-path. For Apple `container`, capture the exact release, system configuration,
-default network behavior, and inspect schema.
+Also capture ownership/mode and SHA-256 for both plists, wrappers, runner binary,
+policy, seccomp profile, Colima config, control socket, runner home, and Docker
+socket. Inspect the resolved profile and guest mount table. The gate fails if
+the profile does not resolve to `vmType: vz`, Docker runtime, `mounts: null`,
+`forwardAgent: false`, `autoActivate: false`, `network.address: false`, and
+Kubernetes disabled; if any `/Users`, `/var/lib/evie-agent`, `/opt/evie`, or
+other macOS filesystem appears in the guest; or if `_evie-agent` can traverse
+the runner home or open the Docker socket. Do not print registry auth or
+environment secrets.
 
 ## Executable spike: required evidence
 
@@ -501,21 +597,18 @@ runner shim that can produce the following evidence.
 - Result integration accepts a valid manifest, rejects path/digest/mode/base/ref
   changes, and performs the ref update once.
 
-## Runtime-selection decision record
+## Runtime validation decision record
 
-Choose only after collecting the spike artifacts:
+The product/platform decision selects a dedicated Colima/VZ profile for the v1
+spike. Production enablement still has only two outcomes:
 
-1. **Native Linux target:** use the rootless Podman/`crun` profile if every
-   Linux preflight and spike assertion passes.
-2. **Observed macOS target, Apple `container`:** select it only if broker-only
-   networking can be enforced and its pre-1.0 lifecycle/inspect APIs meet the
-   recovery contract.
-3. **Observed macOS target, Podman machine:** select it only with all default
-   host mounts removed and runnerd operating inside the VM through a narrow,
-   authenticated relay.
-4. **No candidate passes:** keep real Prime disabled. Do not weaken the
-   contract or relabel `unsafe-local` as contained.
+1. **Every macOS preflight and adversarial spike assertion passes:** pin the
+   exact host, Colima/Lima, guest, Docker, image, policy, plist, and relay
+   identities and proceed with the selected backend.
+2. **Any assertion fails:** keep real Prime disabled. Do not switch to Apple
+   `container` or Podman machine without a new ADR and equivalent evidence, and
+   do not weaken the contract or relabel `unsafe-local` as contained.
 
 The decision record must include exact versions, configuration digests,
 commands, raw redacted output, failed probes, performance/resource measurements,
-and the reason each rejected candidate failed.
+and the reason each failed assertion did or did not block production.

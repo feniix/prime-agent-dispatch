@@ -13,81 +13,66 @@ review-host facts, unresolved deployment assumptions, and hypotheses that must
 be proved by a spike. The architecture below is a proposal until those gates
 pass.
 
-## Recommendation
+## Deployment decision
 
-For a Linux deployment target, implement the first production containment
-backend with:
+The target is Evie Platform's dedicated Apple-silicon Mac Mini running macOS
+Tahoe. Implement v1 with:
 
-- **rootless Podman with `crun`** as the OCI runtime;
-- **a static, dedicated `prime-runner` OS account** with no OpenClaw, provider,
-  source-repository, or control-plane access;
-- **a root-owned systemd service** that runs `prime-runnerd` as that account and
-  delegates a cgroup v2 subtree;
+- **a dedicated Colima profile named `prime-sandbox`**, using Apple's
+  Virtualization.framework (`vmType: vz`) and the Docker runtime inside its
+  Linux VM;
+- **a new `_evie-runner` macOS service account**, separate from OpenClaw's
+  `_evie-agent`, with no SSH key, provider credential, repository checkout,
+  OpenClaw state, login shell, admin group, or sudo grant;
+- **root-owned LaunchDaemons** for the Colima profile and `prime-runnerd`, both
+  dropping to `_evie-runner` through `UserName`;
+- **no macOS host mounts in the Colima VM** (`--mount=none`) and guest-native
+  Docker volumes for source, result, and
+  lease-socket state;
 - **one container for the root Prime session and one container per child or
-  verification gate**, each receiving only its own workspace;
-- **`--network=none` for every untrusted container** and a single mounted Unix
-  socket that reaches only its scoped inference lease;
+  verification gate**, each receiving only its own Docker volumes;
+- **`--network=none` for every untrusted and relay container**. Inference and
+  child-control bytes cross the VM through an attached, fixed relay process,
+  not a host bind mount or a network route;
 - **an immutable OCI image selected by digest**, built from a `Containerfile`,
-  scanned, given an SBOM, and signed before installation;
-- **Node's HTTP implementation over Unix sockets plus Zod schemas** for the
-  runner API, rather than introducing gRPC or a privileged container daemon
-  socket into the OpenClaw process;
+  scanned, given an SBOM, signed, and preloaded into the dedicated VM;
+- **Node HTTP over a macOS Unix socket plus strict Zod schemas** for the narrow
+  runner API. Only `prime-runnerd` receives `DOCKER_HOST`; `_evie-agent` never
+  receives a Docker/Colima socket or arbitrary container arguments;
 - **Git plumbing plus a content-addressed result manifest** for final
   integration, avoiding repository hooks, filters, credential helpers, and
   shell execution in the trusted control plane.
 
-This is the best fit for the current TypeScript codebase and a Linux deployment
-model.
-Rootless Podman has standard OCI image and lifecycle tooling, integrates with
-cgroups and systemd, and does not require handing the OpenClaw user a rootful
-Docker socket. `crun` is preferred because it has mature cgroup v2 and rootless
-support.
+This choice is grounded in Evie Platform's current architecture: ADR-0043
+removed infrastructure services from Colima and explicitly reserved its future
+use for agent sandboxing. The current Ansible tree no longer installs Colima or
+Docker, so Workstream 2 must add a purpose-built sandbox role rather than revive
+the old general-purpose profile.
 
-The review workstation is actually macOS 26.5.2 on Apple silicon, and none of
-Podman, `crun`, Apple `container`, Lima, or Colima is installed there. If that
-Mac is the intended deployment host, first choose and prove either a dedicated
-Linux runner VM or an Apple `container` backend. The systemd/rootless-Podman
-profile cannot run directly on macOS.
-
-Each backend profile must fail closed on an unsupported OS, missing isolation
-feature, unverified image, or policy mismatch. Do not silently fall back to
-`unsafe-local`.
+The runtime remains a proposal until it passes the executable spike on real
+Apple-silicon hardware. The backend must fail closed if the dedicated profile,
+VM boot identity, image, policy, network denial, host-mount denial, or Docker
+socket ownership is wrong. It must never fall back to `unsafe-local`.
 
 ## Why these tools
 
-| Tool or approach                  | Decision       | Reason                                                                                                  |
-| --------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------- |
-| Rootless Podman + `crun`          | Use            | Daemonless OCI lifecycle, rootless namespaces, cgroup v2 limits, digest-pinned images, systemd support. |
-| systemd                           | Use on Linux   | Static service identity, socket ownership, restart policy, resource delegation, and installation audit. |
-| Node HTTP over Unix sockets + Zod | Use            | Matches the existing stack, streams large bodies, versions cleanly, and avoids a new RPC toolchain.     |
-| `Containerfile` / Buildah         | Use            | Reproducible OCI build path supported directly by Podman.                                               |
-| Syft + Grype                      | Use in release | Generate an SBOM and fail builds on reviewed vulnerability policy.                                      |
-| Cosign                            | Use in release | Sign the image digest and attach SBOM/provenance attestations.                                          |
-| Rootless Docker                   | Do not prefer  | Viable, but its daemon/socket model adds authority and operational state without a project benefit.     |
-| Bubblewrap                        | Spike fallback | Small attack surface, but image distribution, cgroups, lifecycle, and broker wiring become custom work. |
-| Firecracker                       | Future option  | Stronger VM boundary, but KVM, image boot, networking, snapshots, and observability are heavier.        |
-| Kubernetes                        | Do not use     | Adds a cluster control plane to a single-host detached-job problem.                                     |
-| Podman machine on macOS           | Candidate      | Required for Podman on macOS; disable its default host-HOME mount and prove VM relays.                  |
-| Apple `container` on macOS        | Candidate      | Matches the observed macOS 26/arm64 host and gives each container a VM; needs a network-deny spike.     |
+| Tool or approach                  | Decision       | Reason                                                                                                       |
+| --------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------ |
+| Dedicated Colima + Docker         | Use for v1     | Already evaluated operationally by Evie; VZ provides a Linux VM boundary and Docker provides `network=none`. |
+| launchd LaunchDaemons             | Use            | Matches Evie's headless boot and service supervision pattern.                                                |
+| Separate `_evie-runner` account   | Use            | Keeps VM/container authority out of the prompt-reachable `_evie-agent` account.                              |
+| Node HTTP over Unix sockets + Zod | Use            | Matches the stack, streams large bodies, versions cleanly, and avoids a new RPC toolchain.                   |
+| `Containerfile`                   | Use            | Reproducible OCI build consumed by Docker without coupling job requests to build tooling.                    |
+| Syft + Grype                      | Use in release | Generate an SBOM and fail builds on reviewed vulnerability policy.                                           |
+| Cosign                            | Use in release | Sign the image digest and attach SBOM/provenance attestations.                                               |
+| Apple `container`                 | Revisit later  | Strong per-container VM boundary, but broker-only networking and stable recovery APIs are not yet proved.    |
+| Podman machine                    | Do not use v1  | Duplicates the Linux-VM layer without matching Evie's prior operational work or accepted sandbox direction.  |
+| Kubernetes                        | Do not use     | Adds a cluster control plane to a single-host, globally serialized detached-job problem.                     |
 
-If the threat model later includes hostile kernel-exploit research or multiple
-mutually hostile tenants, move the same runner protocol behind Firecracker or
-another microVM backend. The protocol should not expose Podman-specific details
-to the worker.
-
-For the observed Mac, run a short comparative spike before selecting a runtime:
-
-- Apple `container`: prove an OCI image can run with no external network, only
-  one published broker socket, a read-only root, dropped capabilities, bounded
-  CPU/memory/processes, no host mounts, complete teardown, and stable inspect
-  identity.
-- Podman machine: create a dedicated VM with the documented default
-  `$HOME:$HOME` mount removed, run `prime-runnerd` inside it, use rootless
-  Podman `--network=none`, and prove that source/result/broker traffic crosses
-  the VM without a general host mount or Podman API exposure.
-
-Prefer the candidate that passes the complete contract with fewer privileged
-host integrations. Until one passes, macOS containment remains unsupported.
+If the threat model later includes mutually hostile tenants or routinely
+hostile kernel-exploit research, move the same runner protocol to Apple
+`container` after its contract is proved, or to a separate physical runner.
+The worker-facing protocol must not expose Docker- or Colima-specific details.
 
 ## Security boundary and process ownership
 
@@ -100,11 +85,11 @@ Separate the system into three trust levels:
    - Never executes repository code, Prime SDK code, gates, dependency scripts,
      or Git hooks.
 2. **`prime-runnerd` service**
-   - Runs as the credential-free `prime-runner` account.
-   - Owns rootless Podman storage and disposable job workspaces.
+   - Runs as the credential-free `_evie-runner` account.
+   - Owns only the dedicated Colima profile and its Docker socket.
    - Converts a host-owned policy into fixed OCI operations.
    - Accepts opaque IDs and streamed content, never caller-selected host paths,
-     images, mounts, Podman flags, or arbitrary host commands.
+     images, mounts, Docker flags, or arbitrary host commands.
 3. **Untrusted OCI containers**
    - Run Prime, IPython, children, gates, package lifecycle scripts, and
      repository-local Git operations.
@@ -119,7 +104,9 @@ flowchart LR
     Store[(SQLite and evidence)]
     Provider[Provider endpoint]
     Broker[Trusted inference broker]
-    Runner[prime-runnerd as dedicated UID]
+    Runner[prime-runnerd as _evie-runner]
+    VM[Dedicated Colima VZ VM]
+    Relay[Fixed no-network relay containers]
     Root[Root OCI container]
     Child[Child OCI container]
     Gate[Gate OCI container]
@@ -129,22 +116,25 @@ flowchart LR
     Worker <--> Store
     Worker --> Broker --> Provider
     Worker <-->|versioned UDS API| Runner
-    Runner --> Root
-    Runner --> Child
-    Runner --> Gate
-    Root <-->|lease-only UDS| Broker
-    Child <-->|lease-only UDS| Broker
-    Root <-->|bounded child RPC| Worker
+    Runner --> VM
+    VM --> Root
+    VM --> Child
+    VM --> Gate
+    Root <-->|guest UDS| Relay
+    Child <-->|guest UDS| Relay
+    Relay <-->|Docker attach stream| Runner
+    Runner <-->|lease socket| Broker
+    Root -->|bounded child RPC through relay| Relay
     Worker -->|base tree stream| Runner
     Runner -->|validated result manifest| Worker
     Worker -->|Git plumbing only| Repo
 ```
 
-`prime-runner` and the OpenClaw user should share only narrowly scoped
-`prime-dispatch-control` and broker-relay groups. `prime-runner` must not join
-the OpenClaw user's general-purpose groups, and the OpenClaw user must not be
-able to modify the runner binary, systemd unit, policy, image store, or
-workspace root.
+`_evie-runner` and `_evie-agent` share only a narrowly scoped
+`_evie-prime-control` group for the runner control socket. `_evie-runner` must
+not join the agent group, and `_evie-agent` must not be able to traverse the
+runner home, read its Docker socket, invoke Colima as that user, or modify the
+runner binary, LaunchDaemon plists, policy, image store, or VM state.
 
 The current global one-job lease reduces cross-job exposure in the first
 release. Still give root, child, and gate processes different mount/PID/IPC
@@ -155,28 +145,32 @@ sibling child's workspace.
 
 Require and audit:
 
-- Linux with cgroup v2;
-- systemd with resource delegation for the runner unit;
-- rootless Podman and `crun` from the supported distribution;
-- unprivileged user namespaces enabled;
-- `/etc/subuid` and `/etc/subgid` ranges for `prime-runner`;
-- SELinux enforcing with private relabeling where available, or an AppArmor
-  profile on supported Ubuntu deployments;
-- enough disk for the immutable image, Podman overlay storage, and bounded job
-  workspaces.
+- a supported macOS 26 release on Apple silicon with
+  `kern.hv_support = 1`;
+- exact pinned Colima, Lima, Docker CLI, and guest Docker Engine versions;
+- the `vz` VM backend, `mounts: null` as resolved from `--mount none`, SSH-agent
+  forwarding disabled, no reachable VM address, and no Kubernetes;
+- a dedicated `_evie-runner` UID/GID and 0700 home, separate from
+  `_evie-agent` and the administrative operator;
+- root-owned LaunchDaemon plists, policy, executable, image trust material, and
+  the canonical Colima configuration template;
+- enough disk and fixed VM-level CPU/memory/disk ceilings for the image,
+  guest-native volumes, and bounded jobs.
 
 Recommended layout:
 
 ```text
-/usr/libexec/prime-dispatch/prime-runnerd       root:root 0755
-/usr/libexec/prime-dispatch/container-entry    root:root 0755
-/etc/prime-dispatch/runner.json                root:root 0644
-/etc/prime-dispatch/seccomp.json               root:root 0644
-/var/lib/prime-dispatch-runner/                 prime-runner:prime-runner 0700
-  storage/                                      rootless Podman storage
-  jobs/<job-id>/<attempt-id>/                   generated by runnerd
-/run/prime-dispatch-runner/control.sock         prime-runner:prime-dispatch-control 0660
-/run/prime-dispatch-brokers/<lease-id>/         scoped relay endpoint only
+/opt/evie/bin/prime-runnerd                     root:wheel 0755
+/opt/evie/etc/prime-runner/policy.json          root:wheel 0644
+/opt/evie/etc/prime-runner/colima.yaml          root:wheel 0644
+/opt/evie/etc/prime-runner/seccomp.json         root:wheel 0644
+/Library/LaunchDaemons/com.evie.prime-colima.plist  root:wheel 0644
+/Library/LaunchDaemons/com.evie.prime-runner.plist  root:wheel 0644
+/var/lib/evie-runner/                           _evie-runner:_evie-runner 0700
+  .colima/prime-sandbox/                        dedicated VM and Docker socket
+  state/                                        opaque runtime metadata only
+/opt/evie/run/prime-runner/                     _evie-runner:_evie-prime-control 0750
+  control.sock                                  _evie-runner:_evie-prime-control 0660
 ```
 
 The OpenClaw installation command must not silently create system users or
@@ -184,58 +178,37 @@ install system services. Add a separate operator-reviewed runner installation
 flow that requires administrative authority, then make the existing lifecycle
 audit verify the installed runner without mutating it.
 
-### systemd service shape
+### launchd service shape
 
-Use socket activation so systemd creates the control socket before runnerd
-starts. The production units should express these properties:
+Add two Ansible-managed LaunchDaemons following Evie's existing system-domain
+pattern:
 
-```ini
-# prime-runnerd.socket (illustrative)
-[Socket]
-ListenStream=/run/prime-dispatch-runner/control.sock
-SocketUser=prime-runner
-SocketGroup=prime-dispatch-control
-SocketMode=0660
-RemoveOnStop=true
+1. `com.evie.prime-colima` runs Colima as `_evie-runner`, with explicit
+   `HOME=/var/lib/evie-runner`, `COLIMA_PROFILE=prime-sandbox`, pinned PATH, and
+   no agent/OpenClaw environment. Its wrapper verifies the root-owned expected
+   configuration digest before starting the fixed profile in the foreground.
+2. `com.evie.prime-runner` runs `prime-runnerd` as `_evie-runner`. Its wrapper
+   waits for the exact profile socket, verifies its owner/mode and VM identity,
+   then exports `DOCKER_HOST` only to runnerd.
 
-# prime-runnerd.service (illustrative hardening requirements)
-[Service]
-User=prime-runner
-Group=prime-runner
-SupplementaryGroups=prime-dispatch-control prime-dispatch-broker
-ExecStart=/usr/libexec/prime-dispatch/prime-runnerd
-Environment=HOME=/var/lib/prime-dispatch-runner
-Environment=XDG_RUNTIME_DIR=/run/prime-dispatch-runner
-NoNewPrivileges=true
-CapabilityBoundingSet=
-AmbientCapabilities=
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-RestrictSUIDSGID=true
-LockPersonality=true
-UMask=0077
-Delegate=true
-ReadWritePaths=/var/lib/prime-dispatch-runner /run/prime-dispatch-runner
-```
+Both use `RunAtLoad`, unconditional `KeepAlive`, `ThrottleInterval=30`, bounded
+logs under `/opt/evie/log/prime-runner/`, and root-owned plist/wrapper files.
+Intentional shutdown uses `launchctl bootout`; do not create a competing
+LaunchAgent.
 
-Treat this as a starting profile, not a copy-paste promise. Rootless Podman must
-be exercised under the exact unit because namespace and cgroup restrictions can
-conflict with container creation. Never fix such a conflict by adding root
-capabilities, `--privileged`, a rootful Podman socket, or broad writable paths.
-Record the final unit digest in installation audit evidence.
+launchd does not create Unix sockets for the process. Runnerd must create the
+control socket atomically beneath the pre-created 0750 runtime directory, set
+mode 0660/group `_evie-prime-control`, reject a pre-existing non-socket or
+wrong-owner path, and unlink it on clean shutdown. Record the plist, wrapper,
+policy, Colima config, and runner binary digests in installation audit evidence.
 
 ## Runner API
 
 ### Transport
 
-Use `node:http` over `/run/prime-dispatch-runner/control.sock`:
+Use `node:http` over `/opt/evie/run/prime-runner/control.sock`:
 
-- systemd creates or owns the socket;
+- runnerd creates the socket beneath the Ansible-created runtime directory;
 - the socket ACL is local service admission, not proof of Discord owner
   identity; bind each operation to the short-lived control-plane capability
   described in Workstream 1 when that capability is implemented;
@@ -247,17 +220,17 @@ Use `node:http` over `/run/prime-dispatch-runner/control.sock`:
   types, unknown fields, and unsupported protocol versions;
 - request IDs, workspace IDs, and container IDs are generated by runnerd;
 - the client never supplies a filesystem path, image tag, entrypoint, mount,
-  environment variable name, or raw Podman argument.
+  environment variable name, or raw Docker/Colima argument.
 
-Node does not expose Linux `SO_PEERCRED` through a stable public API. Do not use
-private `socket._handle` methods. If exact peer UID/GID enforcement is required
-beyond the systemd socket ACL, put a minimal root-owned Rust acceptor in front
-of the TypeScript HTTP server and verify `SO_PEERCRED` there. Peer credentials
-still identify an OS process, not a Discord owner, so they do not replace the
-control-plane capability.
+Node does not expose macOS local-socket peer credentials through a stable public
+API. Do not use private `socket._handle` methods. If exact peer UID/GID
+enforcement is required beyond filesystem ownership, put a minimal root-owned
+Rust acceptor in front of the TypeScript server and verify macOS
+`LOCAL_PEERCRED`. Peer credentials still identify an OS process, not a Discord
+owner, so they do not replace the per-operation control-plane capability.
 
-Do not mount the Podman API socket into OpenClaw and do not expose runnerd over
-TCP.
+Do not expose the Colima SSH configuration, Docker socket, or Docker context to
+OpenClaw, and do not expose runnerd over TCP.
 
 ### Minimal API surface
 
@@ -305,9 +278,12 @@ values.
 
 ```ts
 type ContainmentPolicyV1 = {
-  id: "prime-linux-v1";
+  id: "prime-macos-colima-v1";
+  vmProfile: "prime-sandbox";
+  vmType: "vz";
+  hostMounts: "none";
   imageDigest: `sha256:${string}`;
-  runtime: "crun";
+  runtime: "docker";
   network: "none";
   readOnlyRootfs: true;
   capabilities: [];
@@ -345,13 +321,16 @@ Build an exact, canonical source artifact from the confirmed base tree:
    `.prime-dispatch/` namespace, absolute paths, `..`, NULs, duplicates, and
    case-fold collisions on the target filesystem.
 5. Stream the artifact directly to runnerd with a total byte ceiling and
-   digest. Do not create a shared exchange directory.
-6. Runnerd writes to a new `O_EXCL` temporary file inside its owned job root,
-   verifies the complete digest, fsyncs it, renames it, and then invokes the
-   existing traversal/link/manifest validation patterns before extraction.
-7. Inside the workspace, initialize a private Git repository and create a
-   synthetic base commit. Persist the mapping between original base commit,
-   original base tree, and synthetic base commit.
+   digest. Do not create a shared exchange directory or a macOS bind mount.
+6. Runnerd creates a randomly named, labeled Docker volume and a fixed
+   no-network materializer container. It streams the artifact over the Docker
+   attach/exec channel. The audited materializer performs beneath-root path
+   resolution, `O_EXCL` writes, digest verification, fsync, and atomic
+   publication entirely inside the Linux VM.
+7. The materializer initializes a private Git repository in that volume and
+   creates a synthetic base commit. Persist the mapping between original base
+   commit, original base tree, synthetic base commit, volume ID, and VM boot
+   identity.
 
 Using a tree artifact instead of a Git bundle avoids copying unrelated history,
 remotes, hooks, repository config, alternates, replace refs, and credential
@@ -374,7 +353,7 @@ Add a root-owned, digest-pinned image containing only:
   still disabled;
 - a non-root `prime` user and an empty writable home supplied at runtime.
 
-Do not include SSH clients, cloud CLIs, Docker/Podman clients, systemd, compilers
+Do not include SSH clients, cloud CLIs, Docker clients, init systems, compilers
 not required by supported repositories, or package-registry credentials.
 
 Build requirements:
@@ -390,7 +369,7 @@ Build requirements:
   exception policy;
 - sign the image digest and attach SBOM/provenance attestations with Cosign;
 - make the runner installer verify the signature and expected identity before
-  importing the image into rootless Podman storage;
+  importing the image into the dedicated Colima profile;
 - set `--pull=never` for every job. Network retrieval must never occur during
   admission or resume.
 
@@ -403,14 +382,13 @@ Runnerd must construct the OCI request itself. The following is an illustrative
 policy, not a caller-visible command template:
 
 ```text
-podman create
+docker create
   --pull=never
-  --runtime=crun
   --read-only
   --network=none
   --cap-drop=all
   --security-opt=no-new-privileges
-  --security-opt=seccomp=/etc/prime-dispatch/seccomp.json
+  --security-opt=seccomp=<verified-guest-profile>
   --pids-limit=<host-policy>
   --memory=<host-policy>
   --cpus=<host-policy>
@@ -418,8 +396,8 @@ podman create
   --stop-timeout=<host-policy>
   --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=<host-policy>
   --tmpfs=/run:rw,nosuid,nodev,noexec,size=<host-policy>
-  --mount=type=bind,src=<runner-owned-workspace>,dst=/workspace,rw
-  --mount=type=bind,src=<lease-socket>,dst=/run/prime/broker.sock,rw
+  --mount=type=volume,src=<runner-generated-workspace-volume>,dst=/workspace,rw
+  --mount=type=volume,src=<runner-generated-lease-volume>,dst=/run/prime,rw
   --user=<fixed-non-root-uid>:<fixed-non-root-gid>
   --workdir=/workspace
   --label=<runner-generated-job-identity>
@@ -435,57 +413,59 @@ Required invariants:
 - private PID, IPC, mount, UTS, and network namespaces;
 - a read-only root filesystem with bounded tmpfs mounts;
 - only one workspace and the exact role-specific sockets mounted;
-- a private SELinux label (`:Z`) where SELinux is enabled;
-- cgroup v2 limits for CPU, memory, PIDs, and wall-clock enforcement outside
-  the container;
+- Docker/cgroup limits for CPU, memory, PIDs, and file descriptors, plus a
+  host-owned wall-clock timer and a fixed VM-level resource ceiling;
 - image and entrypoint selected from root-owned policy;
-- container labels include job, attempt, role, workspace, policy digest, and
-  image digest so reconciliation can reject substitutions.
+- container and volume labels include job, attempt, role, workspace, policy
+  digest, image digest, profile, and VM boot identity so reconciliation can
+  reject substitutions.
 
-Start with Podman's default seccomp profile plus explicit no-new-privileges and
+Start with Docker's default seccomp profile plus explicit no-new-privileges and
 zero capabilities. Record syscalls from the deterministic and live fixture
 suites, then publish a tighter project profile. Do not guess a tiny syscall
 allowlist that breaks Node, Python, or Git and tempts operators to use
 `seccomp=unconfined`.
 
-Rootless user-namespace mode must be fixed by policy and verified with
-`podman inspect`. For v1, the dedicated credential-free runner UID plus private
-mount namespaces is the primary host boundary. Before permitting concurrent
-unrelated jobs, allocate distinct subordinate UID/GID ranges or idmapped mounts
-per workspace so a container escape to the runner UID cannot read another
-job's staging data.
+The VZ Linux VM is the macOS host boundary; Docker namespaces and cgroups are
+the within-VM job boundary. Verify the Colima profile has no macOS mounts and
+that the job has no Docker socket. Before permitting concurrent unrelated jobs,
+prove that distinct Docker volumes and container UIDs prevent cross-workspace
+access after a container escape inside the VM, or allocate one VM per job.
 
 ## Inference path with no container network
 
 The existing broker should remain in the trusted worker because it holds the
 provider access token and authoritative usage callbacks.
 
-Add Unix-socket support:
+Add a VM-crossing relay that does not require host mounts or VM networking:
 
-1. The trusted broker creates one socket per inference lease beneath
-   `/run/prime-dispatch-brokers/<lease-id>/`. The path is derived from a
-   validated opaque lease ID rather than accepted as a caller-selected path.
-2. The socket is bound to the lease in server state and has a random directory
-   name, strict shared-relay group access, expiry, and revocation behavior.
-3. Runnerd creates a second, runner-owned socket inside the matching workspace
-   and starts a fixed byte relay from that socket to the lease socket. The relay
-   has no destination parameter after creation and never receives the provider
-   credential.
-4. Runnerd bind-mounts only its container-side socket at
-   `/run/prime/broker.sock`. This avoids exposing cross-UID runtime directories
-   or requiring broad host group mappings inside the container.
-5. A small fixed bridge inside the image listens only on container loopback and
-   forwards HTTP bytes to that Unix socket. Prime continues to use an HTTP base
-   URL such as `http://127.0.0.1:<fixed-port>/v1`.
-6. The container still presents the scoped bearer token. The broker enforces
-   lease ID, token digest, job/child binding, model, reasoning, concurrency,
-   request bytes, request count, token budget, expiry, redirect rejection, SSE
-   bounds, and revocation exactly as it does now.
+1. The trusted worker creates one macOS Unix socket per inference lease beneath
+   its private runtime directory. The path is derived from a validated opaque
+   lease ID rather than accepted as a caller-selected path.
+2. Runnerd connects to that socket after a capability-bound request. The broker
+   retains the provider credential and binds the connection to the lease,
+   expiry, model, budget, and revocation state.
+3. Runnerd creates a guest-native Docker volume and a fixed `broker-relay`
+   container with `--network=none`. The relay listens on
+   `/relay/broker.sock` in that volume and exposes only a framed bidirectional
+   byte stream on its attached stdin/stdout.
+4. Runnerd bridges the relay's Docker attach stream to the trusted broker
+   socket. The relay image and command are fixed by policy; it accepts no
+   destination, hostname, port, path, or proxy command from the job.
+5. Runnerd mounts the same guest volume into only the matching root or child at
+   `/run/prime`. A small fixed bridge inside the job image listens on container
+   loopback and forwards HTTP bytes to `/run/prime/broker.sock`. Prime continues
+   to use `http://127.0.0.1:<fixed-port>/v1`.
+6. The job still presents the scoped bearer token. The broker enforces lease
+   ID, token digest, job/child binding, model, reasoning, concurrency, request
+   bytes, request count, token budget, expiry, redirect rejection, SSE bounds,
+   and revocation exactly as it does now.
 
 The bridge has no destination parameter, DNS resolver, CONNECT support,
 generic proxy behavior, or filesystem browsing. It knows one socket and one
-HTTP route family. If the mount or bridge fails, the job fails; runnerd must not
-enable slirp4netns, pasta, or host networking as a fallback.
+framed attach stream. If the volume, attach stream, or bridge fails, the job
+fails; runnerd must not enable container networking, publish a host port, or
+mount a host path as a fallback.
 
 Test from inside the container that internet, DNS, host loopback, RFC 1918,
 link-local, IPv6, cloud metadata, and arbitrary Unix sockets are unreachable
@@ -498,8 +478,8 @@ into `container-entry`:
 
 1. The trusted worker prepares host policy, broker lease, source artifact, and
    runner workspace.
-2. Runnerd starts a `prime-root` container with the root workspace, root broker
-   socket, and a job-scoped child-control socket.
+2. Runnerd starts a `prime-root` container with the root workspace volume and
+   guest-native broker/child-control volumes backed by fixed attached relays.
 3. `container-entry` constructs a strict environment from constants and
    host-approved values. It must not inherit runnerd's environment.
 4. The entrypoint verifies the mounted runtime/image identity and workspace
@@ -508,8 +488,8 @@ into `container-entry`:
 5. Agent JSONL/events stream through runnerd to the trusted worker with the
    existing byte limits and hashing behavior.
 6. Steering and cancellation travel through the runner API to the entrypoint.
-7. Completion is not trusted until runnerd proves the container and cgroup are
-   quiescent and seals the workspace.
+7. Completion is not trusted until runnerd proves the container has exited,
+   no process remains in its cgroup, and the workspace volume is sealed.
 
 The container environment allowlist should contain only locale, minimal PATH,
 job-private HOME/TMPDIR, fixed runtime paths, job/attempt IDs, the local broker
@@ -524,7 +504,9 @@ Preserve durable child admission in the trusted worker, but replace in-process
 child sessions with a remote runtime:
 
 - `container-entry` in the root implements Prime's `subagentRuntimeHost` with a
-  `RemoteRlmHostProxy` over the mounted child-control Unix socket.
+  `RemoteRlmHostProxy` over a guest-native child-control Unix socket. A fixed
+  no-network relay carries its framed stream over Docker attach to runnerd and
+  the trusted worker.
 - The trusted worker exposes only bounded `run`, `inspect`, and `cancel`
   operations on that socket. It reuses `BoundedRlmHostBridge` for prompt,
   model, reasoning, dependency, concurrency, retry, and lifecycle admission.
@@ -541,15 +523,16 @@ child sessions with a remote runtime:
   runnerd to integrate the proposal into the root workspace. Integration Git
   commands run under the credential-free runner account with hooks, filters,
   remotes, helpers, pagers, and editors disabled.
-- Freeze the root runtime's cgroup while runnerd snapshots a wave base or
+- Pause the root container with Docker while runnerd snapshots a wave base or
   integrates a child proposal. Revalidate root HEAD and worktree state before
-  and after the operation, then unfreeze it. This prevents a daemonized root
+  and after the operation, then unpause it. This prevents a daemonized root
   tool from racing the trusted child integration while the SDK awaits the
   child result.
 - The root sees the new wave base only after durable integration evidence is
   committed, matching current ordering.
-- Cancellation destroys only the selected child cgroup and revokes only its
-  lease. Root cancellation recursively destroys all child and gate runtimes.
+- Cancellation destroys only the selected child container/volumes and revokes
+  only its lease. Root cancellation recursively destroys all child and gate
+  runtimes.
 
 The root and child containers must never share a writable mount. This preserves
 the current proposal/integration model as an actual isolation property rather
@@ -620,7 +603,10 @@ type ContainedResultManifestV1 = {
 
 Integration sequence:
 
-1. Stop every root, child, and gate runtime and seal the runner workspace.
+1. Stop every root, child, relay, and gate runtime and seal the guest-native
+   workspace volume. Start a fixed, no-network exporter with that volume mounted
+   read-only and stream its manifest/blobs to runnerd over Docker attach. Never
+   bind-mount the volume into macOS.
 2. Revalidate manifest ownership, policy/image identity, base commit/tree,
    path rules, modes, counts, per-file size, total size, and blob digest.
 3. Re-read the selected repository and prove that the confirmed base commit and
@@ -650,10 +636,12 @@ credentials/remotes, no pager/editor/signing, and an empty root-owned
 trusted-side operations.
 
 Initially reject symlink changes if the secure materializer cannot provide
-race-free beneath-root operations. If symlink support is required, use a small
-audited helper based on `openat2` with `RESOLVE_BENEATH`,
-`RESOLVE_NO_MAGICLINKS`, and no-follow semantics rather than path-string checks
-alone.
+race-free beneath-root operations. The trusted materializer runs on macOS, so
+do not specify Linux `openat2()` for this path. Use a small audited Rust or Swift
+helper that walks from an already-open root directory descriptor with Darwin
+`openat()`/`fstatat()`, `O_NOFOLLOW`, `AT_SYMLINK_NOFOLLOW`, and atomic
+`renameat()` operations. Revalidate every opened component and never resolve a
+caller-controlled absolute path.
 
 This approach preserves an automatic local commit without executing runner
 code or repository hooks as the OpenClaw user. Child commit SHAs remain runner
@@ -668,25 +656,29 @@ Extend durable identity with:
 - runner protocol version and runnerd boot identity;
 - workspace ID and source-manifest digest;
 - runtime IDs for root, children, and gates;
-- Podman container ID, OCI image digest, containment-policy digest, cgroup path,
-  role, and start timestamp;
+- Colima profile and VM boot identity, Docker container/volume IDs, OCI image
+  digest, containment-policy digest, cgroup identity, role, and start timestamp;
 - broker and child-control socket lease IDs, never their bearer values;
 - last event sequence and sealed/result state.
 
-Reconciliation must call runnerd and compare every field with `podman inspect`
-and cgroup state. A matching live runtime may reconnect. A missing, replaced,
-wrong-image, wrong-policy, wrong-label, or ambiguous runtime becomes
-interrupted; do not recreate it silently.
+Reconciliation must call runnerd and compare every field with `colima status`,
+the profile configuration digest, `docker inspect`, and guest cgroup state. A
+matching live runtime may reconnect. A missing/replaced VM, changed host-mount
+policy, wrong image/policy/label, or ambiguous runtime becomes interrupted; do
+not recreate it silently.
 
 Cancellation order:
 
 1. revoke the applicable inference lease;
 2. send the structured Prime abort;
 3. wait the confirmed grace period;
-4. stop the OCI container;
-5. kill the complete delegated cgroup if anything survives;
-6. prove there are no tasks, mounts, sockets, or container records left;
-7. seal or quarantine the workspace and persist teardown evidence.
+4. stop and then kill the Docker container;
+5. verify the container is absent and its cgroup has no tasks;
+6. if Docker or guest-state verification fails, force-stop the entire dedicated
+   Colima VM and mark every runtime on that VM interrupted;
+7. prove there are no tasks, containers, attached relays, or unexpected volumes
+   left;
+8. seal or quarantine the workspace and persist teardown evidence.
 
 Runnerd performs cleanup by opaque workspace/runtime ID and generates all
 paths beneath its fixed root. It must revalidate labels, ownership, canonical
@@ -694,9 +686,11 @@ location, mount state, cgroup state, and image identity immediately before
 deletion. The trusted control cleanup plan records the exact runner objects and
 requires a new runner snapshot if any identity changes.
 
-On service startup, runnerd inventories labeled containers and workspaces.
-Unknown, corrupt, running-without-authority, or mismatched objects are
-quarantined or stopped, never adopted based on a path or name alone.
+On service startup, runnerd verifies the profile and VM boot identity, then
+inventories labeled containers and volumes. Unknown, corrupt,
+running-without-authority, or mismatched objects are quarantined or stopped,
+never adopted based on a path or name alone. A profile with any macOS mount or
+an unexpected Docker context is rejected wholesale.
 
 ## Data model and migration
 
@@ -733,9 +727,16 @@ backend and policy identity recorded by the original attempt.
   runnerd.
 - `src/runner/daemon.ts`: credential-free runner service.
 - `src/runner/policy.ts`: root-owned policy loading and invariant checks.
-- `src/runner/podman.ts`: literal Podman invocation and inspect validation.
+- `src/runner/colima.ts`: profile/config/VM identity preflight and fail-closed
+  VM shutdown.
+- `src/runner/docker.ts`: literal Docker invocation, context confinement, and
+  container/volume inspect validation.
 - `src/runner/workspace.ts`: source extraction, private Git, sealing, result
   export, quotas, and deletion.
+- `src/runner/relay.ts`: fixed framed Docker-attach relay for broker and child
+  control traffic.
+- `src/runner/materializer.ts`: fixed guest helper for source import and result
+  export over Docker attach.
 - `src/runner/container-entry.ts`: fixed root/child/gate entrypoints.
 - `src/runner/remote-rlm-host.ts`: root-container child RPC proxy.
 
@@ -763,6 +764,37 @@ Do not let `ContainedExecutionBackend` become a thin worktree creator followed
 by the existing host-side `AgentBackend` and gate calls. The backend boundary
 must encompass every repository-influenced executable operation.
 
+### Evie Platform provisioning changes
+
+Implement privileged host integration in `evie-platform`, not in an OpenClaw
+plugin installation hook:
+
+- add an Ansible `prime_runner` role that creates `_evie-runner` and
+  `_evie-prime-control`, adds only `_evie-agent` to the control group, and
+  creates the runner home/runtime/log directories with explicit modes;
+- install pinned Colima and Docker CLI packages, but set no global
+  `DOCKER_HOST`, Docker context, shell profile, or `/var/run/docker.sock` link;
+- deploy the two root-owned LaunchDaemon plists/wrappers and canonical runner,
+  Colima, seccomp, image-trust, and policy files;
+- initialize the named `prime-sandbox` profile as `_evie-runner` with
+  `--mount none`, VZ, Docker, no Kubernetes, no SSH-agent forwarding, no
+  auto-activation, and no reachable VM address;
+- preload the verified image by digest during provisioning/upgrade, before the
+  gateway can select the policy;
+- extend the verify role to assert account/group separation, socket denial from
+  `_evie-agent`, resolved profile/guest mounts, exact VM/runtime/image identity,
+  network-none behavior, and absence of legacy/default Colima profiles;
+- expose operator-only `evie agent prime-runner status|stop|start|reset`
+  commands through tightly matched sudoers entries. Do not grant `_evie-agent`
+  service-management, Colima, Docker, SSH, or arbitrary `_evie-runner` sudo;
+- add an upgrade hold-down: stop Prime admission, drain/cancel jobs, stop
+  runnerd/profile, update and verify artifacts, then re-enable only after the
+  malicious canary passes.
+
+The Prime Dispatch repository owns the protocol, runner implementation, image,
+and deterministic tests. Evie Platform owns macOS identities, packages,
+LaunchDaemons, configuration, installation audit, and physical-host acceptance.
+
 ## Implementation milestones
 
 ### Milestone 2A: ADR and executable spike
@@ -770,12 +802,16 @@ must encompass every repository-influenced executable operation.
 Deliver:
 
 - an ADR freezing the trust boundary and tool choice;
-- rootless Podman preflight and inspect code;
+- Evie Platform ADR/addendum freezing the macOS, account, LaunchDaemon, Colima,
+  socket, and no-host-mount decisions;
+- Colima profile/config/VM and Docker preflight/inspect code;
 - a minimal runnerd UDS API;
 - one malicious fixture container proving read-only rootfs, workspace-only
-  writes, no network, broker-only UDS access, cgroup kill, and no surviving
-  process;
-- a documented unsupported-platform failure.
+  writes, no network, attach-relayed broker-only UDS access, container/VM kill,
+  and no surviving process;
+- proof that `_evie-agent` cannot read the runner home or Docker socket and the
+  VM contains no macOS mounts;
+- a documented fail-closed path when Colima is absent or its identity drifts.
 
 Exit criterion: the spike proves the security contract on the target host. Do
 not merge a spike that uses host networking or broad mounts.
@@ -791,7 +827,7 @@ Deliver:
 - crash injection at create/upload/seal boundaries.
 
 Exit criterion: a malicious source tree cannot escape or alter runner-owned
-metadata, and no caller-controlled host path reaches Podman.
+metadata, and no caller-controlled macOS path reaches Colima or Docker.
 
 ### Milestone 2C: Single-root Prime path
 
@@ -852,14 +888,15 @@ Exit criterion: every PD-01 closure criterion in the remediation plan is met.
 
 - policy canonicalization and downgrade rejection;
 - every runner API schema, unknown-field rejection, and size limit;
-- Podman argv generation from host policy with no caller-controlled tokens;
+- Colima/Docker argv and configuration generation from host policy with no
+  caller-controlled tokens;
 - source/result manifest path, mode, digest, count, and collision validation;
 - broker socket lease binding and revocation;
 - child RPC binding and cross-job/child replay rejection;
 - event ordering, truncation, reconnect cursor, and digest behavior;
 - migration compatibility and unsafe-local/non-contained resume rejection.
 
-### Integration tests with fake Podman
+### Integration tests with fake runtime adapters
 
 - full worker state machine through a fake runner client;
 - fault injection before and after each runner side effect;
@@ -867,9 +904,12 @@ Exit criterion: every PD-01 closure criterion in the remediation plan is met.
   partial upload, and corrupted result behavior;
 - root, child, gate, cancel, resume, cleanup, and orphan reconciliation.
 
-### Rootless Podman acceptance tests
+### Colima/VZ acceptance tests
 
-Run only on an ephemeral, credential-free Linux host. The fixture must attempt:
+Run on a disposable, credential-free Apple-silicon Mac with the production
+launchd/account/profile topology. Tart CI cannot exercise this layer because
+Evie Platform has already established that nested virtualization is
+unavailable. The fixture must attempt:
 
 - reads of OpenClaw, runner, control database, SSH, cloud, package, GitHub, and
   host environment data;
@@ -882,43 +922,55 @@ Run only on an ephemeral, credential-free Linux host. The fixture must attempt:
 - Git hooks, filters, helpers, pagers, editors, alternates, replace refs, and
   malicious result paths;
 - broker token reuse across root/child/job/expiry/revocation boundaries;
-- worker, runnerd, container, and host restarts at every durable checkpoint.
+- worker, runnerd, container, Colima VM, launchd service, and host restarts at
+  every durable checkpoint;
+- access to `_evie-agent` state from the VM, and Docker/Colima authority from
+  `_evie-agent` on macOS.
 
 The suite passes only if the scoped inference request succeeds, all forbidden
 access fails, resource limits hold, cancellation empties the cgroup, and no
 secret-shaped value appears in events or artifacts.
 
-Do not run this suite on GitHub-hosted CI if the necessary namespace/cgroup
-behavior is nested or weakened. Use a freshly provisioned self-hosted test VM,
-destroy it after each run, and provide it no production credentials.
+GitHub-hosted and Tart CI should run deterministic/fake-runtime tests only. Run
+the VZ suite on a freshly provisioned physical Mac or a dedicated sacrificial
+Evie host, erase the runner profile after each run, and provide it no production
+credentials.
 
 ## Observability and audit evidence
 
 Record without secrets:
 
 - policy ID/digest, image digest, runner version/boot ID, workspace/runtime IDs,
-  role, container ID, cgroup path hash, and timestamps;
+  role, Colima profile/VM boot identity, container/volume IDs, cgroup path hash,
+  and timestamps;
 - source and result manifest digests and byte counts;
 - broker lease ID/token digest, request/usage totals, and revocation reason;
 - resource peaks, timeout/signal sequence, exit code, OOM indication, and
   teardown proof;
 - every rejected runner operation and policy mismatch with bounded fields;
-- installation audit results for OS identity, socket modes, image signature,
-  cgroup/user namespace support, SELinux/AppArmor, network-none probe, and
-  unsafe-local disablement.
+- installation audit results for macOS/hardware identity, service-account and
+  socket modes, plist/config digests, image signature, VZ/profile/VM identity,
+  absence of host mounts, Docker socket isolation, guest cgroups,
+  network-none probe, and unsafe-local disablement.
 
 Never log raw environment variables, broker tokens, provider credentials,
-request/response bodies, source blobs, or arbitrary Podman inspect output.
+request/response bodies, source blobs, or arbitrary Docker/Colima inspect
+output.
 
 ## Stop-ship conditions
 
 Do not enable the contained backend for real Prime if any of these is true:
 
-- the runner executable, systemd unit, policy, seccomp profile, or image-signing
-  trust policy is writable by OpenClaw or `prime-runner`;
+- the runner executable, LaunchDaemon plist/wrapper, policy, canonical Colima
+  config, seccomp profile, or image-signing trust policy is writable by
+  `_evie-agent` or `_evie-runner`;
 - the job selects an image by tag, accepts a digest/signature mismatch, or can
   import an image during execution;
-- Podman uses a rootful socket or job-time image pull;
+- `_evie-agent` can read or use the Colima/Docker socket, or Docker can pull an
+  image at job time;
+- the Colima profile exposes any macOS host mount, forwards the SSH agent, has a
+  reachable VM address, auto-activates a Docker context for `_evie-agent`, or
+  runs an unexpected workload;
 - any untrusted container has normal network access;
 - provider credentials enter runnerd or a container;
 - the selected repository, `.git`, OpenClaw state, control state, host HOME, or
@@ -926,7 +978,8 @@ Do not enable the contained backend for real Prime if any of these is true:
 - root and child share a writable workspace;
 - gates or repository-influenced Git commands still execute in the trusted
   worker;
-- cancellation cannot prove the delegated cgroup is empty;
+- cancellation cannot prove the container is absent and its guest cgroup is
+  empty, or cannot force-stop the dedicated VM when Docker becomes unreliable;
 - resume accepts a changed image, policy, source, workspace, runtime, or runner
   identity;
 - final integration can invoke hooks, filters, helpers, pagers, editors, or a
@@ -937,7 +990,8 @@ Do not enable the contained backend for real Prime if any of these is true:
 
 The contained backend is production-ready when:
 
-- the target Linux host passes installation preflight and audit;
+- the target Apple-silicon macOS host passes the Evie/launchd/account/Colima/VZ
+  installation preflight and audit;
 - image build, SBOM, scanning, signing, import, and digest verification are
   reproducible;
 - every root, child, dependency script, and gate runs through runnerd under the
