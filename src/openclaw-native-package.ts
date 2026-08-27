@@ -11,6 +11,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -143,6 +144,17 @@ export const NativeOpenClawPackageManifestSchema = z
         code: "custom",
         message: "online plugin cannot vendor production dependencies",
       });
+    if (manifest.variant === "online" && !names.includes("npm-shrinkwrap.json"))
+      context.addIssue({
+        code: "custom",
+        message: "online plugin requires an install-time dependency lock",
+      });
+    if (manifest.variant === "offline" && names.includes("npm-shrinkwrap.json"))
+      context.addIssue({
+        code: "custom",
+        message:
+          "offline plugin cannot declare an install-time dependency lock",
+      });
     if (
       manifest.prime.mode === "embedded" &&
       !names.includes(manifest.prime.path)
@@ -183,7 +195,10 @@ export async function buildNativeOpenClawPluginPackage(
   const output = resolve(options.output);
   if (await lstat(output).catch(() => undefined))
     throw new Error(`OpenClaw plugin package already exists: ${output}`);
-  const sourceRoot = await realpath(options.sourceRoot);
+  const sourceRoot = await prepareVerifiedSource(
+    options.sourceRoot,
+    options.sourceCommit,
+  );
   const primeRuntime = await realpath(options.primeRuntimeArtifact);
   if ((await sha256File(primeRuntime)) !== options.primeRuntimeSha256)
     throw new Error("Prime runtime checksum mismatch");
@@ -206,6 +221,8 @@ export async function buildNativeOpenClawPluginPackage(
       variant: options.variant,
       openclawVersion: options.openclawVersion,
     });
+    if (options.variant === "online")
+      await createOnlineDependencyLock(publication);
     if (options.variant === "offline") {
       await vendorDependencies(
         sourceRoot,
@@ -279,6 +296,107 @@ export async function buildNativeOpenClawPluginPackage(
   } finally {
     await rm(stage, { recursive: true, force: true });
   }
+}
+
+async function createOnlineDependencyLock(publication: string): Promise<void> {
+  await execFileAsync(
+    "npm",
+    [
+      "install",
+      "--package-lock-only",
+      "--omit=dev",
+      "--legacy-peer-deps",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      "--loglevel=error",
+    ],
+    {
+      cwd: publication,
+      encoding: "utf8",
+      timeout: 300_000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: process.env,
+    },
+  );
+  await rename(
+    join(publication, "package-lock.json"),
+    join(publication, "npm-shrinkwrap.json"),
+  );
+}
+
+async function prepareVerifiedSource(
+  sourceRootValue: string,
+  sourceCommit: string,
+): Promise<string> {
+  const sourceRoot = await realpath(sourceRootValue);
+  const repositoryRoot = (
+    await execFileAsync(
+      "git",
+      ["-C", sourceRoot, "rev-parse", "--show-toplevel"],
+      {
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 64 * 1024,
+      },
+    )
+  ).stdout.trim();
+  if ((await realpath(repositoryRoot)) !== sourceRoot)
+    throw new Error(
+      "native plugin source root must be the Git repository root",
+    );
+  const sourceHead = (
+    await execFileAsync("git", ["-C", sourceRoot, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 64 * 1024,
+    })
+  ).stdout.trim();
+  if (sourceHead !== sourceCommit)
+    throw new Error(
+      `source commit mismatch: expected ${sourceCommit}, got ${sourceHead}`,
+    );
+  await assertCleanSource(sourceRoot);
+
+  for (const path of [
+    join(sourceRoot, "dist"),
+    join(sourceRoot, "openclaw-plugin", "dist"),
+  ])
+    await rm(path, { recursive: true, force: true });
+  await runTypeScriptBuild(sourceRoot);
+  await runTypeScriptBuild(join(sourceRoot, "openclaw-plugin"));
+  await assertCleanSource(sourceRoot);
+  return sourceRoot;
+}
+
+async function assertCleanSource(sourceRoot: string): Promise<void> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", sourceRoot, "status", "--porcelain=v1", "--untracked-files=all"],
+    {
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  if (stdout.trim())
+    throw new Error(
+      `native plugin source repository must be clean:\n${stdout.trim()}`,
+    );
+}
+
+async function runTypeScriptBuild(packageRoot: string): Promise<void> {
+  await execFileAsync(
+    join(packageRoot, "node_modules", ".bin", "tsc"),
+    ["-p", "tsconfig.json"],
+    {
+      cwd: packageRoot,
+      encoding: "utf8",
+      timeout: 300_000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: process.env,
+    },
+  );
 }
 
 function validateBuildOptions(
@@ -405,7 +523,7 @@ async function vendorDependencies(
   );
   await disableAutoInstallPeers(join(runtime, "pnpm-lock.yaml"));
   await installDependencies(runtime);
-  await removeBinDirectories(join(runtime, "node_modules"));
+  await removeNonRuntimeDependencyEntries(join(runtime, "node_modules"));
   await copyFile(
     join(sourceRoot, "openclaw-plugin", "package.json"),
     join(publication, "package.json"),
@@ -420,7 +538,7 @@ async function vendorDependencies(
     join(publication, "pnpm-workspace.yaml"),
   );
   await installDependencies(publication);
-  await removeBinDirectories(join(publication, "node_modules"));
+  await removeNonRuntimeDependencyEntries(join(publication, "node_modules"));
   await writeFile(join(publication, "package.json"), finalPluginPackage);
   await writeFile(join(runtime, "package.json"), finalRuntimePackage);
   await rm(join(publication, "pnpm-lock.yaml"));
@@ -460,16 +578,24 @@ async function disableAutoInstallPeers(path: string): Promise<void> {
   await writeFile(path, updated);
 }
 
-async function removeBinDirectories(path: string): Promise<void> {
+const NON_RUNTIME_DEPENDENCY_ENTRIES = new Set([
+  ".bin",
+  ".modules.yaml",
+  ".package-map.json",
+  ".pnpm",
+  ".pnpm-workspace-state-v1.json",
+]);
+
+async function removeNonRuntimeDependencyEntries(path: string): Promise<void> {
   for (const child of await readdir(path)) {
     const candidate = join(path, child);
     const metadata = await lstat(candidate);
-    if (child === ".bin" && metadata.isDirectory()) {
+    if (NON_RUNTIME_DEPENDENCY_ENTRIES.has(child)) {
       await rm(candidate, { recursive: true, force: true });
       continue;
     }
     if (metadata.isDirectory() && !metadata.isSymbolicLink())
-      await removeBinDirectories(candidate);
+      await removeNonRuntimeDependencyEntries(candidate);
   }
 }
 

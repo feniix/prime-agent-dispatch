@@ -63,6 +63,7 @@ The resulting OpenClaw entry is equivalent to:
         "config": {
           "hostPolicy": {
             "repoRoots": ["/absolute/path/to/source"],
+            "multiChild": false,
             "repositories": [
               {
                 "path": "/absolute/path/to/source/repository",

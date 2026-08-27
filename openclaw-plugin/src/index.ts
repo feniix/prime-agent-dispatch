@@ -59,6 +59,7 @@ const configJsonSchema = {
           type: "array",
           items: { type: "string", minLength: 1 },
         },
+        multiChild: { const: false },
         repositories: {
           type: "array",
           items: {
@@ -646,15 +647,18 @@ function stringValue(value: unknown): string | undefined {
 function parseNativeHostPolicy(value: unknown): NativeHostPolicy {
   if (!record(value)) throw new Error("Prime Dispatch host policy is invalid");
   const repoRoots = value.repoRoots;
+  const multiChild = value.multiChild;
   const repositories = value.repositories;
   if (
     !Array.isArray(repoRoots) ||
     repoRoots.some((path) => typeof path !== "string" || !path) ||
+    (multiChild !== undefined && multiChild !== false) ||
     !Array.isArray(repositories)
   )
     throw new Error("Prime Dispatch host policy is invalid");
   return {
     repoRoots,
+    ...(multiChild === false ? { multiChild: false } : {}),
     repositories: repositories.map((repository) => {
       if (
         !record(repository) ||

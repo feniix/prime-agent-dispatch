@@ -25,6 +25,7 @@ type Gate = {
 
 export type NativeHostPolicy = {
   repoRoots: string[];
+  multiChild?: false;
   repositories: Array<{
     path: string;
     fixture?: boolean;
@@ -72,7 +73,10 @@ export async function initializeNativePlugin(
   await ensurePrivateDirectory(dirname(options.hostConfigPath));
   await ensurePrivateDirectory(options.stateRoot);
 
-  const runtimeArtifact = join(runtimeRoot, "prime-runtime.tgz");
+  const runtimeArtifact = join(
+    runtimeRoot,
+    `sha256-${manifest.prime.sha256}.tgz`,
+  );
   const existingRuntime = await lstat(runtimeArtifact).catch(
     (error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
@@ -183,29 +187,11 @@ async function installHostPolicy(options: {
   runtimeArtifactSha256: string;
   hostPolicy?: NativeHostPolicy;
 }): Promise<void> {
-  const previous = await readFile(options.path, "utf8").catch(
-    (error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return undefined;
-      throw error;
-    },
-  );
-  const parsed = previous === undefined ? undefined : JSON.parse(previous);
-  if (parsed !== undefined && !record(parsed))
-    throw new Error("installed Prime Dispatch host policy is invalid");
-  const policy =
-    options.hostPolicy ??
-    (parsed
-      ? {
-          repoRoots: arrayOfStrings(parsed.repoRoots),
-          repositories: Array.isArray(parsed.repositories)
-            ? parsed.repositories
-            : [],
-        }
-      : { repoRoots: [], repositories: [] });
+  const policy = options.hostPolicy ?? { repoRoots: [], repositories: [] };
   const next = {
-    ...(parsed ?? {}),
     schemaVersion: 1,
     repoRoots: policy.repoRoots,
+    ...(policy.multiChild === false ? { multiChild: false } : {}),
     repositories: policy.repositories,
     prime: {
       runtimeArtifact: options.runtimeArtifact,
@@ -317,10 +303,4 @@ async function sha256File(path: string): Promise<string> {
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function arrayOfStrings(value: unknown): string[] {
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))
-    throw new Error("installed Prime Dispatch host policy is invalid");
-  return value;
 }

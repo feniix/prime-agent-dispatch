@@ -81,7 +81,7 @@ describe("native OpenClaw plugin initialization", () => {
       value.profile,
       "prime-dispatch",
       "runtime",
-      "prime-runtime.tgz",
+      `sha256-${value.digest}.tgz`,
     );
     expect(await readFile(runtime)).toEqual(await readFile(value.embedded));
     expect(JSON.parse(await readFile(value.hostConfigPath, "utf8"))).toEqual({
@@ -102,6 +102,7 @@ describe("native OpenClaw plugin initialization", () => {
     const value = await fixture();
     const hostPolicy = {
       repoRoots: ["/srv/source"],
+      multiChild: false as const,
       repositories: [
         {
           path: "/srv/source/repository",
@@ -127,8 +128,99 @@ describe("native OpenClaw plugin initialization", () => {
 
     const installed = JSON.parse(await readFile(value.hostConfigPath, "utf8"));
     expect(installed.repoRoots).toEqual(hostPolicy.repoRoots);
+    expect(installed.multiChild).toBe(false);
     expect(installed.repositories).toEqual(hostPolicy.repositories);
     expect(installed.prime.runtimeArtifactSha256).toBe(value.digest);
+  });
+
+  it("revokes repository authority when host policy is removed", async () => {
+    const value = await fixture();
+    await initializeNativePlugin({
+      pluginRoot: value.pluginRoot,
+      openclawStateDir: value.profile,
+      hostConfigPath: value.hostConfigPath,
+      stateRoot: value.stateRoot,
+      hostPolicy: {
+        repoRoots: ["/srv/source"],
+        multiChild: false,
+        repositories: [
+          {
+            path: "/srv/source/repository",
+            gates: [
+              {
+                name: "test",
+                command: "/usr/bin/true",
+                args: [],
+                timeoutMs: 1_000,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    await initializeNativePlugin({
+      pluginRoot: value.pluginRoot,
+      openclawStateDir: value.profile,
+      hostConfigPath: value.hostConfigPath,
+      stateRoot: value.stateRoot,
+    });
+
+    const installed = JSON.parse(await readFile(value.hostConfigPath, "utf8"));
+    expect(installed.repoRoots).toEqual([]);
+    expect(installed.repositories).toEqual([]);
+    expect(installed).not.toHaveProperty("multiChild");
+  });
+
+  it("retains checksum-addressed runtimes across package upgrades", async () => {
+    const value = await fixture();
+    await initializeNativePlugin({
+      pluginRoot: value.pluginRoot,
+      openclawStateDir: value.profile,
+      hostConfigPath: value.hostConfigPath,
+      stateRoot: value.stateRoot,
+    });
+    const previousRuntime = join(
+      value.profile,
+      "prime-dispatch",
+      "runtime",
+      `sha256-${value.digest}.tgz`,
+    );
+
+    await writeFile(value.embedded, "upgraded Prime runtime\n");
+    const upgradedDigest = createHash("sha256")
+      .update(await readFile(value.embedded))
+      .digest("hex");
+    const manifestPath = join(value.pluginRoot, "prime-dispatch-package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.prime.sha256 = upgradedDigest;
+    await writeFile(manifestPath, JSON.stringify(manifest));
+
+    await initializeNativePlugin({
+      pluginRoot: value.pluginRoot,
+      openclawStateDir: value.profile,
+      hostConfigPath: value.hostConfigPath,
+      stateRoot: value.stateRoot,
+    });
+
+    const upgradedRuntime = join(
+      value.profile,
+      "prime-dispatch",
+      "runtime",
+      `sha256-${upgradedDigest}.tgz`,
+    );
+    expect(await readFile(previousRuntime, "utf8")).toBe(
+      "verified Prime runtime\n",
+    );
+    expect(await readFile(upgradedRuntime, "utf8")).toBe(
+      "upgraded Prime runtime\n",
+    );
+    expect(
+      JSON.parse(await readFile(value.hostConfigPath, "utf8")).prime,
+    ).toEqual({
+      runtimeArtifact: upgradedRuntime,
+      runtimeArtifactSha256: upgradedDigest,
+    });
   });
 
   it("rejects runtime tampering and removes incomplete staging files", async () => {
@@ -143,7 +235,12 @@ describe("native OpenClaw plugin initialization", () => {
     ).rejects.toThrow("Prime runtime checksum mismatch");
     await expect(
       readFile(
-        join(value.profile, "prime-dispatch", "runtime", "prime-runtime.tgz"),
+        join(
+          value.profile,
+          "prime-dispatch",
+          "runtime",
+          `sha256-${"0".repeat(64)}.tgz`,
+        ),
       ),
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -168,7 +265,10 @@ describe("native OpenClaw plugin initialization", () => {
     const value = await fixture();
     const runtimeRoot = join(value.profile, "prime-dispatch", "runtime");
     await mkdir(runtimeRoot, { recursive: true });
-    await symlink(value.embedded, join(runtimeRoot, "prime-runtime.tgz"));
+    await symlink(
+      value.embedded,
+      join(runtimeRoot, `sha256-${value.digest}.tgz`),
+    );
     await expect(
       initializeNativePlugin({
         pluginRoot: value.pluginRoot,

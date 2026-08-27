@@ -274,19 +274,6 @@ program
       sourceRoot: string;
       output: string;
     }) => {
-      const { stdout: sourceHead } = await execFileAsync(
-        "git",
-        ["-C", options.sourceRoot, "rev-parse", "HEAD"],
-        {
-          encoding: "utf8",
-          timeout: 30_000,
-          maxBuffer: 64 * 1024,
-        },
-      );
-      if (sourceHead.trim() !== options.sourceCommit)
-        throw new Error(
-          `source commit mismatch: expected ${options.sourceCommit}, got ${sourceHead.trim()}`,
-        );
       const built = await buildNativeOpenClawPluginPackage({
         variant: options.variant,
         sourceRoot: options.sourceRoot,

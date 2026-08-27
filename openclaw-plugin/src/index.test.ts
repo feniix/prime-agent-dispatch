@@ -48,6 +48,35 @@ describe("Prime Dispatch OpenClaw plugin", () => {
     ).toThrow("Prime Dispatch host policy is invalid");
   });
 
+  it("passes the single-root host policy opt-out to native installation", () => {
+    expect(
+      parseConfig(
+        {
+          openclawStateDir: "/profiles/clean",
+          hostPolicy: {
+            repoRoots: ["/source"],
+            multiChild: false,
+            repositories: [
+              {
+                path: "/source/repo",
+                fixture: true,
+                gates: [
+                  {
+                    name: "test",
+                    command: "npm",
+                    args: ["test"],
+                    timeoutMs: 60_000,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        "/extensions/prime-dispatch",
+      ).nativeInstallation?.hostPolicy,
+    ).toMatchObject({ multiChild: false });
+  });
+
   it("rejects a partial legacy path override", () => {
     expect(() =>
       parseConfig({ cliPath: "/legacy/cli.js" }, "/extensions/prime-dispatch"),

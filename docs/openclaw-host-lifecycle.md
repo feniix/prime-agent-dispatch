@@ -126,6 +126,12 @@ node dist/openclaw-host.js package-build \
   --output <online-package.tgz>
 ```
 
+The builder requires an exact clean Git commit and regenerates both compiled
+trees before packaging, so ignored or stale `dist` files cannot be attributed
+to the requested source commit. Online artifacts include an npm shrinkwrap that
+locks the production dependency graph. Offline artifacts remove package-manager
+store metadata and paths before deterministic archiving.
+
 The emitted JSON includes the archive SHA-256. Verify it before installation,
 then install either variant through OpenClaw:
 
