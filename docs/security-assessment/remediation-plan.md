@@ -173,6 +173,11 @@ Acceptance criteria:
 
 ## Workstream 2: Implement a contained execution backend
 
+See the
+[contained execution backend implementation plan](./contained-execution-backend-implementation-plan.md)
+for the recommended toolchain, runner protocol, OCI policy, code changes, and
+delivery milestones.
+
 This work closes PD-01. Keep the trusted control plane outside the runner and
 make the runner replaceable. A rootless OCI container or lightweight VM is a
 reasonable Linux implementation, but select it only after proving the
