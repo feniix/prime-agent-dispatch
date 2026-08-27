@@ -6,9 +6,17 @@ into a concrete implementation design. Its purpose is to close PD-01 without
 weakening Prime Dispatch's existing confirmation, inference, child lifecycle,
 recovery, evidence, and cleanup guarantees.
 
+The supporting
+[grounding and validation record](./contained-execution-backend-grounding.md)
+separates repository facts, upstream-documented tool capabilities, observed
+review-host facts, unresolved deployment assumptions, and hypotheses that must
+be proved by a spike. The architecture below is a proposal until those gates
+pass.
+
 ## Recommendation
 
-Implement the first production containment backend on Linux with:
+For a Linux deployment target, implement the first production containment
+backend with:
 
 - **rootless Podman with `crun`** as the OCI runtime;
 - **a static, dedicated `prime-runner` OS account** with no OpenClaw, provider,
@@ -28,15 +36,22 @@ Implement the first production containment backend on Linux with:
   integration, avoiding repository hooks, filters, credential helpers, and
   shell execution in the trusted control plane.
 
-This is the best fit for the current TypeScript/Linux deployment model.
+This is the best fit for the current TypeScript codebase and a Linux deployment
+model.
 Rootless Podman has standard OCI image and lifecycle tooling, integrates with
 cgroups and systemd, and does not require handing the OpenClaw user a rootful
 Docker socket. `crun` is preferred because it has mature cgroup v2 and rootless
 support.
 
-The first release should fail closed on macOS, Windows, cgroup v1, missing
-unprivileged user namespaces, a rootful Podman connection, or an unverified
-image. Do not silently fall back to `unsafe-local`.
+The review workstation is actually macOS 26.5.2 on Apple silicon, and none of
+Podman, `crun`, Apple `container`, Lima, or Colima is installed there. If that
+Mac is the intended deployment host, first choose and prove either a dedicated
+Linux runner VM or an Apple `container` backend. The systemd/rootless-Podman
+profile cannot run directly on macOS.
+
+Each backend profile must fail closed on an unsupported OS, missing isolation
+feature, unverified image, or policy mismatch. Do not silently fall back to
+`unsafe-local`.
 
 ## Why these tools
 
@@ -52,12 +67,27 @@ image. Do not silently fall back to `unsafe-local`.
 | Bubblewrap                        | Spike fallback | Small attack surface, but image distribution, cgroups, lifecycle, and broker wiring become custom work. |
 | Firecracker                       | Future option  | Stronger VM boundary, but KVM, image boot, networking, snapshots, and observability are heavier.        |
 | Kubernetes                        | Do not use     | Adds a cluster control plane to a single-host detached-job problem.                                     |
-| Apple containers                  | Defer          | The current project already treats Apple containment as deferred; keep the first contract Linux-only.   |
+| Podman machine on macOS           | Candidate      | Required for Podman on macOS; disable its default host-HOME mount and prove VM relays.                  |
+| Apple `container` on macOS        | Candidate      | Matches the observed macOS 26/arm64 host and gives each container a VM; needs a network-deny spike.     |
 
 If the threat model later includes hostile kernel-exploit research or multiple
 mutually hostile tenants, move the same runner protocol behind Firecracker or
 another microVM backend. The protocol should not expose Podman-specific details
 to the worker.
+
+For the observed Mac, run a short comparative spike before selecting a runtime:
+
+- Apple `container`: prove an OCI image can run with no external network, only
+  one published broker socket, a read-only root, dropped capabilities, bounded
+  CPU/memory/processes, no host mounts, complete teardown, and stable inspect
+  identity.
+- Podman machine: create a dedicated VM with the documented default
+  `$HOME:$HOME` mount removed, run `prime-runnerd` inside it, use rootless
+  Podman `--network=none`, and prove that source/result/broker traffic crosses
+  the VM without a general host mount or Podman API exposure.
+
+Prefer the candidate that passes the complete contract with fewer privileged
+host integrations. Until one passes, macOS containment remains unsupported.
 
 ## Security boundary and process ownership
 
