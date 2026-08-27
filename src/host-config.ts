@@ -8,6 +8,7 @@ export const DEFAULT_MINIMUM_EVIDENCE = [
   "report.md",
   "final.diff",
   "inference-usage.json",
+  "children/",
   "checks/",
   "logs/worker.log",
 ] as const;

@@ -49,6 +49,16 @@ export const ResumePlanSchema = z.object({
   gateResults: z.array(GateResultSchema),
   commitSha: z.string().optional(),
   noChanges: z.boolean().optional(),
+  childTree: z
+    .object({
+      revision: z.number().int().nonnegative(),
+      digest: z.string().regex(/^[a-f0-9]{64}$/),
+      interruptedAttemptIds: z.array(z.string().uuid()).max(10),
+      retryableChildIds: z.array(z.string().uuid()).max(5),
+      preservedProposalAttemptIds: z.array(z.string().uuid()).max(10),
+    })
+    .strict()
+    .optional(),
   rationale: z.string().min(1),
 });
 export type ResumePlan = z.infer<typeof ResumePlanSchema>;

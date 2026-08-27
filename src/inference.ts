@@ -365,6 +365,15 @@ export class ProductionInferenceBroker {
     return Object.freeze({ ...this.counters });
   }
 
+  async revokeLease(leaseId: string, reason = "revoked"): Promise<boolean> {
+    const lease = [...this.leases.values()].find(
+      (candidate) => candidate.leaseId === leaseId,
+    );
+    if (!lease) return false;
+    await this.revoke(lease.token, reason);
+    return true;
+  }
+
   async close(): Promise<void> {
     await Promise.all(
       [...this.leases.keys()].map((token) =>

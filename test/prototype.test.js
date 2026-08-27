@@ -362,6 +362,7 @@ test("child controls validate the tree and reach only the root transport", async
   const { root, repo, stateRoot } = await fixture();
   const dispatcher = new PrimeDispatcher(stateRoot);
   const request = input(repo, root, "SLOW root-routed controls");
+  request.budget.wallClockMs = 60_000;
   request.budget.maxTokens = DEFAULT_CHILD_INFERENCE_POLICY.aggregateMaxTokens;
   const preview = await dispatcher.preview(
     request,
@@ -427,10 +428,29 @@ test("child controls validate the tree and reach only the root transport", async
       envelopeDigest: child.envelopeDigest,
     },
   );
+  const quiesced = await dispatcher.store.recordChildRuntimeTeardown(
+    started.jobId,
+    {
+      childId: child.envelope.childId,
+      attemptId: child.attempts[0].attemptId,
+      expectedChildRevision: cancelling.revision,
+      envelopeDigest: child.envelopeDigest,
+      evidence: {
+        schemaVersion: 1,
+        status: "quiesced",
+        mode: "already_quiescent",
+        processTreeQuiesced: true,
+        registryAbsent: true,
+        processes: [],
+        completedAt: new Date().toISOString(),
+        summary: "test child never acquired a native runtime",
+      },
+    },
+  );
   await dispatcher.store.completeChildAttempt(started.jobId, {
     childId: child.envelope.childId,
     attemptId: child.attempts[0].attemptId,
-    expectedChildRevision: cancelling.revision,
+    expectedChildRevision: quiesced.revision,
     envelopeDigest: child.envelopeDigest,
     evidence: {
       schemaVersion: 1,

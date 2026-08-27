@@ -509,7 +509,10 @@ test("aggregate child concurrency is three and revocation aborts only its lease"
       body: JSON.stringify({ metadata: { index: 3 } }),
     });
     assert.equal(fourth.status, 429);
-    await leases[0].revoke();
+    assert.equal(
+      await broker.revokeLease(leases[0].leaseId, "child cancellation"),
+      true,
+    );
     await settleWithin(
       closes[0].promise,
       "the revoked child upstream to close",

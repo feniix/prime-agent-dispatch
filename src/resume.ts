@@ -14,6 +14,7 @@ import {
   type ResumePlan,
 } from "./recovery.js";
 import { git } from "./process.js";
+import { canonicalDigest, terminalChildStatuses } from "./children.js";
 
 const AgentResultFactsSchema = z.object({
   agentResult: z.object({
@@ -89,10 +90,11 @@ export async function assessSafeResume(
   jobId: string,
 ): Promise<ResumePlan> {
   await store.assertNotReservedForCleanup(jobId);
-  const [request, state, attempt] = await Promise.all([
+  const [request, state, attempt, childTree] = await Promise.all([
     store.readRequest(jobId),
     store.readState(jobId),
     store.currentAttempt(jobId),
+    store.readChildTree(jobId),
   ]);
   if (state.status !== "interrupted" || attempt.status !== "interrupted")
     throw new ResumeUnavailableError("only interrupted jobs can be resumed");
@@ -100,6 +102,38 @@ export async function assessSafeResume(
     throw new ResumeUnavailableError(
       "legacy job has no versioned checkpoint evidence; evidence was preserved",
     );
+  if (
+    childTree?.children.some(
+      (child) => !terminalChildStatuses.has(child.status),
+    )
+  )
+    throw new ResumeUnavailableError(
+      "child tree still contains nonterminal attempts; evidence was preserved",
+    );
+  const childRecovery = childTree
+    ? {
+        revision: childTree.revision,
+        digest: canonicalDigest(childTree),
+        interruptedAttemptIds: childTree.children.flatMap((child) =>
+          child.attempts
+            .filter((candidate) => candidate.status === "interrupted")
+            .map((candidate) => candidate.attemptId),
+        ),
+        retryableChildIds: childTree.children.flatMap((child) => {
+          const current = child.attempts.at(-1)!;
+          return current.status === "interrupted" &&
+            !current.proposal &&
+            child.attempts.length < childTree.policy.maxAttemptsPerChild
+            ? [child.envelope.childId]
+            : [];
+        }),
+        preservedProposalAttemptIds: childTree.children.flatMap((child) =>
+          child.attempts.flatMap((candidate) =>
+            candidate.proposal ? [candidate.attemptId] : [],
+          ),
+        ),
+      }
+    : undefined;
   const readEffectiveCheckpoints = async () =>
     mergeResumeEvidence(
       await store.readCheckpoints(jobId, attempt.attemptId),
@@ -332,6 +366,9 @@ export async function assessSafeResume(
       "worktree and partial diff",
       "transcripts, logs, and artifact digests",
       "known side effects",
+      ...(childRecovery
+        ? ["child attempts, runtime teardown, usage, and proposal evidence"]
+        : []),
     ],
     willRepeat,
     willNotRepeat,
@@ -342,6 +379,7 @@ export async function assessSafeResume(
     gateResults,
     ...(commitFacts?.commitSha ? { commitSha: commitFacts.commitSha } : {}),
     ...(commitFacts ? { noChanges: commitFacts.noChanges } : {}),
+    ...(childRecovery ? { childTree: childRecovery } : {}),
     rationale: `next action ${nextStage} is mechanically safe; uncertain model calls, gates, and external effects are never replayed`,
   });
 }
@@ -353,6 +391,21 @@ export async function assertResumePlanEvidence(
 ): Promise<void> {
   if (plan.jobId !== jobId)
     throw new ResumeUnavailableError("resume plan job identity changed");
+  const childTree = await store.readChildTree(jobId);
+  if (plan.childTree) {
+    if (
+      !childTree ||
+      childTree.revision !== plan.childTree.revision ||
+      canonicalDigest(childTree) !== plan.childTree.digest
+    )
+      throw new ResumeUnavailableError(
+        "preserved child tree changed after resume preview",
+      );
+  } else if (childTree) {
+    throw new ResumeUnavailableError(
+      "resume plan omitted the preserved child tree",
+    );
+  }
   if (plan.nextStage === "worktree") return;
   if (!plan.worktreePath || !plan.branchName || !plan.worktreeSnapshotSha256)
     throw new ResumeUnavailableError(

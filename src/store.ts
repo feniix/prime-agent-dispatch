@@ -52,11 +52,14 @@ import {
 } from "./recovery.js";
 import {
   ChildAttemptSchema,
+  ChildCancellationIntentSchema,
   ChildIntegrationSchema,
   ChildProposalSchema,
   CHILD_PROPOSAL_DIFF_MAX_BYTES,
   ChildSpawnEnvelopeSchema,
   ChildTerminalEvidenceSchema,
+  ChildRuntimeInspectionSchema,
+  ChildRuntimeTeardownEvidenceSchema,
   ChildTreePolicySchema,
   ChildTreeSnapshotSchema,
   ChildWaveBaseSchema,
@@ -74,6 +77,8 @@ import {
   type ChildProposal,
   type ChildSpawnEnvelope,
   type ChildStatus,
+  type ChildRuntimeInspection,
+  type ChildRuntimeTeardownEvidence,
   type ChildTerminalEvidence,
   type ChildTreePolicy,
   type ChildTreeSnapshot,
@@ -207,6 +212,9 @@ type ChildAttemptRow = {
   inference_json: string;
   native_child_id: string | null;
   native_handle_json: string | null;
+  cancellation_intent_json: string | null;
+  runtime_inspection_json: string | null;
+  runtime_teardown_json: string | null;
   started_at: string;
   completed_at: string | null;
   terminal_evidence_json: string | null;
@@ -302,6 +310,11 @@ export type ChildMutationInput = {
   childId: string;
   expectedChildRevision: number;
   envelopeDigest: string;
+};
+
+export type RequestChildCancellationInput = ChildMutationInput & {
+  reason?: string;
+  requestedAt?: string;
 };
 
 export type BindChildRuntimeInput = ChildMutationInput & {
@@ -1982,20 +1995,33 @@ export class JobStore {
 
   async requestChildCancellation(
     jobId: string,
-    input: ChildMutationInput,
+    input: RequestChildCancellationInput,
   ): Promise<LogicalChild> {
     await this.ensureImported(jobId);
-    const now = new Date().toISOString();
+    const now = input.requestedAt ?? new Date().toISOString();
     const child = this.transaction("cancel_child", () => {
-      this.assertChildMutation(jobId, input);
+      const row = this.assertChildMutation(jobId, input);
       const attempt = this.currentChildAttemptFromDatabase(input.childId);
       if (attempt.status !== "active")
         throw new Error("only an active child may enter cancellation");
+      const envelope = ChildSpawnEnvelopeSchema.parse(
+        parseSqliteJson(row.envelope_json, "child spawn envelope"),
+      );
+      const intent = ChildCancellationIntentSchema.parse({
+        schemaVersion: SCHEMA_VERSION,
+        requestedAt: now,
+        gracefulDeadline: new Date(
+          Date.parse(now) + envelope.lifecycle.cancellationGraceMs,
+        ).toISOString(),
+        reason: (input.reason ?? "child cancellation requested").slice(0, 256),
+      });
       this.database
         .prepare(
-          "UPDATE child_attempts SET status = 'cancelling' WHERE attempt_id = ?",
+          `UPDATE child_attempts
+           SET status = 'cancelling', cancellation_intent_json = ?
+           WHERE attempt_id = ?`,
         )
-        .run(attempt.attempt_id);
+        .run(sqliteJson(intent), attempt.attempt_id);
       this.database
         .prepare(
           `UPDATE logical_children SET revision = revision + 1,
@@ -2007,6 +2033,9 @@ export class JobStore {
         this.newEvent(jobId, "child_cancellation_requested", {
           childId: input.childId,
           attemptId: attempt.attempt_id,
+          requestedAt: intent.requestedAt,
+          gracefulDeadline: intent.gracefulDeadline,
+          reason: intent.reason,
         }),
       );
       return this.logicalChildFromDatabase(input.childId);
@@ -2073,6 +2102,119 @@ export class JobStore {
     return child;
   }
 
+  async recordChildRuntimeInspection(
+    jobId: string,
+    input: ChildMutationInput & {
+      attemptId: string;
+      inspection: ChildRuntimeInspection;
+    },
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const inspection = ChildRuntimeInspectionSchema.parse(input.inspection);
+    const child = this.transaction("record_child_runtime_inspection", () => {
+      this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child runtime inspection attempt is stale");
+      if (attempt.status !== "active" && attempt.status !== "cancelling")
+        throw new Error("only a nonterminal child runtime may be inspected");
+      if (!attempt.native_handle_json)
+        throw new Error("child runtime inspection requires a bound handle");
+      if (Date.parse(inspection.checkedAt) < Date.parse(attempt.started_at))
+        throw new Error("child runtime inspection predates the attempt");
+      const handle = NativeRlmSpawnHandleSchema.parse(
+        parseSqliteJson(
+          attempt.native_handle_json,
+          "native child runtime handle",
+        ),
+      );
+      if (inspection.handleDigest !== canonicalDigest(handle))
+        throw new Error("child runtime inspection handle identity mismatch");
+      this.database
+        .prepare(
+          `UPDATE child_attempts SET runtime_inspection_json = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(sqliteJson(inspection), attempt.attempt_id);
+      this.bumpChildRevision(jobId, input.childId, inspection.checkedAt);
+      this.insertEvent(
+        this.newEvent(jobId, "child_runtime_inspected", {
+          childId: input.childId,
+          attemptId: input.attemptId,
+          status: inspection.status,
+          processCount: inspection.processes.length,
+          handleDigest: inspection.handleDigest,
+          summary: inspection.summary,
+        }),
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
+  async recordChildRuntimeTeardown(
+    jobId: string,
+    input: ChildMutationInput & {
+      attemptId: string;
+      evidence: ChildRuntimeTeardownEvidence;
+    },
+  ): Promise<LogicalChild> {
+    await this.ensureImported(jobId);
+    const evidence = ChildRuntimeTeardownEvidenceSchema.parse(input.evidence);
+    const child = this.transaction("record_child_runtime_teardown", () => {
+      this.assertChildMutation(jobId, input);
+      const attempt = this.currentChildAttemptFromDatabase(input.childId);
+      if (attempt.attempt_id !== input.attemptId)
+        throw new Error("child runtime teardown attempt is stale");
+      if (attempt.status !== "active" && attempt.status !== "cancelling")
+        throw new Error("only a nonterminal child runtime may be torn down");
+      if (attempt.runtime_teardown_json)
+        throw new Error("child runtime teardown evidence is immutable");
+      if (Date.parse(evidence.completedAt) < Date.parse(attempt.started_at))
+        throw new Error("child runtime teardown predates the attempt");
+      if (attempt.status === "cancelling") {
+        const intent = ChildCancellationIntentSchema.parse(
+          parseSqliteJson(
+            attempt.cancellation_intent_json,
+            "child cancellation intent",
+          ),
+        );
+        if (Date.parse(evidence.completedAt) < Date.parse(intent.requestedAt))
+          throw new Error(
+            "child runtime teardown predates its cancellation request",
+          );
+      }
+      if (attempt.native_handle_json) {
+        const handle = NativeRlmSpawnHandleSchema.parse(
+          parseSqliteJson(
+            attempt.native_handle_json,
+            "native child runtime handle",
+          ),
+        );
+        if (evidence.handleDigest !== canonicalDigest(handle))
+          throw new Error("child runtime teardown handle identity mismatch");
+      } else if (evidence.handleDigest)
+        throw new Error("unbound child runtime cannot name a handle digest");
+      this.database
+        .prepare(
+          `UPDATE child_attempts SET runtime_teardown_json = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(sqliteJson(evidence), attempt.attempt_id);
+      this.bumpChildRevision(jobId, input.childId, evidence.completedAt);
+      this.insertChildRuntimeTeardownEvent(
+        jobId,
+        input.childId,
+        input.attemptId,
+        evidence,
+      );
+      return this.logicalChildFromDatabase(input.childId);
+    });
+    await this.projectEvents(jobId);
+    return child;
+  }
+
   async completeChildAttempt(
     jobId: string,
     input: CompleteChildAttemptInput,
@@ -2090,12 +2232,61 @@ export class JobStore {
         throw new Error(
           "child attempt cannot become terminal while its inference lease is active",
         );
-      if (attempt.status === "cancelling" && evidence.outcome !== "cancelled")
-        throw new Error("a cancelling child must finish as cancelled");
+      if (
+        attempt.status === "cancelling" &&
+        evidence.outcome !== "cancelled" &&
+        evidence.outcome !== "interrupted"
+      )
+        throw new Error(
+          "a cancelling child must finish as cancelled or interrupted",
+        );
       if (evidence.outcome === "cancelled" && attempt.status !== "cancelling")
         throw new Error(
           "child cancellation must be requested before terminal cancellation",
         );
+      const runtimeTeardown = attempt.runtime_teardown_json
+        ? ChildRuntimeTeardownEvidenceSchema.parse(
+            parseSqliteJson(
+              attempt.runtime_teardown_json,
+              "child runtime teardown",
+            ),
+          )
+        : undefined;
+      if (evidence.outcome === "cancelled") {
+        if (!attempt.cancellation_intent_json)
+          throw new Error("child cancellation intent is missing");
+        const cancellationIntent = ChildCancellationIntentSchema.parse(
+          parseSqliteJson(
+            attempt.cancellation_intent_json,
+            "child cancellation intent",
+          ),
+        );
+        if (runtimeTeardown?.status !== "quiesced")
+          throw new Error(
+            "cancelled child completion requires proven runtime quiescence",
+          );
+        if (
+          Date.parse(runtimeTeardown.completedAt) <
+          Date.parse(cancellationIntent.requestedAt)
+        )
+          throw new Error(
+            "child runtime teardown predates its cancellation request",
+          );
+      }
+      if (
+        attempt.native_handle_json &&
+        evidence.outcome !== "interrupted" &&
+        runtimeTeardown?.status !== "quiesced"
+      )
+        throw new Error(
+          "native child completion requires proven runtime quiescence",
+        );
+      if (
+        runtimeTeardown &&
+        Date.parse(runtimeTeardown.completedAt) >
+          Date.parse(evidence.completedAt)
+      )
+        throw new Error("child completed before its runtime teardown evidence");
       const worktree = this.childWorktreeRow(attempt.attempt_id, false);
       const proposal = this.childProposalRow(attempt.attempt_id, false);
       if (evidence.outcome === "succeeded" && worktree && !proposal)
@@ -2141,6 +2332,402 @@ export class JobStore {
     });
     await this.projectEvents(jobId);
     return child;
+  }
+
+  async requestAllChildCancellations(
+    jobId: string,
+    reason = "root cancellation requested",
+  ): Promise<ChildTreeSnapshot | undefined> {
+    await this.ensureImported(jobId);
+    if (!this.childTreeRow(jobId, false)) return undefined;
+    const now = new Date().toISOString();
+    const boundedReason = reason.slice(0, 256);
+    this.transaction("cancel_all_children", () => {
+      const rows = this.database
+        .prepare(
+          `SELECT child.child_id, child.envelope_json, attempt.attempt_id
+           FROM logical_children AS child
+           JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+           WHERE child.job_id = ? AND attempt.status = 'active'
+             AND attempt.ordinal = (
+               SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+               WHERE latest.child_id = child.child_id
+             )
+           ORDER BY child.wave, child.name`,
+        )
+        .all(jobId) as Array<{
+        child_id: string;
+        envelope_json: string;
+        attempt_id: string;
+      }>;
+      for (const row of rows) {
+        const envelope = ChildSpawnEnvelopeSchema.parse(
+          parseSqliteJson(row.envelope_json, "child spawn envelope"),
+        );
+        const intent = ChildCancellationIntentSchema.parse({
+          schemaVersion: SCHEMA_VERSION,
+          requestedAt: now,
+          gracefulDeadline: new Date(
+            Date.parse(now) + envelope.lifecycle.cancellationGraceMs,
+          ).toISOString(),
+          reason: boundedReason,
+        });
+        this.database
+          .prepare(
+            `UPDATE child_attempts
+             SET status = 'cancelling', cancellation_intent_json = ?
+             WHERE attempt_id = ? AND status = 'active'`,
+          )
+          .run(sqliteJson(intent), row.attempt_id);
+        this.bumpChildRevision(jobId, row.child_id, now);
+        this.insertEvent(
+          this.newEvent(jobId, "child_cancellation_requested", {
+            childId: row.child_id,
+            attemptId: row.attempt_id,
+            requestedAt: intent.requestedAt,
+            gracefulDeadline: intent.gracefulDeadline,
+            reason: intent.reason,
+            source: "root",
+          }),
+        );
+      }
+    });
+    await this.projectEvents(jobId);
+    return this.childTreeFromDatabase(jobId);
+  }
+
+  async completeRootCancelledChildren(
+    jobId: string,
+    reason = "root process tree quiesced after cancellation",
+  ): Promise<ChildTreeSnapshot | undefined> {
+    await this.ensureImported(jobId);
+    if (!this.childTreeRow(jobId, false)) return undefined;
+    const now = new Date().toISOString();
+    const summary = reason.slice(0, 8_192);
+    this.transaction("complete_root_cancelled_children", () => {
+      const rows = this.database
+        .prepare(
+          `SELECT child.child_id, attempt.attempt_id,
+                  attempt.native_handle_json, attempt.runtime_inspection_json,
+                  attempt.runtime_teardown_json,
+                  attempt.cancellation_intent_json
+           FROM logical_children AS child
+           JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+           WHERE child.job_id = ? AND attempt.status = 'cancelling'
+             AND attempt.ordinal = (
+               SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+               WHERE latest.child_id = child.child_id
+             )
+           ORDER BY child.wave, child.name`,
+        )
+        .all(jobId) as Array<{
+        child_id: string;
+        attempt_id: string;
+        native_handle_json: string | null;
+        runtime_inspection_json: string | null;
+        runtime_teardown_json: string | null;
+        cancellation_intent_json: string;
+      }>;
+      for (const row of rows) {
+        const lease = this.childInferenceLeaseRow(row.attempt_id);
+        if (lease?.status === "active")
+          throw new Error(
+            "root child cancellation requires every broker lease to be revoked",
+          );
+        const handle = row.native_handle_json
+          ? NativeRlmSpawnHandleSchema.parse(
+              parseSqliteJson(
+                row.native_handle_json,
+                "native child runtime handle",
+              ),
+            )
+          : undefined;
+        const inspection = row.runtime_inspection_json
+          ? ChildRuntimeInspectionSchema.parse(
+              parseSqliteJson(
+                row.runtime_inspection_json,
+                "child runtime inspection",
+              ),
+            )
+          : undefined;
+        const existingTeardown = row.runtime_teardown_json
+          ? ChildRuntimeTeardownEvidenceSchema.parse(
+              parseSqliteJson(
+                row.runtime_teardown_json,
+                "child runtime teardown",
+              ),
+            )
+          : undefined;
+        const cancellationIntent = ChildCancellationIntentSchema.parse(
+          parseSqliteJson(
+            row.cancellation_intent_json,
+            "child cancellation intent",
+          ),
+        );
+        const teardown =
+          existingTeardown ??
+          ChildRuntimeTeardownEvidenceSchema.parse({
+            schemaVersion: SCHEMA_VERSION,
+            ...(handle ? { handleDigest: canonicalDigest(handle) } : {}),
+            status: "quiesced",
+            mode: "root_quiescence",
+            processTreeQuiesced: true,
+            registryAbsent: true,
+            processes: inspection?.processes ?? [],
+            completedAt: now,
+            summary,
+          });
+        const outcome =
+          teardown.status === "quiesced" &&
+          Date.parse(teardown.completedAt) >=
+            Date.parse(cancellationIntent.requestedAt)
+            ? "cancelled"
+            : "interrupted";
+        const completedAt = new Date(
+          Math.max(Date.parse(now), Date.parse(teardown.completedAt)),
+        ).toISOString();
+        const terminal = ChildTerminalEvidenceSchema.parse({
+          schemaVersion: SCHEMA_VERSION,
+          outcome,
+          summary,
+          ...(outcome === "interrupted" ? { error: summary } : {}),
+          completedAt,
+        });
+        if (existingTeardown) {
+          this.database
+            .prepare(
+              `UPDATE child_attempts
+               SET status = ?, completed_at = ?, terminal_evidence_json = ?
+               WHERE attempt_id = ? AND status = 'cancelling'`,
+            )
+            .run(outcome, completedAt, sqliteJson(terminal), row.attempt_id);
+        } else {
+          this.database
+            .prepare(
+              `UPDATE child_attempts
+               SET status = ?, completed_at = ?,
+                   runtime_teardown_json = ?, terminal_evidence_json = ?
+               WHERE attempt_id = ? AND status = 'cancelling'`,
+            )
+            .run(
+              outcome,
+              completedAt,
+              sqliteJson(teardown),
+              sqliteJson(terminal),
+              row.attempt_id,
+            );
+        }
+        if (!existingTeardown)
+          this.insertChildRuntimeTeardownEvent(
+            jobId,
+            row.child_id,
+            row.attempt_id,
+            teardown,
+            "root",
+          );
+        this.bumpChildRevision(jobId, row.child_id, completedAt);
+        this.insertEvent(
+          this.newEvent(
+            jobId,
+            outcome === "cancelled"
+              ? "child_attempt_completed"
+              : "child_attempt_interrupted",
+            {
+              childId: row.child_id,
+              attemptId: row.attempt_id,
+              outcome,
+              runtimeStatus: teardown.status,
+              runtimeMode: teardown.mode,
+            },
+          ),
+        );
+      }
+    });
+    await this.projectEvents(jobId);
+    return this.childTreeFromDatabase(jobId);
+  }
+
+  async interruptActiveChildren(
+    jobId: string,
+    reason: string,
+  ): Promise<ChildTreeSnapshot | undefined> {
+    await this.ensureImported(jobId);
+    if (!this.childTreeRow(jobId, false)) return undefined;
+    const now = new Date().toISOString();
+    const summary = reason.slice(0, 8_192);
+    this.transaction("interrupt_active_children", () => {
+      const rows = this.database
+        .prepare(
+          `SELECT child.child_id, attempt.attempt_id, attempt.status,
+                  attempt.native_handle_json, attempt.runtime_inspection_json,
+                  attempt.runtime_teardown_json,
+                  attempt.cancellation_intent_json
+           FROM logical_children AS child
+           JOIN child_attempts AS attempt ON attempt.child_id = child.child_id
+           WHERE child.job_id = ? AND attempt.status IN ('active', 'cancelling')
+             AND attempt.ordinal = (
+               SELECT MAX(latest.ordinal) FROM child_attempts AS latest
+               WHERE latest.child_id = child.child_id
+             )
+           ORDER BY child.wave, child.name`,
+        )
+        .all(jobId) as Array<{
+        child_id: string;
+        attempt_id: string;
+        status: "active" | "cancelling";
+        native_handle_json: string | null;
+        runtime_inspection_json: string | null;
+        runtime_teardown_json: string | null;
+        cancellation_intent_json: string | null;
+      }>;
+      for (const row of rows) {
+        const lease = this.childInferenceLeaseRow(row.attempt_id);
+        if (lease?.status === "active") {
+          this.database
+            .prepare(
+              `UPDATE child_inference_leases
+               SET status = 'revoked', revoked_at = ?, revoke_reason = ?
+               WHERE lease_id = ? AND status = 'active'`,
+            )
+            .run(now, "root worker identity lost", lease.lease_id);
+          this.insertEvent(
+            this.newEvent(jobId, "child_inference_lease_revoked", {
+              childId: row.child_id,
+              attemptId: row.attempt_id,
+              leaseId: lease.lease_id,
+              reason: "root worker identity lost",
+            }),
+          );
+        }
+        const handle = row.native_handle_json
+          ? NativeRlmSpawnHandleSchema.parse(
+              parseSqliteJson(
+                row.native_handle_json,
+                "native child runtime handle",
+              ),
+            )
+          : undefined;
+        const inspection = row.runtime_inspection_json
+          ? ChildRuntimeInspectionSchema.parse(
+              parseSqliteJson(
+                row.runtime_inspection_json,
+                "child runtime inspection",
+              ),
+            )
+          : undefined;
+        const existingTeardown = row.runtime_teardown_json
+          ? ChildRuntimeTeardownEvidenceSchema.parse(
+              parseSqliteJson(
+                row.runtime_teardown_json,
+                "child runtime teardown",
+              ),
+            )
+          : undefined;
+        const cancellationIntent = row.cancellation_intent_json
+          ? ChildCancellationIntentSchema.parse(
+              parseSqliteJson(
+                row.cancellation_intent_json,
+                "child cancellation intent",
+              ),
+            )
+          : undefined;
+        const teardown =
+          existingTeardown ??
+          ChildRuntimeTeardownEvidenceSchema.parse({
+            schemaVersion: SCHEMA_VERSION,
+            ...(handle ? { handleDigest: canonicalDigest(handle) } : {}),
+            status: "uncertain",
+            mode: "worker_death",
+            processTreeQuiesced: false,
+            registryAbsent: false,
+            processes: inspection?.processes ?? [],
+            completedAt: now,
+            summary,
+          });
+        const outcome =
+          row.status === "cancelling" &&
+          cancellationIntent &&
+          teardown.status === "quiesced" &&
+          Date.parse(teardown.completedAt) >=
+            Date.parse(cancellationIntent.requestedAt)
+            ? "cancelled"
+            : "interrupted";
+        const completedAt = new Date(
+          Math.max(Date.parse(now), Date.parse(teardown.completedAt)),
+        ).toISOString();
+        const terminal = ChildTerminalEvidenceSchema.parse({
+          schemaVersion: SCHEMA_VERSION,
+          outcome,
+          summary,
+          ...(outcome === "interrupted" ? { error: summary } : {}),
+          completedAt,
+        });
+        if (existingTeardown) {
+          this.database
+            .prepare(
+              `UPDATE child_attempts
+               SET status = ?, completed_at = ?, terminal_evidence_json = ?
+               WHERE attempt_id = ? AND status IN ('active', 'cancelling')`,
+            )
+            .run(outcome, completedAt, sqliteJson(terminal), row.attempt_id);
+        } else {
+          this.database
+            .prepare(
+              `UPDATE child_attempts
+               SET status = ?, completed_at = ?,
+                   runtime_teardown_json = ?, terminal_evidence_json = ?
+               WHERE attempt_id = ? AND status IN ('active', 'cancelling')`,
+            )
+            .run(
+              outcome,
+              completedAt,
+              sqliteJson(teardown),
+              sqliteJson(terminal),
+              row.attempt_id,
+            );
+        }
+        if (!existingTeardown)
+          this.insertChildRuntimeTeardownEvent(
+            jobId,
+            row.child_id,
+            row.attempt_id,
+            teardown,
+            "worker_reconciliation",
+          );
+        this.bumpChildRevision(jobId, row.child_id, completedAt);
+        this.insertEvent(
+          this.newEvent(
+            jobId,
+            outcome === "cancelled"
+              ? "child_attempt_completed"
+              : "child_attempt_interrupted",
+            {
+              childId: row.child_id,
+              attemptId: row.attempt_id,
+              outcome,
+              reason: summary,
+              processTreeQuiesced: teardown.processTreeQuiesced,
+              runtimeMode: teardown.mode,
+            },
+          ),
+        );
+      }
+    });
+    await this.projectEvents(jobId);
+    return this.childTreeFromDatabase(jobId);
+  }
+
+  async materializeChildEvidence(jobId: string): Promise<string | undefined> {
+    const tree = await this.readChildTree(jobId);
+    if (!tree) return undefined;
+    const events = (await this.readEvents(jobId))
+      .filter((event) => typeof event.data.childId === "string")
+      .slice(-500);
+    return await this.writeArtifact(
+      jobId,
+      "children/evidence.json",
+      `${JSON.stringify({ schemaVersion: SCHEMA_VERSION, tree, events }, null, 2)}\n`,
+    );
   }
 
   async decideChildResult(
@@ -3130,6 +3717,36 @@ export class JobStore {
           }
         : {}),
       ...(inferenceUsage ? { inferenceUsage } : {}),
+      ...(row.cancellation_intent_json
+        ? {
+            cancellationIntent: ChildCancellationIntentSchema.parse(
+              parseSqliteJson(
+                row.cancellation_intent_json,
+                "child cancellation intent",
+              ),
+            ),
+          }
+        : {}),
+      ...(row.runtime_inspection_json
+        ? {
+            runtimeInspection: ChildRuntimeInspectionSchema.parse(
+              parseSqliteJson(
+                row.runtime_inspection_json,
+                "child runtime inspection",
+              ),
+            ),
+          }
+        : {}),
+      ...(row.runtime_teardown_json
+        ? {
+            runtimeTeardown: ChildRuntimeTeardownEvidenceSchema.parse(
+              parseSqliteJson(
+                row.runtime_teardown_json,
+                "child runtime teardown",
+              ),
+            ),
+          }
+        : {}),
       ...(row.terminal_evidence_json
         ? {
             terminalEvidence: parseSqliteJson(
@@ -3147,6 +3764,8 @@ export class JobStore {
         .prepare(
           `SELECT attempt_id, child_id, job_id, ordinal, previous_attempt_id,
                   status, inference_json, native_child_id, native_handle_json,
+                  cancellation_intent_json, runtime_inspection_json,
+                  runtime_teardown_json,
                   started_at, completed_at,
                   terminal_evidence_json
            FROM child_attempts WHERE child_id = ? ORDER BY ordinal`,
@@ -3160,6 +3779,8 @@ export class JobStore {
       .prepare(
         `SELECT attempt_id, child_id, job_id, ordinal, previous_attempt_id,
                 status, inference_json, native_child_id, native_handle_json,
+                cancellation_intent_json, runtime_inspection_json,
+                runtime_teardown_json,
                 started_at, completed_at,
                 terminal_evidence_json
          FROM child_attempts WHERE child_id = ? ORDER BY ordinal DESC LIMIT 1`,
@@ -3370,6 +3991,28 @@ export class JobStore {
       )
       .run(updatedAt, childId);
     this.advanceChildTreeRevision(jobId, updatedAt);
+  }
+
+  private insertChildRuntimeTeardownEvent(
+    jobId: string,
+    childId: string,
+    attemptId: string,
+    evidence: ChildRuntimeTeardownEvidence,
+    source?: "root" | "worker_reconciliation",
+  ): void {
+    this.insertEvent(
+      this.newEvent(jobId, "child_runtime_teardown_recorded", {
+        childId,
+        attemptId,
+        status: evidence.status,
+        mode: evidence.mode,
+        processTreeQuiesced: evidence.processTreeQuiesced,
+        registryAbsent: evidence.registryAbsent,
+        processCount: evidence.processes.length,
+        summary: evidence.summary,
+        ...(source ? { source } : {}),
+      }),
+    );
   }
 
   private assertChildrenJoined(jobId: string): void {

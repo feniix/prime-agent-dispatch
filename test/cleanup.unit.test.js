@@ -48,6 +48,7 @@ function policy(overrides = {}) {
       "report.md",
       "final.diff",
       "inference-usage.json",
+      "children/",
       "checks/",
       "logs/worker.log",
     ],
@@ -77,6 +78,7 @@ async function fixture({ terminal = true } = {}) {
     ["final.diff", "diff\n"],
     ["logs/worker.log", "log\n"],
     ["checks/gate.log", "gate\n"],
+    ["children/evidence.json", '{"schemaVersion":1}\n'],
     ["debug/raw.jsonl", "large disposable evidence\n"],
   ])
     await store.writeArtifact(request.jobId, path, content);
@@ -114,8 +116,12 @@ test("dry-run persists exact decisions and apply preserves minimum evidence", as
     const result = planned.actions.find(
       (action) => action.target === "result.json",
     );
+    const children = planned.actions.find(
+      (action) => action.target === "children/evidence.json",
+    );
     assert.equal(debug.decision, "delete");
     assert.equal(result.decision, "keep");
+    assert.equal(children.decision, "keep");
     const applied = await manager.apply(planned.runId);
     assert.equal(applied.snapshotSha256, planned.snapshotSha256);
     assert.equal(applied.status, "completed");
@@ -132,6 +138,19 @@ test("dry-run persists exact decisions and apply preserves minimum evidence", as
         "utf8",
       ),
       "report\n",
+    );
+    assert.equal(
+      await readFile(
+        join(
+          root,
+          "jobs",
+          request.jobId,
+          "artifacts",
+          "children/evidence.json",
+        ),
+        "utf8",
+      ),
+      '{"schemaVersion":1}\n',
     );
     await manager.store.verifyArtifactIntegrity(request.jobId);
     assert.ok(
