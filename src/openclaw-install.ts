@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
+  chown,
   cp,
+  lchown,
   lstat,
   mkdir,
   readFile,
@@ -838,7 +840,10 @@ async function ensureRealDirectory(
     throw new Error(
       `${owned ? "owned install" : "OpenClaw extensions"} path must be a real directory: ${path}`,
     );
-  if (owned) await chmod(path, 0o700);
+  if (owned) {
+    await establishOwnership(path);
+    await chmod(path, 0o700);
+  }
 }
 
 function acquireInstallLock(
@@ -1445,6 +1450,7 @@ function validateReleaseId(value: string): void {
 
 async function secureTree(path: string): Promise<void> {
   const value = await lstat(path);
+  await establishOwnership(path, value.isSymbolicLink());
   if (value.isSymbolicLink()) return;
   if (value.isDirectory()) {
     await chmod(path, 0o700);
@@ -1453,6 +1459,15 @@ async function secureTree(path: string): Promise<void> {
   } else if (value.isFile()) {
     await chmod(path, 0o600);
   }
+}
+
+async function establishOwnership(
+  path: string,
+  symbolicLink = false,
+): Promise<void> {
+  if (!process.getuid || !process.getgid) return;
+  const update = symbolicLink ? lchown : chown;
+  await update(path, process.getuid(), process.getgid());
 }
 
 async function auditSecureTree(

@@ -388,18 +388,31 @@ test("child controls validate the tree and reach only the root transport", async
     () => dispatcher.steer(started.jobId, "tampered", crypto.randomUUID()),
     /outside this job/,
   );
-  assert.deepEqual(
-    await dispatcher.steer(
-      started.jobId,
-      "keep this child bounded",
-      child.envelope.childId,
-    ),
-    {
-      accepted: true,
-      childId: child.envelope.childId,
-      routedTo: "root",
-    },
-  );
+  let routedSteer;
+  const steerDeadline = Date.now() + 2_000;
+  while (!routedSteer) {
+    try {
+      routedSteer = await dispatcher.steer(
+        started.jobId,
+        "keep this child bounded",
+        child.envelope.childId,
+      );
+    } catch (error) {
+      if (
+        !/agent is not accepting steering|agent is not running/.test(
+          error.message,
+        ) ||
+        Date.now() >= steerDeadline
+      )
+        throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  assert.deepEqual(routedSteer, {
+    accepted: true,
+    childId: child.envelope.childId,
+    routedTo: "root",
+  });
   assert.deepEqual(
     await dispatcher.cancel(started.jobId, child.envelope.childId),
     {

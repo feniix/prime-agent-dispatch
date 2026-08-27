@@ -4,7 +4,9 @@ import {
   appendFile,
   mkdir,
   mkdtemp,
+  realpath,
   readdir,
+  symlink,
   readFile,
   writeFile,
 } from "node:fs/promises";
@@ -35,6 +37,20 @@ async function storeFixture() {
   await store.initialize(request);
   return { root, store, request };
 }
+
+test("state roots are canonicalized before owned paths are derived", async () => {
+  const parent = await mkdtemp(
+    join(tmpdir(), "prime-dispatch-store-canonical-unit-"),
+  );
+  const physicalRoot = join(parent, "physical");
+  const aliasRoot = join(parent, "alias");
+  await mkdir(physicalRoot);
+  await symlink(physicalRoot, aliasRoot, "dir");
+
+  const store = new JobStore(aliasRoot);
+  assert.equal(store.root, await realpath(physicalRoot));
+  store.close();
+});
 
 test("request creation is immutable and exclusive", async () => {
   const { store, request } = await storeFixture();
@@ -138,7 +154,7 @@ test("invalid transitions do not mutate the authoritative snapshot", async () =>
 });
 
 test("artifact paths cannot escape the job artifact directory", async () => {
-  const { store, request, root } = await storeFixture();
+  const { store, request } = await storeFixture();
   await assert.rejects(
     () => store.writeArtifact(request.jobId, "../escaped", "bad"),
     /invalid artifact path/,
@@ -153,7 +169,7 @@ test("artifact paths cannot escape the job artifact directory", async () => {
     "bounded\n",
   );
   assert.equal(await readFile(artifact, "utf8"), "bounded\n");
-  assert.ok(artifact.startsWith(root));
+  assert.ok(artifact.startsWith(store.root));
 });
 
 test("event reads quarantine corrupt projections and repair from SQLite", async () => {

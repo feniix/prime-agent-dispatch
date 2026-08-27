@@ -84,8 +84,8 @@ export class PrimeDispatcher {
   readonly stateRoot: string;
 
   constructor(stateRoot: string) {
-    this.stateRoot = resolve(stateRoot);
-    this.store = new JobStore(this.stateRoot);
+    this.store = new JobStore(resolve(stateRoot));
+    this.stateRoot = this.store.root;
   }
 
   async preview(

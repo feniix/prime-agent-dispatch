@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   chmod,
+  chown,
   lstat,
   mkdir,
   mkdtemp,
@@ -30,6 +31,13 @@ async function writeJson(path, value) {
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "prime-openclaw-lifecycle-"));
+  const inheritedGid = process
+    .getgroups?.()
+    .find((gid) => gid !== process.getgid?.());
+  if (process.getuid && inheritedGid !== undefined) {
+    await chown(root, process.getuid(), inheritedGid);
+    await chmod(root, 0o2770);
+  }
   const openclawStateDir = join(root, "openclaw");
   const sourceRoot = join(root, "source");
   const hostConfigSource = join(root, "acceptance", "host.json");

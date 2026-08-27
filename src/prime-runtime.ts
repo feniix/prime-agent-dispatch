@@ -16,6 +16,10 @@ export async function writePrimeModelsConfig(options: {
   configDir: string;
   brokerBaseUrl: string;
   scopedToken: string;
+  models?: Array<{
+    id: string;
+    reasoning: string[];
+  }>;
 }): Promise<string> {
   await mkdir(options.configDir, { recursive: true, mode: 0o700 });
   const path = join(options.configDir, "models.json");
@@ -26,17 +30,21 @@ export async function writePrimeModelsConfig(options: {
         api: "openai-responses",
         apiKey: options.scopedToken,
         authHeader: true,
-        models: [
-          {
-            id: PRIME_MODEL,
-            name: `${PRIME_MODEL} via scoped host broker`,
-            reasoning: true,
-            input: ["text"],
-            contextWindow: 372_000,
-            maxTokens: 128_000,
-            thinkingLevelMap: { high: PRIME_REASONING_EFFORT },
-          },
-        ],
+        models: (
+          options.models ?? [
+            { id: PRIME_MODEL, reasoning: [PRIME_REASONING_EFFORT] },
+          ]
+        ).map(({ id, reasoning }) => ({
+          id,
+          name: `${id} via scoped host broker`,
+          reasoning: true,
+          input: ["text"],
+          contextWindow: 372_000,
+          maxTokens: 128_000,
+          thinkingLevelMap: Object.fromEntries(
+            reasoning.map((level) => [level, level]),
+          ),
+        })),
       },
     },
   };
