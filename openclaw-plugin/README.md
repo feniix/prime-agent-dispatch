@@ -11,10 +11,11 @@ runtime context. Repository eligibility, fixture classification, gates, Prime
 runtime paths, model, reasoning level, and hard ceilings come from the host
 configuration passed to the standalone CLI.
 
-When the host enables the experimental multi-child policy, the confirmation
-card binds the topology, repository scope, model allowlist, aggregate and
-per-attempt budgets, root reserve, retry limit, and descendant authorization
-into the reviewed request hash. Status cards show at most five children with
+Multi-child policy is enabled by default for host-configured Prime jobs; set
+trusted host policy `multiChild` to `false` to use the single-root fallback.
+The confirmation card binds the topology, repository scope, model allowlist,
+aggregate and per-attempt budgets, root reserve, retry limit, and descendant
+authorization into the reviewed request hash. Status cards show at most five children with
 their role, wave, lifecycle state, inference allocation and usage, retry
 lineage, proposed commit, and decision. Cards are edited in place and recover
 their durable message identity after an adapter restart.

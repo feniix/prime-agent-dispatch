@@ -80,22 +80,6 @@ test(
             releaseArtifact:
               process.env.PRIME_AGENT_TARBALL ?? `${primeAgentRoot}.tgz`,
           },
-          multiChild: {
-            schemaVersion: 1,
-            experimental: true,
-            provider: "openai",
-            models: [
-              { model: "gpt-5.6-sol", reasoning: ["high"] },
-              { model: "gpt-5.6-mini", reasoning: ["medium", "high"] },
-            ],
-            aggregateMaxTokens: 250_000,
-            rootReservePercent: 30,
-            maxTokensPerAttempt: 50_000,
-            maxRequestsPerAttempt: 12,
-            aggregateMaxConcurrency: 3,
-            maxConcurrencyPerAttempt: 1,
-            maxWallClockMsPerAttempt: 8 * 60_000,
-          },
           repositories: [
             {
               path: repository,

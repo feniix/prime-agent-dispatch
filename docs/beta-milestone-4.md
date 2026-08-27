@@ -5,9 +5,9 @@ rollout remains blocked.
 
 ## Delivered boundary
 
-The existing single-root JSONL backend remains the default. An explicit,
-hash-confirmed host policy can instead select the native Prime SDK path and a
-depth-one root-directed child tree.
+Host-configured Prime jobs use the native Prime SDK path and a depth-one
+root-directed child tree by default. Setting trusted host policy `multiChild`
+to `false` selects the existing single-root JSONL backend.
 
 - The host admits at most five logical children, three concurrently active,
   with no child recursion. Implementation, test, and adversarial-review roles
@@ -64,8 +64,10 @@ Unknown usage remains explicit rather than being treated as zero.
 
 ## Remaining boundaries
 
-- Multi-child mode is experimental, disabled by default, and requires both a
-  selected host repository and hash-bound operator confirmation.
+- Multi-child mode is enabled by default for host-configured Prime jobs and
+  still requires both a selected host repository and hash-bound operator
+  confirmation. Trusted host policy can explicitly opt out with
+  `multiChild: false`.
 - The SDK is loaded from the pinned installed Prime artifact only for this
   experimental path. Complete dependency-tree integrity remains issue #2.
 - Current-user execution is not filesystem, process, or network containment.

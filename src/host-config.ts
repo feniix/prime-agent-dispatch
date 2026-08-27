@@ -1,7 +1,10 @@
 import { readFile, realpath } from "node:fs/promises";
 import { z } from "zod";
 import { GateSchema, SCHEMA_VERSION } from "./schemas.js";
-import { ChildInferencePolicySchema } from "./child-inference.js";
+import {
+  ChildInferencePolicySchema,
+  DEFAULT_CHILD_INFERENCE_POLICY,
+} from "./child-inference.js";
 
 export const DEFAULT_MINIMUM_EVIDENCE = [
   "result.json",
@@ -23,6 +26,16 @@ const DEFAULT_RETENTION_POLICY = {
   retainForMsByStatus: DEFAULT_RETENTION_AGES,
   minimumEvidence: [...DEFAULT_MINIMUM_EVIDENCE],
 };
+
+const HostMultiChildPolicySchema = z
+  .union([ChildInferencePolicySchema, z.literal(false)])
+  .default(() => ({
+    ...DEFAULT_CHILD_INFERENCE_POLICY,
+    models: DEFAULT_CHILD_INFERENCE_POLICY.models.map((model) => ({
+      ...model,
+      reasoning: [...model.reasoning],
+    })),
+  }));
 
 export const RetentionPolicySchema = z
   .object({
@@ -76,7 +89,7 @@ export const HostConfigSchema = z
       executable: z.string().min(1),
       releaseArtifact: z.string().min(1),
     }),
-    multiChild: ChildInferencePolicySchema.optional(),
+    multiChild: HostMultiChildPolicySchema,
     retention: RetentionPolicySchema.default(DEFAULT_RETENTION_POLICY),
     repositories: z
       .array(

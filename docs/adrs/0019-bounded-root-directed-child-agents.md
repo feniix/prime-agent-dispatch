@@ -35,15 +35,16 @@ child registry provides host-level scheduling, Git isolation, or containment.
 - Make child state visible through the existing durable control plane and
   Discord adapter.
 - Reconnect an intact live tree and fail closed after uncertain worker death.
-- Preserve the single-root path and keep multi-child execution explicitly
-  experimental until its acceptance evidence exists.
+- Preserve the single-root path as an explicit host-policy fallback after
+  multi-child acceptance evidence exists.
 
 ## Considered options
 
 ### Keep one root session indefinitely
 
-Rejected as the only mode. It remains the stable default, but it does not test
-Prime's native delegation value or parallel specialist work.
+Rejected as the only mode. It remains available through explicit host policy,
+but it does not test Prime's native delegation value or parallel specialist
+work.
 
 ### Raise `RLM_MAX_DEPTH` and rely on Prime's native child lifecycle
 
@@ -65,11 +66,12 @@ Dispatch owns admission, isolation, authorization, evidence, and completion.
 
 ## Decision outcome
 
-Prime Dispatch will add an explicit experimental multi-child mode. Single-root
-execution remains the default. A confirmed job may authorize the root to admit
-bounded descendants without additional per-child confirmation when every
-child remains inside the previewed repository, topology, provider, model,
-budget, and execution-policy envelope.
+Prime Dispatch enables bounded multi-child execution by default for
+host-configured Prime jobs. Setting trusted host policy `multiChild` to `false`
+selects the single-root JSONL fallback. A confirmed job may authorize the root
+to admit bounded descendants without additional per-child confirmation when
+every child remains inside the previewed repository, topology, provider,
+model, budget, and execution-policy envelope.
 
 ### Tree and admission
 
@@ -154,8 +156,8 @@ budget, and execution-policy envelope.
 
 ### Rollout
 
-- Multi-child mode is disabled by default behind an explicit experimental
-  host-policy flag.
+- Multi-child mode is enabled by default for host-configured Prime jobs;
+  trusted host policy can explicitly opt out with `multiChild: false`.
 - The first live acceptance targets the explicitly selected
   `prime-dispatch-prototype` repository and proves implementation, test, and
   adversarial-review children through dependency-aware waves.
