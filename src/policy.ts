@@ -28,6 +28,7 @@ export function buildPrimeEnvironment(options: {
     PRIME_AGENT_CODING_AGENT_DIR: options.configDir ?? options.jobHome,
     PRIME_AGENT_SESSION_DIR:
       options.sessionDir ?? `${options.jobHome}/sessions`,
+    NODE_PATH: undefined,
     RLM_MAX_DEPTH: "0",
     PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1",

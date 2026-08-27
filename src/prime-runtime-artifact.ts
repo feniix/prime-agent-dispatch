@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants, createReadStream } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -190,14 +191,23 @@ export const PrimeRuntimeIdentitySchema = z
 export type PrimeRuntimeIdentity = z.infer<typeof PrimeRuntimeIdentitySchema>;
 
 type RuntimeEntry = z.infer<typeof RuntimeEntrySchema>;
+type ArchiveEntry = { type: string; mode: number };
 
-async function sha256File(path: string): Promise<string> {
+async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
   const hash = createHash("sha256");
-  const file = await import("node:fs").then(({ createReadStream }) =>
-    createReadStream(path),
-  );
-  for await (const chunk of file) hash.update(chunk);
+  const file = createReadStream(path, { signal });
+  for await (const chunk of file) {
+    signal?.throwIfAborted();
+    hash.update(chunk);
+  }
   return hash.digest("hex");
+}
+
+async function lstatIfPresent(path: string) {
+  return await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
 }
 
 function canonicalManifest(manifest: PrimeRuntimeManifest): string {
@@ -261,6 +271,7 @@ async function materializeRuntime(
     }
     if (metadata.isDirectory()) {
       await mkdir(targetPath, { recursive: false, mode: 0o755 });
+      await chmod(targetPath, 0o755);
       entries.push({
         path: logicalPath,
         type: "directory",
@@ -303,6 +314,7 @@ async function verifyOfficialReleaseSource(
     throw new Error("official Prime release is empty");
   const releaseRoot = join(stage, "official-release");
   await mkdir(releaseRoot, { mode: 0o700 });
+  await chmod(releaseRoot, 0o700);
   await extractTar({
     cwd: releaseRoot,
     file: releaseArtifact,
@@ -375,13 +387,8 @@ export async function buildPrimeRuntimeArtifact(options: {
 }> {
   assertRelativeRuntimePath(options.entrypoint);
   const output = resolve(options.output);
-  await lstat(output)
-    .then(() => {
-      throw new Error(`Prime runtime artifact already exists: ${output}`);
-    })
-    .catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
+  if (await lstatIfPresent(output))
+    throw new Error(`Prime runtime artifact already exists: ${output}`);
   await mkdir(dirname(output), { recursive: true, mode: 0o700 });
   const stage = await mkdtemp(join(dirname(output), ".prime-runtime-build-"));
   await chmod(stage, 0o700);
@@ -394,7 +401,20 @@ export async function buildPrimeRuntimeArtifact(options: {
       officialReleaseMetadata.size > MAX_ARTIFACT_BYTES
     )
       throw new Error("official Prime release is not a bounded regular file");
-    const officialReleaseSha256 = await sha256File(options.releaseArtifact);
+    const privateReleaseArtifact = join(stage, "official-release.tgz");
+    await copyFile(
+      options.releaseArtifact,
+      privateReleaseArtifact,
+      constants.COPYFILE_EXCL,
+    );
+    await chmod(privateReleaseArtifact, 0o600);
+    const privateReleaseMetadata = await lstat(privateReleaseArtifact);
+    if (
+      !privateReleaseMetadata.isFile() ||
+      privateReleaseMetadata.size > MAX_ARTIFACT_BYTES
+    )
+      throw new Error("official Prime release is not a bounded regular file");
+    const officialReleaseSha256 = await sha256File(privateReleaseArtifact);
     const expectedOfficialReleaseSha256 =
       options.expectedOfficialReleaseSha256 ?? PRIME_AGENT_SHA256;
     if (officialReleaseSha256 !== expectedOfficialReleaseSha256)
@@ -402,7 +422,7 @@ export async function buildPrimeRuntimeArtifact(options: {
         `official Prime release checksum mismatch: expected ${expectedOfficialReleaseSha256}, got ${officialReleaseSha256}`,
       );
     await verifyOfficialReleaseSource(
-      options.releaseArtifact,
+      privateReleaseArtifact,
       options.sourceDir,
       stage,
     );
@@ -416,6 +436,8 @@ export async function buildPrimeRuntimeArtifact(options: {
     const publication = join(stage, "publication");
     const runtime = join(publication, "runtime");
     await mkdir(runtime, { recursive: true, mode: 0o755 });
+    await chmod(publication, 0o700);
+    await chmod(runtime, 0o755);
     const entries = await materializeRuntime(options.sourceDir, runtime);
     const manifest = PrimeRuntimeManifestSchema.parse({
       schemaVersion: 1,
@@ -433,6 +455,7 @@ export async function buildPrimeRuntimeArtifact(options: {
     const manifestText = canonicalManifest(manifest);
     const manifestPath = join(publication, "prime-runtime-manifest.json");
     await writeFile(manifestPath, manifestText, { mode: 0o644, flag: "wx" });
+    await chmod(manifestPath, 0o644);
     const manifestSha256 = createHash("sha256")
       .update(manifestText)
       .digest("hex");
@@ -458,11 +481,7 @@ export async function buildPrimeRuntimeArtifact(options: {
     );
     if ((await lstat(temporaryArtifact)).size > MAX_ARTIFACT_BYTES)
       throw new Error("Prime runtime artifact exceeds its size limit");
-    await copyFile(
-      temporaryArtifact,
-      output,
-      (await import("node:fs")).constants.COPYFILE_EXCL,
-    );
+    await copyFile(temporaryArtifact, output, constants.COPYFILE_EXCL);
     return {
       artifactPath: output,
       artifactSha256: await sha256File(output),
@@ -482,14 +501,16 @@ function normalizeArchivePath(path: string): string {
 
 async function inspectArchive(
   path: string,
-): Promise<Map<string, { type: string; mode: number }>> {
-  const entries = new Map<string, { type: string; mode: number }>();
+  signal?: AbortSignal,
+): Promise<Map<string, ArchiveEntry>> {
+  const entries = new Map<string, ArchiveEntry>();
   let totalBytes = 0;
   let violation: Error | undefined;
   await listTar({
     file: path,
     strict: true,
     onReadEntry: (entry) => {
+      signal?.throwIfAborted();
       if (violation) return;
       try {
         const name = normalizeArchivePath(entry.path);
@@ -530,8 +551,9 @@ async function inspectArchive(
 async function verifyPublishedRuntime(
   publication: string,
   manifest: PrimeRuntimeManifest,
-  archiveEntries: Map<string, { type: string; mode: number }>,
+  archiveEntries: Map<string, ArchiveEntry>,
   allowLinkCreation: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {
   const expected = new Map<string, RuntimeEntry>(
     manifest.entries
@@ -572,6 +594,7 @@ async function verifyPublishedRuntime(
     throw new Error("published Prime runtime roots have invalid metadata");
   const canonicalPublication = await realpath(publication);
   for (const [archivePath, entry] of expected) {
+    signal?.throwIfAborted();
     const path = join(publication, ...archivePath.split("/"));
     const metadata = await lstat(path);
     const canonical = await realpath(path);
@@ -585,7 +608,7 @@ async function verifyPublishedRuntime(
         throw new Error(`Prime runtime file is missing: ${entry.path}`);
       if (
         metadata.size !== entry.size ||
-        (await sha256File(path)) !== entry.sha256
+        (await sha256File(path, signal)) !== entry.sha256
       )
         throw new Error(`Prime runtime file was modified: ${entry.path}`);
     }
@@ -595,6 +618,7 @@ async function verifyPublishedRuntime(
   const runtimeRoot = join(publication, "runtime");
   const byPath = new Map(manifest.entries.map((entry) => [entry.path, entry]));
   for (const entry of manifest.entries) {
+    signal?.throwIfAborted();
     if (entry.type !== "symlink") continue;
     const target = byPath.get(entry.target!);
     if (!target || target.type === "symlink")
@@ -602,12 +626,7 @@ async function verifyPublishedRuntime(
     const linkPath = join(runtimeRoot, ...entry.path.split("/"));
     const targetPath = join(runtimeRoot, ...entry.target!.split("/"));
     const expectedLink = relative(dirname(linkPath), targetPath);
-    let metadata = await lstat(linkPath).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      },
-    );
+    let metadata = await lstatIfPresent(linkPath);
     if (!metadata) {
       if (!allowLinkCreation)
         throw new Error(`Prime runtime link is missing: ${entry.path}`);
@@ -635,6 +654,7 @@ async function verifyPublishedRuntime(
     logicalDirectory: string,
   ): Promise<void> => {
     for (const name of await readdir(directory)) {
+      signal?.throwIfAborted();
       const logicalPath = logicalDirectory
         ? `${logicalDirectory}/${name}`
         : name;
@@ -726,6 +746,7 @@ export async function preparePrimeRuntime(options: {
   const expectedArtifactSha256 = Sha256Schema.parse(
     options.expectedArtifactSha256,
   );
+  options.signal?.throwIfAborted();
   const cacheDir = resolve(options.cacheDir);
   await mkdir(cacheDir, { recursive: true, mode: 0o700 });
   const cacheMetadata = await lstat(cacheDir);
@@ -747,8 +768,9 @@ export async function preparePrimeRuntime(options: {
     await copyFile(
       options.artifactPath,
       privateArtifact,
-      (await import("node:fs")).constants.COPYFILE_EXCL,
+      constants.COPYFILE_EXCL,
     );
+    options.signal?.throwIfAborted();
     await chmod(privateArtifact, 0o600);
     const artifactMetadata = await lstat(privateArtifact);
     if (
@@ -756,14 +778,18 @@ export async function preparePrimeRuntime(options: {
       artifactMetadata.size > MAX_ARTIFACT_BYTES
     )
       throw new Error("Prime runtime artifact is not a bounded regular file");
-    const artifactSha256 = await sha256File(privateArtifact);
+    const artifactSha256 = await sha256File(privateArtifact, options.signal);
     if (artifactSha256 !== expectedArtifactSha256)
       throw new Error(
         `Prime runtime artifact checksum mismatch: expected ${expectedArtifactSha256}, got ${artifactSha256}`,
       );
-    const archiveEntries = await inspectArchive(privateArtifact);
+    const archiveEntries = await inspectArchive(
+      privateArtifact,
+      options.signal,
+    );
     const publication = join(stage, "publication");
     await mkdir(publication, { mode: 0o700 });
+    await chmod(publication, 0o700);
     await extractTar({
       cwd: publication,
       file: privateArtifact,
@@ -772,7 +798,9 @@ export async function preparePrimeRuntime(options: {
       unlink: false,
       chmod: true,
       processUmask: 0,
+      onReadEntry: () => options.signal?.throwIfAborted(),
     });
+    options.signal?.throwIfAborted();
     const manifestPath = join(publication, "prime-runtime-manifest.json");
     const manifestMetadata = await lstat(manifestPath);
     if (
@@ -801,10 +829,17 @@ export async function preparePrimeRuntime(options: {
       );
     const nodeExecutableSha256 = await sha256File(
       options.nodeExecutable ?? process.execPath,
+      options.signal,
     );
     if (manifest.nodeExecutableSha256 !== nodeExecutableSha256)
       throw new Error("Prime runtime Node executable mismatch");
-    await verifyPublishedRuntime(publication, manifest, archiveEntries, true);
+    await verifyPublishedRuntime(
+      publication,
+      manifest,
+      archiveEntries,
+      true,
+      options.signal,
+    );
     const manifestSha256 = createHash("sha256")
       .update(manifestText)
       .digest("hex");
@@ -831,6 +866,7 @@ export async function preparePrimeRuntime(options: {
     );
     const validationHome = join(stage, "validation-home");
     await mkdir(validationHome, { mode: 0o700 });
+    await chmod(validationHome, 0o700);
     await validatePrimeRuntimeStartup(
       stagedExecutablePath,
       manifest,
@@ -840,8 +876,14 @@ export async function preparePrimeRuntime(options: {
     const target = join(cacheDir, `sha256-${artifactSha256}`);
     const verifyExistingTarget = async (): Promise<void> => {
       const metadata = await lstat(target);
-      if (!metadata.isDirectory() || metadata.isSymbolicLink())
-        throw new Error("pre-existing Prime runtime cache target is unsafe");
+      if (
+        !metadata.isDirectory() ||
+        metadata.isSymbolicLink() ||
+        (metadata.mode & 0o777) !== 0o700
+      )
+        throw new Error(
+          "pre-existing Prime runtime cache target must be a private directory",
+        );
       const canonicalTarget = await realpath(target);
       if (dirname(canonicalTarget) !== canonicalCacheDir)
         throw new Error(
@@ -863,16 +905,12 @@ export async function preparePrimeRuntime(options: {
         existingManifest,
         archiveEntries,
         false,
+        options.signal,
       );
       if (dirname(await realpath(target)) !== canonicalCacheDir)
         throw new Error("pre-existing Prime runtime cache target changed");
     };
-    const existing = await lstat(target).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      },
-    );
+    const existing = await lstatIfPresent(target);
     if (existing) {
       await verifyExistingTarget();
     } else {

@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { c as createTar, x as extractTar } from "tar";
 import {
   PRIME_AGENT_COMMIT,
@@ -121,10 +121,16 @@ test("self-contained Prime runtime builds reproducibly and publishes a verified 
     ...buildOptions,
     output: first,
   });
-  const two = await buildPrimeRuntimeArtifact({
-    ...buildOptions,
-    output: second,
-  });
+  const originalUmask = process.umask(0o077);
+  let two;
+  try {
+    two = await buildPrimeRuntimeArtifact({
+      ...buildOptions,
+      output: second,
+    });
+  } finally {
+    process.umask(originalUmask);
+  }
   assert.equal(one.artifactSha256, two.artifactSha256);
   assert.deepEqual(await readFile(first), await readFile(second));
   await rm(input.sourceDir, { recursive: true });
@@ -151,6 +157,18 @@ test("self-contained Prime runtime builds reproducibly and publishes a verified 
     prepared.executablePath,
     /cache\/sha256-[a-f0-9]{64}\/runtime\//,
   );
+  const cacheTarget = dirname(prepared.runtimeRoot);
+  await chmod(cacheTarget, 0o755);
+  await assert.rejects(
+    () =>
+      preparePrimeRuntime({
+        artifactPath: first,
+        expectedArtifactSha256: one.artifactSha256,
+        cacheDir: join(root, "cache"),
+      }),
+    /must be a private directory/,
+  );
+  await chmod(cacheTarget, 0o700);
   await writeFile(join(prepared.runtimeRoot, "unmanifested"), "surprise\n");
   await assert.rejects(
     () =>
@@ -174,6 +192,18 @@ test("runtime preparation rejects checksum, platform, missing, extra, and modifi
     primeVersion: PRIME_AGENT_VERSION,
     primeCommit: PRIME_AGENT_COMMIT,
   });
+  const cancelled = new AbortController();
+  cancelled.abort(new Error("runtime preparation cancelled"));
+  await assert.rejects(
+    () =>
+      preparePrimeRuntime({
+        artifactPath: artifact,
+        expectedArtifactSha256: built.artifactSha256,
+        cacheDir: join(root, "cancelled"),
+        signal: cancelled.signal,
+      }),
+    /runtime preparation cancelled/,
+  );
   await assert.rejects(
     () =>
       preparePrimeRuntime({
@@ -192,6 +222,26 @@ test("runtime preparation rejects checksum, platform, missing, extra, and modifi
         platform: "not-this-platform",
       }),
     /platform mismatch/,
+  );
+  await assert.rejects(
+    () =>
+      preparePrimeRuntime({
+        artifactPath: artifact,
+        expectedArtifactSha256: built.artifactSha256,
+        cacheDir: join(root, "wrong-architecture"),
+        architecture: "not-this-architecture",
+      }),
+    /architecture mismatch/,
+  );
+  await assert.rejects(
+    () =>
+      preparePrimeRuntime({
+        artifactPath: artifact,
+        expectedArtifactSha256: built.artifactSha256,
+        cacheDir: join(root, "wrong-node-version"),
+        nodeVersion: "v0.0.0",
+      }),
+    /Node version mismatch/,
   );
   const missing = await tamperArtifact(
     root,
@@ -290,6 +340,70 @@ test("runtime preparation rejects links and traversal before publication", async
         cacheDir: join(root, "cache"),
       }),
     /link|unsupported archive entry/,
+  );
+});
+
+test("runtime preparation rejects duplicate and traversal archive entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prime-runtime-archive-"));
+  const input = await fixture(root);
+  const artifact = join(root, "runtime.tgz");
+  await buildPrimeRuntimeArtifact({
+    ...input,
+    output: artifact,
+    entrypoint: "dist/bundle/cli.js",
+    primeVersion: PRIME_AGENT_VERSION,
+    primeCommit: PRIME_AGENT_COMMIT,
+  });
+  const stage = join(root, "duplicate-stage");
+  await mkdir(stage);
+  await extractTar({ cwd: stage, file: artifact, strict: true });
+  const duplicate = join(root, "duplicate.tgz");
+  await createTar(
+    {
+      cwd: stage,
+      file: duplicate,
+      gzip: true,
+      portable: true,
+      noMtime: true,
+      noDirRecurse: true,
+    },
+    ["prime-runtime-manifest.json", "prime-runtime-manifest.json", "runtime"],
+  );
+  const duplicateSha256 = await sha256(duplicate);
+  await assert.rejects(
+    () =>
+      preparePrimeRuntime({
+        artifactPath: duplicate,
+        expectedArtifactSha256: duplicateSha256,
+        cacheDir: join(root, "duplicate-cache"),
+      }),
+    /duplicate archive entry/,
+  );
+
+  await writeFile(join(root, "outside"), "escape\n");
+  const traversalStage = join(root, "traversal-stage");
+  await mkdir(traversalStage);
+  const traversal = join(root, "traversal.tgz");
+  await createTar(
+    {
+      cwd: traversalStage,
+      file: traversal,
+      gzip: true,
+      portable: true,
+      noMtime: true,
+      preservePaths: true,
+    },
+    ["../outside"],
+  );
+  const traversalSha256 = await sha256(traversal);
+  await assert.rejects(
+    () =>
+      preparePrimeRuntime({
+        artifactPath: traversal,
+        expectedArtifactSha256: traversalSha256,
+        cacheDir: join(root, "traversal-cache"),
+      }),
+    /unsafe Prime runtime path/,
   );
 });
 
