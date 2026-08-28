@@ -32,7 +32,7 @@ integration boundary.
 
 ## Deferred issue candidates
 
-### [Add OS-level containment for enforceable network and process policy](https://github.com/feniix/prime-dispatch-prototype/issues/3)
+### [Add OS-level containment for enforceable network and process policy](https://github.com/feniix/prime-agent-dispatch/issues/3)
 
 The Git wrapper, scrubbed credentials, and Git configuration are deterrence and
 defense in depth. Under `unsafe-local`, Prime can invoke an absolute Git binary,
@@ -40,28 +40,28 @@ override Git configuration, use another network client, or start unrelated
 processes. Hard no-remote and hard single-process guarantees require a sandbox,
 container, dedicated account, or equivalent OS enforcement.
 
-### [Add authoritative inference accounting](https://github.com/feniix/prime-dispatch-prototype/issues/4)
+### [Add authoritative inference accounting](https://github.com/feniix/prime-agent-dispatch/issues/4)
 
 Codex subscription usage is visible only when a response reports usage. One
 response can exceed the remaining allowance, aborted responses may not report
 usage, and monetary cost is unavailable. The current limit is a soft observable
 admission ceiling, not exact token or cost enforcement.
 
-### [Complete the OpenClaw adapter boundary](https://github.com/feniix/prime-dispatch-prototype/issues/5)
+### [Complete the OpenClaw adapter boundary](https://github.com/feniix/prime-agent-dispatch/issues/5)
 
 The adapter remains a compile-time contract. It still needs a two-step
 preview/confirmation API, trusted OpenClaw-owned fixture and repository policy,
 host-owned gates, broker/auth ownership, and Discord status components.
 
-### [Add stable worker identity and restart-safe reconnection](https://github.com/feniix/prime-dispatch-prototype/issues/6)
+### [Add stable worker identity and restart-safe reconnection](https://github.com/feniix/prime-agent-dispatch/issues/6)
 
 Workers now bind PID plus process-start identity to a random nonce, private
 socket, protocol version, and identity-bound global lease. CLI startup scans
 nonterminal jobs and reconnects only after a nonce-bound handshake. Explicit
 checkpoint recovery and safe transcript/worktree resume remain tracked by
-[issue #11](https://github.com/feniix/prime-dispatch-prototype/issues/11).
+[issue #11](https://github.com/feniix/prime-agent-dispatch/issues/11).
 
-### [Make terminal persistence transactional](https://github.com/feniix/prime-dispatch-prototype/issues/7)
+### [Make terminal persistence transactional](https://github.com/feniix/prime-agent-dispatch/issues/7)
 
 Terminal intent and reconciliation remove contradictory terminal snapshots and
 results, but files and journal entries are not one atomic transaction. A future

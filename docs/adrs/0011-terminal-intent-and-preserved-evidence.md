@@ -44,7 +44,7 @@ The execution plan records deterministic worktree and branch paths before `git w
 
 ### Confirmation
 
-Tests cover crash-window reconciliation through both status and result reads, edit-then-gate-failure evidence, cancellation evidence, truthful `noChanges`, planned worktree recording, exact journal identity and sequence, and distinct gate log artifacts. A fully transactional store remains tracked by [issue #7](https://github.com/feniix/prime-dispatch-prototype/issues/7).
+Tests cover crash-window reconciliation through both status and result reads, edit-then-gate-failure evidence, cancellation evidence, truthful `noChanges`, planned worktree recording, exact journal identity and sequence, and distinct gate log artifacts. A fully transactional store remains tracked by [issue #7](https://github.com/feniix/prime-agent-dispatch/issues/7).
 
 ## More Information
 

@@ -1,7 +1,14 @@
 {
-  "name": "prime-dispatch-prototype",
+  "name": "prime-agent-dispatch",
   "version": "0.1.0",
   "private": true,
+  "description": "Durable, policy-bound OpenClaw control plane for detached Prime Agent coding jobs.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/feniix/prime-agent-dispatch.git"
+  },
+  "homepage": "https://github.com/feniix/prime-agent-dispatch",
   "packageManager": "pnpm@11.21.0",
   "type": "module",
   "bin": {

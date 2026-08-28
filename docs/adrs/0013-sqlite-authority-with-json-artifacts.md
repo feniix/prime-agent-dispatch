@@ -51,7 +51,7 @@ Existing JSON-only job directories require a lossless, idempotent migration or r
 
 ### Confirmation
 
-Implemented by [issue #7](https://github.com/feniix/prime-dispatch-prototype/issues/7). The control database owns requests, state revisions, ordered events, notification cursors, inference usage, leases, result metadata, artifact digests, migrations, and authority-audit records. Deterministic tests cover independent connections, transaction fault injection before and after commit, atomic terminal materialization and lease release, legacy import, projection regeneration, integrity checks, and corrupt-evidence quarantine.
+Implemented by [issue #7](https://github.com/feniix/prime-agent-dispatch/issues/7). The control database owns requests, state revisions, ordered events, notification cursors, inference usage, leases, result metadata, artifact digests, migrations, and authority-audit records. Deterministic tests cover independent connections, transaction fault injection before and after commit, atomic terminal materialization and lease release, legacy import, projection regeneration, integrity checks, and corrupt-evidence quarantine.
 
 ## More Information
 

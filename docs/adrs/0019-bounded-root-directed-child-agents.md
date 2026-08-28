@@ -159,7 +159,7 @@ model, budget, and execution-policy envelope.
 - Multi-child mode is enabled by default for host-configured Prime jobs;
   trusted host policy can explicitly opt out with `multiChild: false`.
 - The first live acceptance targets the explicitly selected
-  `prime-dispatch-prototype` repository and proves implementation, test, and
+  `prime-agent-dispatch` repository and proves implementation, test, and
   adversarial-review children through dependency-aware waves.
 - Issue #2 now supplies the self-contained runtime. Broader repository rollout
   remains blocked by the containment decisions and implementation in issues #3

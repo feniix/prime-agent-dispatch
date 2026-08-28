@@ -42,7 +42,7 @@ On `agent_end`, the RPC backend stops accepting steering, requests abort, escala
 
 ### Confirmation
 
-Focused tests verify that the process tree exits before `start()` resolves, late steering is rejected, signal exits are recognized, Prime's repeated large tool-result sequence reaches a valid `agent_end`, malformed and over-ceiling terminal records fail closed, oversized control records fail with bounded forensic evidence, and terminal summaries and metadata are bounded. Integration tests verify gate cancellation and truthful terminal outcomes. Enforceable process containment remains tracked by [issue #3](https://github.com/feniix/prime-dispatch-prototype/issues/3).
+Focused tests verify that the process tree exits before `start()` resolves, late steering is rejected, signal exits are recognized, Prime's repeated large tool-result sequence reaches a valid `agent_end`, malformed and over-ceiling terminal records fail closed, oversized control records fail with bounded forensic evidence, and terminal summaries and metadata are bounded. Integration tests verify gate cancellation and truthful terminal outcomes. Enforceable process containment remains tracked by [issue #3](https://github.com/feniix/prime-agent-dispatch/issues/3).
 
 ## More Information
 

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`prime-dispatch-prototype` authorizes a job, launches a detached per-job worker in an isolated Git
+`prime-agent-dispatch` authorizes a job, launches a detached per-job worker in an isolated Git
 worktree, runs a Prime agent inside it, verifies the result through structured gates, and preserves
 the evidence. It is a **prototype**: no feature flags, no compatibility shims, no deprecation
 windows — change the code and its tests together and delete what the change replaces.
