@@ -165,20 +165,57 @@ jobs:
         run: |
           set -euo pipefail
           profile="$RUNNER_TEMP/online-profile"
+          gateway_log="$RUNNER_TEMP/online-gateway.log"
+          expected_runtime="$profile/prime-dispatch/runtime/sha256-$RUNTIME_SHA256.tgz"
+          expected_policy="$profile/prime-dispatch/config/host.json"
           mkdir -p "$profile"
           printf '{"version":1,"socket":{},"defaults":{},"agents":{}}\n' > "$profile/exec-approvals.json"
           OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
             pnpm --dir openclaw-plugin exec openclaw plugins install "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET"
           OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw gateway run \
+              --allow-unconfigured --auth none --bind loopback --port 19081 --compact \
+              > "$gateway_log" 2>&1 &
+          gateway_pid=$!
+          stop_gateway() {
+            if kill -0 "$gateway_pid" 2>/dev/null; then kill -INT "$gateway_pid"; fi
+            wait "$gateway_pid" || true
+          }
+          trap stop_gateway EXIT
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$gateway_pid" 2>/dev/null; then
+              cat "$gateway_log"
+              wait "$gateway_pid"
+              exit 1
+            fi
+            if test -f "$expected_runtime" && test -f "$expected_policy" && grep -Fq '[gateway] ready' "$gateway_log"; then
+              break
+            fi
+            sleep 1
+          done
+          test -f "$expected_runtime"
+          test -f "$expected_policy"
+          grep -Fq '[gateway] ready' "$gateway_log"
+          printf '%s  %s\n' "$RUNTIME_SHA256" "$expected_runtime" | shasum -a 256 -c -
+          test "$(stat -f '%Lp' "$expected_runtime")" = 600
+          jq -e --arg runtime "$expected_runtime" --arg sha "$RUNTIME_SHA256" \
+            '.repoRoots == [] and .repositories == [] and .prime.runtimeArtifact == $runtime and .prime.runtimeArtifactSha256 == $sha' \
+            "$expected_policy"
+          OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
             pnpm --dir openclaw-plugin exec openclaw plugins inspect prime-dispatch --runtime --json \
             > "$RUNNER_TEMP/plugin-release/online-acceptance.json"
           OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
             pnpm --dir openclaw-plugin exec openclaw plugins doctor
+          stop_gateway
+          trap - EXIT
 
       - name: Install and initialize the offline artifact in a clean profile
         run: |
           set -euo pipefail
           profile="$RUNNER_TEMP/offline-profile"
+          gateway_log="$RUNNER_TEMP/offline-gateway.log"
+          expected_runtime="$profile/prime-dispatch/runtime/sha256-$RUNTIME_SHA256.tgz"
+          expected_policy="$profile/prime-dispatch/config/host.json"
           mkdir -p "$profile"
           printf '{"version":1,"socket":{},"defaults":{},"agents":{}}\n' > "$profile/exec-approvals.json"
           NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
@@ -186,11 +223,43 @@ jobs:
             pnpm --dir openclaw-plugin exec openclaw plugins install "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET"
           NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
             OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw gateway run \
+              --allow-unconfigured --auth none --bind loopback --port 19082 --compact \
+              > "$gateway_log" 2>&1 &
+          gateway_pid=$!
+          stop_gateway() {
+            if kill -0 "$gateway_pid" 2>/dev/null; then kill -INT "$gateway_pid"; fi
+            wait "$gateway_pid" || true
+          }
+          trap stop_gateway EXIT
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$gateway_pid" 2>/dev/null; then
+              cat "$gateway_log"
+              wait "$gateway_pid"
+              exit 1
+            fi
+            if test -f "$expected_runtime" && test -f "$expected_policy" && grep -Fq '[gateway] ready' "$gateway_log"; then
+              break
+            fi
+            sleep 1
+          done
+          test -f "$expected_runtime"
+          test -f "$expected_policy"
+          grep -Fq '[gateway] ready' "$gateway_log"
+          printf '%s  %s\n' "$RUNTIME_SHA256" "$expected_runtime" | shasum -a 256 -c -
+          test "$(stat -f '%Lp' "$expected_runtime")" = 600
+          jq -e --arg runtime "$expected_runtime" --arg sha "$RUNTIME_SHA256" \
+            '.repoRoots == [] and .repositories == [] and .prime.runtimeArtifact == $runtime and .prime.runtimeArtifactSha256 == $sha' \
+            "$expected_policy"
+          NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
+            OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
             pnpm --dir openclaw-plugin exec openclaw plugins inspect prime-dispatch --runtime --json \
             > "$RUNNER_TEMP/plugin-release/offline-acceptance.json"
           NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
             OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
             pnpm --dir openclaw-plugin exec openclaw plugins doctor
+          stop_gateway
+          trap - EXIT
 
       - name: Generate online package SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
