@@ -10,6 +10,13 @@ import {
   parseReleaseVersion,
 } from "../scripts/bump-release.mjs";
 
+const RELEASE_PATHS = [
+  "release/release.json",
+  "package.json",
+  "openclaw-plugin/package.json",
+  "openclaw-plugin/openclaw.plugin.json",
+];
+
 const roots = [];
 
 afterEach(async () => {
@@ -78,6 +85,44 @@ test("bump updates package identities and preserves the runtime contract", async
   );
 });
 
+test("a failed write restores every package identity", async () => {
+  const root = await fixture();
+  const before = await snapshot(root);
+  let writes = 0;
+  await assert.rejects(
+    bumpRelease({
+      root,
+      version: "0.1.0-rc.2",
+      writeDocument: async (path, source) => {
+        writes += 1;
+        await writeFile(path, source);
+        if (writes === 3) throw new Error("injected package write failure");
+      },
+    }),
+    /injected package write failure/,
+  );
+  assert.deepEqual(await snapshot(root), before);
+});
+
+test("a failed post-write validation restores every package identity", async () => {
+  const root = await fixture();
+  const before = await snapshot(root);
+  let validations = 0;
+  await assert.rejects(
+    bumpRelease({
+      root,
+      version: "0.1.0-rc.2",
+      validate: async () => {
+        validations += 1;
+        if (validations === 2) throw new Error("injected validation failure");
+      },
+    }),
+    /injected validation failure/,
+  );
+  assert.equal(validations, 2);
+  assert.deepEqual(await snapshot(root), before);
+});
+
 test("bump rejects non-increasing versions and existing identity drift", async () => {
   const root = await fixture();
   await assert.rejects(
@@ -141,11 +186,6 @@ async function json(root, path) {
 
 async function snapshot(root) {
   return Promise.all(
-    [
-      "release/release.json",
-      "package.json",
-      "openclaw-plugin/package.json",
-      "openclaw-plugin/openclaw.plugin.json",
-    ].map((path) => readFile(join(root, path), "utf8")),
+    RELEASE_PATHS.map((path) => readFile(join(root, path), "utf8")),
   );
 }

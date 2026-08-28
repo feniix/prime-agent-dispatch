@@ -75,7 +75,14 @@ export function expectedPackageArtifacts(release, version) {
   };
 }
 
-export async function bumpRelease({ root, version, dryRun = false }) {
+export async function bumpRelease({
+  root,
+  version,
+  dryRun = false,
+  validate,
+  writeDocument = atomicWrite,
+}) {
+  if (validate) await validate();
   parseReleaseVersion(version);
   const releaseFile = await readJsonFile(root, RELEASE_PATH);
   const release = releaseFile.value;
@@ -111,6 +118,7 @@ export async function bumpRelease({ root, version, dryRun = false }) {
     {
       path: RELEASE_PATH,
       value: nextRelease,
+      originalSource: releaseFile.source,
       source: replaceJsonStringProperties(releaseFile.source, [
         ["packageVersion", currentVersion, version],
         ["packageReleaseTag", `v${currentVersion}`, `v${version}`],
@@ -121,6 +129,7 @@ export async function bumpRelease({ root, version, dryRun = false }) {
     ...versionedFiles.map((file) => ({
       path: file.path,
       value: { ...file.value, version },
+      originalSource: file.source,
       source: replaceJsonStringProperties(file.source, [
         ["version", currentVersion, version],
       ]),
@@ -133,14 +142,52 @@ export async function bumpRelease({ root, version, dryRun = false }) {
       `${update.path} generated an unexpected document`,
     );
   if (!dryRun)
-    for (const update of updates)
-      await atomicWrite(resolve(root, update.path), update.source);
+    await applyUpdatesWithRollback(root, updates, {
+      validate,
+      writeDocument,
+    });
   return {
     currentVersion,
     nextVersion: version,
     dryRun,
     files: updates.map((update) => update.path),
   };
+}
+
+async function applyUpdatesWithRollback(
+  root,
+  updates,
+  { validate, writeDocument },
+) {
+  const completed = [];
+  let attempted;
+  try {
+    for (const update of updates) {
+      attempted = update;
+      await writeDocument(resolve(root, update.path), update.source);
+      completed.push(update);
+      attempted = undefined;
+    }
+    if (validate) await validate();
+  } catch (error) {
+    const rollbackErrors = [];
+    const rollback = attempted ? [...completed, attempted] : completed;
+    for (const update of rollback.reverse()) {
+      const path = resolve(root, update.path);
+      try {
+        if ((await readFile(path, "utf8")) !== update.originalSource)
+          await atomicWrite(path, update.originalSource);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0)
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        "release bump failed and its original files could not be restored",
+      );
+    throw error;
+  }
 }
 
 async function readJsonFile(root, path) {
@@ -199,9 +246,12 @@ async function main(arguments_) {
   );
   if (positional.length !== 1 || unknown.length > 0) throw new Error(usage());
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  await runReleaseCheck(root);
-  const result = await bumpRelease({ root, version: positional[0], dryRun });
-  if (!dryRun) await runReleaseCheck(root);
+  const result = await bumpRelease({
+    root,
+    version: positional[0],
+    dryRun,
+    validate: () => runReleaseCheck(root),
+  });
   process.stdout.write(
     `${result.dryRun ? "would bump" : "bumped"} package release ${result.currentVersion} -> ${result.nextVersion}\n${result.files.join("\n")}\n`,
   );
