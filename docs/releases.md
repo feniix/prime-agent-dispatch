@@ -5,7 +5,7 @@ Prime Agent Dispatch publishes two separate immutable release identities from th
 - `prime-runtime-v0.8.0-r1` contains the checksum-pinned Prime Agent runtime for Darwin arm64 and exact Node `24.18.0`.
 - `v0.1.0-rc.1` contains native online and offline OpenClaw plugin archives for OpenClaw `2026.7.1` on that target.
 
-[`release/release.json`](../release/release.json) is the machine-readable release contract. It pins the upstream Prime archive, reviewed Prime dependency lockfile, runtime release identity, supported host, package names, and release-candidate version. Changing any of those values requires a new immutable tag and asset name.
+[`release/release.json`](../release/release.json) is the machine-readable release contract. It pins the upstream Prime archive, reviewed Prime dependency lockfile and native-build policy, runtime release identity, supported host, package names, and release-candidate version. Changing any of those values requires a new immutable tag and asset name.
 
 ## Publication order
 

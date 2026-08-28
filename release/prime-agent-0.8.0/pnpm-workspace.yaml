@@ -1,0 +1,5 @@
+allowBuilds:
+  "@google/genai": true
+  koffi: true
+  protobufjs: true
+  zeromq: true
