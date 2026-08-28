@@ -1,0 +1,281 @@
+name: Release OpenClaw plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-openclaw-plugin
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build, attest, and publish Darwin arm64 plugins
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Install repository-pinned pnpm
+        uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Load and validate the release contract
+        id: contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          test "$(node -p 'process.version')" = "v$(jq -r '.target.nodeVersion' release/release.json)"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = "true"
+          pnpm run release:check
+          {
+            printf 'PACKAGE_VERSION=%s\n' "$(jq -r '.packageVersion' release/release.json)"
+            printf 'PACKAGE_RELEASE_TAG=%s\n' "$(jq -r '.packageReleaseTag' release/release.json)"
+            printf 'RUNTIME_RELEASE_TAG=%s\n' "$(jq -r '.primeAgent.runtimeReleaseTag' release/release.json)"
+            printf 'RUNTIME_ASSET=%s\n' "$(jq -r '.primeAgent.runtimeAsset' release/release.json)"
+            printf 'OPENCLAW_VERSION=%s\n' "$(jq -r '.target.openclawVersion' release/release.json)"
+            printf 'ONLINE_ASSET=%s\n' "$(jq -r '.artifacts.online' release/release.json)"
+            printf 'OFFLINE_ASSET=%s\n' "$(jq -r '.artifacts.offline' release/release.json)"
+          } >> "$GITHUB_ENV"
+          {
+            printf 'online_asset=%s\n' "$(jq -r '.artifacts.online' release/release.json)"
+            printf 'offline_asset=%s\n' "$(jq -r '.artifacts.offline' release/release.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reject an existing package release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$PACKAGE_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $PACKAGE_RELEASE_TAG already exists" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$PACKAGE_RELEASE_TAG" >/dev/null 2>&1; then
+            echo "tag $PACKAGE_RELEASE_TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Install project and adapter dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir openclaw-plugin install --frozen-lockfile
+
+      - name: Download and authenticate the immutable Prime runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RUNTIME_RELEASE_TAG" --jq '.immutable')" = "true"
+          mkdir -p "$RUNNER_TEMP/plugin-release"
+          gh release download "$RUNTIME_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$RUNTIME_ASSET" \
+            --dir "$RUNNER_TEMP/plugin-release"
+          gh release download "$RUNTIME_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/plugin-release/runtime-checksum"
+          (
+            cd "$RUNNER_TEMP/plugin-release"
+            shasum -a 256 -c runtime-checksum/SHA256SUMS
+          )
+          gh attestation verify "$RUNNER_TEMP/plugin-release/$RUNTIME_ASSET" \
+            --repo "$GITHUB_REPOSITORY"
+          printf 'RUNTIME_SHA256=%s\n' "$(shasum -a 256 "$RUNNER_TEMP/plugin-release/$RUNTIME_ASSET" | awk '{print $1}')" >> "$GITHUB_ENV"
+          printf 'RUNTIME_URL=https://github.com/%s/releases/download/%s/%s\n' \
+            "$GITHUB_REPOSITORY" "$RUNTIME_RELEASE_TAG" "$RUNTIME_ASSET" >> "$GITHUB_ENV"
+
+      - name: Build and reproduce both native plugin variants
+        run: |
+          set -euo pipefail
+          pnpm run build
+          pnpm run test:adapter
+          node dist/openclaw-host.js package-build \
+            --variant online \
+            --source-commit "$GITHUB_SHA" \
+            --openclaw-version "$OPENCLAW_VERSION" \
+            --release-id "$PACKAGE_RELEASE_TAG" \
+            --prime-runtime "$RUNNER_TEMP/plugin-release/$RUNTIME_ASSET" \
+            --prime-runtime-sha256 "$RUNTIME_SHA256" \
+            --prime-runtime-url "$RUNTIME_URL" \
+            --output "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET" \
+            > "$RUNNER_TEMP/plugin-release/online-build.json"
+          node dist/openclaw-host.js package-build \
+            --variant offline \
+            --source-commit "$GITHUB_SHA" \
+            --openclaw-version "$OPENCLAW_VERSION" \
+            --release-id "$PACKAGE_RELEASE_TAG" \
+            --prime-runtime "$RUNNER_TEMP/plugin-release/$RUNTIME_ASSET" \
+            --prime-runtime-sha256 "$RUNTIME_SHA256" \
+            --output "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET" \
+            > "$RUNNER_TEMP/plugin-release/offline-build.json"
+          mkdir "$RUNNER_TEMP/reproduction"
+          umask 077
+          node dist/openclaw-host.js package-build \
+            --variant online \
+            --source-commit "$GITHUB_SHA" \
+            --openclaw-version "$OPENCLAW_VERSION" \
+            --release-id "$PACKAGE_RELEASE_TAG" \
+            --prime-runtime "$RUNNER_TEMP/plugin-release/$RUNTIME_ASSET" \
+            --prime-runtime-sha256 "$RUNTIME_SHA256" \
+            --prime-runtime-url "$RUNTIME_URL" \
+            --output "$RUNNER_TEMP/reproduction/$ONLINE_ASSET" \
+            > "$RUNNER_TEMP/reproduction/online-build.json"
+          node dist/openclaw-host.js package-build \
+            --variant offline \
+            --source-commit "$GITHUB_SHA" \
+            --openclaw-version "$OPENCLAW_VERSION" \
+            --release-id "$PACKAGE_RELEASE_TAG" \
+            --prime-runtime "$RUNNER_TEMP/plugin-release/$RUNTIME_ASSET" \
+            --prime-runtime-sha256 "$RUNTIME_SHA256" \
+            --output "$RUNNER_TEMP/reproduction/$OFFLINE_ASSET" \
+            > "$RUNNER_TEMP/reproduction/offline-build.json"
+          cmp "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET" "$RUNNER_TEMP/reproduction/$ONLINE_ASSET"
+          cmp "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET" "$RUNNER_TEMP/reproduction/$OFFLINE_ASSET"
+          tar -xOf "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET" prime-dispatch-package.json \
+            > "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET.manifest.json"
+          tar -xOf "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET" prime-dispatch-package.json \
+            > "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET.manifest.json"
+          (
+            cd "$RUNNER_TEMP/plugin-release"
+            shasum -a 256 "$ONLINE_ASSET" "$OFFLINE_ASSET" > SHA256SUMS
+          )
+
+      - name: Install and initialize the online artifact in a clean profile
+        run: |
+          set -euo pipefail
+          profile="$RUNNER_TEMP/online-profile"
+          mkdir -p "$profile"
+          printf '{"version":1,"socket":{},"defaults":{},"agents":{}}\n' > "$profile/exec-approvals.json"
+          OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw plugins install "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET"
+          OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw plugins inspect prime-dispatch --runtime --json \
+            > "$RUNNER_TEMP/plugin-release/online-acceptance.json"
+          OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw plugins doctor
+
+      - name: Install and initialize the offline artifact in a clean profile
+        run: |
+          set -euo pipefail
+          profile="$RUNNER_TEMP/offline-profile"
+          mkdir -p "$profile"
+          printf '{"version":1,"socket":{},"defaults":{},"agents":{}}\n' > "$profile/exec-approvals.json"
+          NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
+            OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw plugins install "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET"
+          NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
+            OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw plugins inspect prime-dispatch --runtime --json \
+            > "$RUNNER_TEMP/plugin-release/offline-acceptance.json"
+          NODE_OPTIONS="--require=$GITHUB_WORKSPACE/scripts/deny-network.cjs" \
+            OPENCLAW_STATE_DIR="$profile" OPENCLAW_CONFIG_PATH="$profile/openclaw.json" \
+            pnpm --dir openclaw-plugin exec openclaw plugins doctor
+
+      - name: Generate online package SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.online_asset }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.online_asset }}.spdx.json
+          syft-version: v1.51.1
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate offline package SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.offline_asset }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.offline_asset }}.spdx.json
+          syft-version: v1.51.1
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest plugin build provenance
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: |
+            ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.online_asset }}
+            ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.offline_asset }}
+
+      - name: Attest online package SBOM
+        uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+        with:
+          subject-path: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.online_asset }}
+          sbom-path: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.online_asset }}.spdx.json
+
+      - name: Attest offline package SBOM
+        uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+        with:
+          subject-path: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.offline_asset }}
+          sbom-path: ${{ runner.temp }}/plugin-release/${{ steps.contract.outputs.offline_asset }}.spdx.json
+
+      - name: Publish the immutable plugin prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg releaseTag "$PACKAGE_RELEASE_TAG" \
+            --arg sourceCommit "$GITHUB_SHA" \
+            --arg runtimeReleaseTag "$RUNTIME_RELEASE_TAG" \
+            --arg runtimeSha256 "$RUNTIME_SHA256" \
+            --arg nodeVersion "$(node -p 'process.version')" \
+            --arg openclawVersion "$OPENCLAW_VERSION" \
+            '{schemaVersion:1, releaseTag:$releaseTag, sourceCommit:$sourceCommit, runtimeReleaseTag:$runtimeReleaseTag, runtimeSha256:$runtimeSha256, target:{platform:"darwin",architecture:"arm64",nodeVersion:$nodeVersion,openclawVersion:$openclawVersion}}' \
+            > "$RUNNER_TEMP/plugin-release/release-metadata.json"
+          cat > "$RUNNER_TEMP/plugin-release/RELEASE.md" <<EOF
+          Prime Agent Dispatch $PACKAGE_VERSION release candidate for OpenClaw $OPENCLAW_VERSION on Darwin arm64 and Node $(node -p 'process.version').
+
+          Install the offline artifact:
+
+          \`openclaw plugins install ./$OFFLINE_ASSET\`
+
+          Verify either artifact with:
+
+          \`gh attestation verify <artifact> --repo "$GITHUB_REPOSITORY"\`
+          EOF
+          gh release create "$PACKAGE_RELEASE_TAG" \
+            "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET" \
+            "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET" \
+            "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET.manifest.json" \
+            "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET.manifest.json" \
+            "$RUNNER_TEMP/plugin-release/$ONLINE_ASSET.spdx.json" \
+            "$RUNNER_TEMP/plugin-release/$OFFLINE_ASSET.spdx.json" \
+            "$RUNNER_TEMP/plugin-release/SHA256SUMS" \
+            "$RUNNER_TEMP/plugin-release/release-metadata.json" \
+            "$RUNNER_TEMP/plugin-release/online-acceptance.json" \
+            "$RUNNER_TEMP/plugin-release/offline-acceptance.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Prime Agent Dispatch $PACKAGE_VERSION" \
+            --notes-file "$RUNNER_TEMP/plugin-release/RELEASE.md" \
+            --prerelease \
+            --draft
+          gh release edit "$PACKAGE_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PACKAGE_RELEASE_TAG" --jq '.immutable')" = "true"

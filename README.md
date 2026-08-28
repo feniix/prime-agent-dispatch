@@ -34,7 +34,7 @@ Prime Agent is the coding runtime. Prime Agent Dispatch supplies the trusted orc
 
 ## Install the OpenClaw plugin
 
-Public release artifacts have not been published yet. The commands below apply to locally accepted packages and will remain the installation path once signed GitHub Release artifacts are available.
+Release candidates are published as immutable GitHub Releases with checksums, SPDX SBOMs, build provenance, and SBOM attestations. Prefer the offline artifact for the smallest installation trust surface.
 
 Requirements:
 
@@ -42,11 +42,21 @@ Requirements:
 - A package built for the host platform, architecture, and exact Node version
 - Git
 
-Install either the online or offline release artifact:
+Download the release assets, verify them, and install either the online or offline artifact:
 
 ```bash
-shasum -a 256 ./prime-dispatch-openclaw-plugin-<release>-offline.tgz
-openclaw plugins install ./prime-dispatch-openclaw-plugin-<release>-offline.tgz
+gh release download v0.1.0-rc.1 \
+  --repo feniix/prime-agent-dispatch \
+  --pattern 'prime-dispatch-openclaw-*.tgz' \
+  --pattern SHA256SUMS
+
+shasum -a 256 -c SHA256SUMS
+gh attestation verify \
+  prime-dispatch-openclaw-v0.1.0-rc.1-darwin-arm64-node-24.18.0-offline.tgz \
+  --repo feniix/prime-agent-dispatch
+
+openclaw plugins install \
+  ./prime-dispatch-openclaw-v0.1.0-rc.1-darwin-arm64-node-24.18.0-offline.tgz
 openclaw gateway restart
 ```
 
@@ -84,7 +94,7 @@ Repository authorization is desired-state configuration: removing `hostPolicy` r
 - Node.js: `24` or newer for development; deployment packages bind the exact Node version
 - Package targets: currently native Darwin arm64; additional targets require native builders and matching Prime runtimes
 
-The control plane is beta-quality and extensively tested, but broad rollout remains blocked on a contained execution backend. Artifact signing and public release provenance are also pending. Read the [security assessment](docs/security-assessment/2026-08-27.md) before running non-fixture jobs.
+The control plane is beta-quality and extensively tested, but broad rollout remains blocked on a contained execution backend. Read the [security assessment](docs/security-assessment/2026-08-27.md) before running non-fixture jobs.
 
 ## Development
 
@@ -110,6 +120,7 @@ Ordinary tests use deterministic fixtures and no real Prime binary or provider c
 - [Technical overview and prototype status](docs/technical-overview.md)
 - [OpenClaw deployment and package building](docs/openclaw-host-lifecycle.md)
 - [Prime runtime artifacts](docs/prime-runtime-artifacts.md)
+- [Release process and verification](docs/releases.md)
 - [Security assessment](docs/security-assessment/2026-08-27.md)
 - [Architecture decisions](docs/adrs/README.md)
 - [Child Git integration](docs/child-git-integration.md)

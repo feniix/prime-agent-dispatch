@@ -11,7 +11,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { initializeNativePlugin } from "./installation.js";
+import {
+  initializeNativePlugin,
+  validateRuntimeRedirect,
+} from "./installation.js";
 
 const roots: string[] = [];
 
@@ -68,6 +71,49 @@ async function fixture(options: { corruptDigest?: boolean } = {}) {
 }
 
 describe("native OpenClaw plugin initialization", () => {
+  it("allows only same-origin and GitHub release-asset redirects", () => {
+    const github = new URL(
+      "https://github.com/feniix/prime-agent-dispatch/releases/download/runtime/runtime.tgz",
+    );
+    expect(() =>
+      validateRuntimeRedirect(
+        github,
+        github,
+        new URL(
+          "https://release-assets.githubusercontent.com/github-production-release-asset/runtime.tgz",
+        ),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateRuntimeRedirect(
+        github,
+        github,
+        new URL("https://github.com/another-path"),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateRuntimeRedirect(
+        github,
+        github,
+        new URL("https://attacker.example/runtime.tgz"),
+      ),
+    ).toThrow("rejected redirect");
+    expect(() =>
+      validateRuntimeRedirect(
+        github,
+        new URL("https://release-assets.githubusercontent.com/first"),
+        new URL("https://release-assets.githubusercontent.com/second"),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateRuntimeRedirect(
+        github,
+        new URL("https://release-assets.githubusercontent.com/first"),
+        new URL("https://github.com/second"),
+      ),
+    ).toThrow("rejected redirect");
+  });
+
   it("installs the embedded runtime and a private fail-closed host policy", async () => {
     const value = await fixture();
     await initializeNativePlugin({
