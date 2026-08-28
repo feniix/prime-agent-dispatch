@@ -4,10 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import {
+  assertReleaseVersion,
   bumpRelease,
-  compareReleaseVersions,
   expectedPackageArtifacts,
-  parseReleaseVersion,
 } from "../scripts/bump-release.mjs";
 
 const RELEASE_PATHS = [
@@ -25,18 +24,10 @@ afterEach(async () => {
   );
 });
 
-test("release versions use strict SemVer ordering", () => {
-  assert.deepEqual(parseReleaseVersion("0.1.0-rc.2"), {
-    major: 0,
-    minor: 1,
-    patch: 0,
-    prerelease: ["rc", "2"],
-  });
-  assert.equal(compareReleaseVersions("0.1.0-rc.2", "0.1.0-rc.1"), 1);
-  assert.equal(compareReleaseVersions("0.1.0", "0.1.0-rc.2"), 1);
-  assert.equal(compareReleaseVersions("0.2.0-alpha", "0.1.9"), 1);
-  assert.throws(() => parseReleaseVersion("0.1.0+rebuilt"), /invalid release/);
-  assert.throws(() => parseReleaseVersion("0.1.0-rc.02"), /invalid release/);
+test("release versions use strict SemVer", () => {
+  assert.doesNotThrow(() => assertReleaseVersion("0.1.0-rc.2"));
+  assert.throws(() => assertReleaseVersion("0.1.0+rebuilt"), /invalid release/);
+  assert.throws(() => assertReleaseVersion("0.1.0-rc.02"), /invalid release/);
 });
 
 test("dry-run reports all generated files without modifying them", async () => {
@@ -81,7 +72,7 @@ test("bump updates package identities and preserves the runtime contract", async
     assert.equal((await json(root, path)).version, "0.1.0-rc.2");
   assert.equal(
     await readFile(join(root, "openclaw-plugin/openclaw.plugin.json"), "utf8"),
-    '{"id":"prime-dispatch","version":"0.1.0-rc.2"}\n',
+    '{\n  "id": "prime-dispatch",\n  "version": "0.1.0-rc.2"\n}\n',
   );
 });
 

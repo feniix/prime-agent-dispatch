@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  assertReleaseVersion,
   expectedPackageArtifacts,
-  parseReleaseVersion,
 } from "./bump-release.mjs";
 
 const root = new URL("../", import.meta.url);
@@ -16,7 +16,7 @@ const plugin = await readJson("openclaw-plugin/package.json");
 const manifest = await readJson("openclaw-plugin/openclaw.plugin.json");
 
 assert.equal(release.schemaVersion, 1);
-parseReleaseVersion(release.packageVersion);
+assertReleaseVersion(release.packageVersion);
 assert.equal(core.version, release.packageVersion);
 assert.equal(plugin.version, release.packageVersion);
 assert.equal(manifest.version, release.packageVersion);
