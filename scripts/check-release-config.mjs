@@ -26,6 +26,13 @@ assert.equal(
   createHash("sha256").update(lockfile).digest("hex"),
   release.primeAgent.lockfileSha256,
 );
+const workspacePolicy = await readFile(
+  new URL(release.primeAgent.workspacePolicy, root),
+);
+assert.equal(
+  createHash("sha256").update(workspacePolicy).digest("hex"),
+  release.primeAgent.workspacePolicySha256,
+);
 
 const releaseSource = await readFile(new URL("src/release.ts", root), "utf8");
 assert.match(

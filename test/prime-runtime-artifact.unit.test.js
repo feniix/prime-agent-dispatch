@@ -109,8 +109,39 @@ async function tamperArtifact(root, artifact, name, mutate) {
 test("self-contained Prime runtime builds reproducibly and publishes a verified identity", async () => {
   const root = await mkdtemp(join(tmpdir(), "prime-runtime-artifact-"));
   const input = await fixture(root);
+  const otherRoot = await mkdtemp(join(tmpdir(), "prime-runtime-artifact-"));
+  const otherInput = await fixture(otherRoot);
+  for (const [fixtureInput, fixtureRoot] of [
+    [input, root],
+    [otherInput, otherRoot],
+  ]) {
+    await mkdir(join(fixtureInput.sourceDir, "node_modules", ".bin"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(fixtureInput.sourceDir, "node_modules", ".bin", "generated"),
+      `#!/bin/sh\nexec ${fixtureRoot}/generated\n`,
+    );
+    await writeFile(
+      join(fixtureInput.sourceDir, "node_modules", ".modules.yaml"),
+      `storeDir: ${fixtureRoot}/store\n`,
+    );
+    await mkdir(join(fixtureInput.sourceDir, "dist", "skills", "__pycache__"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(
+        fixtureInput.sourceDir,
+        "dist",
+        "skills",
+        "__pycache__",
+        "generated.cpython-311.pyc",
+      ),
+      fixtureRoot,
+    );
+  }
   const first = join(root, "first.tgz");
-  const second = join(root, "second.tgz");
+  const second = join(otherRoot, "second.tgz");
   const buildOptions = {
     ...input,
     entrypoint: "dist/bundle/cli.js",
@@ -125,7 +156,10 @@ test("self-contained Prime runtime builds reproducibly and publishes a verified 
   let two;
   try {
     two = await buildPrimeRuntimeArtifact({
-      ...buildOptions,
+      ...otherInput,
+      entrypoint: "dist/bundle/cli.js",
+      primeVersion: PRIME_AGENT_VERSION,
+      primeCommit: PRIME_AGENT_COMMIT,
       output: second,
     });
   } finally {
@@ -133,6 +167,20 @@ test("self-contained Prime runtime builds reproducibly and publishes a verified 
   }
   assert.equal(one.artifactSha256, two.artifactSha256);
   assert.deepEqual(await readFile(first), await readFile(second));
+  const inspection = join(root, "inspection");
+  await mkdir(inspection);
+  await extractTar({ cwd: inspection, file: first, strict: true });
+  const manifest = JSON.parse(
+    await readFile(join(inspection, "prime-runtime-manifest.json"), "utf8"),
+  );
+  assert.equal(
+    manifest.entries.some((entry) =>
+      /(?:__pycache__|\.py[co]$|node_modules\/\.bin|node_modules\/(?:\.modules\.yaml|\.package-map\.json|\.pnpm\/lock\.yaml|\.pnpm-workspace-state-v1\.json))/.test(
+        entry.path,
+      ),
+    ),
+    false,
+  );
   await rm(input.sourceDir, { recursive: true });
 
   const prepared = await preparePrimeRuntime({
@@ -179,6 +227,7 @@ test("self-contained Prime runtime builds reproducibly and publishes a verified 
       }),
     /missing, extra, or unmanifested content/,
   );
+  await rm(otherRoot, { recursive: true, force: true });
 });
 
 test("runtime preparation rejects checksum, platform, missing, extra, and modified content", async () => {

@@ -248,8 +248,9 @@ async function materializeRuntime(
   const visit = async (
     sourcePath: string,
     logicalPath: string,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     assertRelativeRuntimePath(logicalPath);
+    if (excludeRuntimeBuildArtifact(logicalPath)) return false;
     const metadata = await lstat(sourcePath);
     const targetPath = join(targetRoot, ...logicalPath.split("/"));
     if (metadata.isSymbolicLink()) {
@@ -267,9 +268,10 @@ async function materializeRuntime(
         size: 0,
         target,
       });
-      return;
+      return true;
     }
     if (metadata.isDirectory()) {
+      const entryIndex = entries.length;
       await mkdir(targetPath, { recursive: false, mode: 0o755 });
       await chmod(targetPath, 0o755);
       entries.push({
@@ -279,9 +281,16 @@ async function materializeRuntime(
         size: 0,
       });
       const children = (await readdir(sourcePath)).sort();
+      let includedChildren = 0;
       for (const child of children)
-        await visit(join(sourcePath, child), `${logicalPath}/${child}`);
-      return;
+        if (await visit(join(sourcePath, child), `${logicalPath}/${child}`))
+          includedChildren += 1;
+      if (includedChildren === 0) {
+        await rm(targetPath, { recursive: true, force: false });
+        entries.splice(entryIndex, 1);
+        return false;
+      }
+      return true;
     }
     if (!metadata.isFile())
       throw new Error(`unsupported Prime runtime source file: ${logicalPath}`);
@@ -295,6 +304,7 @@ async function materializeRuntime(
       size: metadata.size,
       sha256: await sha256File(targetPath),
     });
+    return true;
   };
 
   for (const child of (await readdir(canonicalRoot)).sort())
@@ -302,6 +312,21 @@ async function materializeRuntime(
   return entries.sort((left, right) =>
     left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
   );
+}
+
+const RUNTIME_BUILD_ARTIFACTS = new Set([
+  "node_modules/.modules.yaml",
+  "node_modules/.package-map.json",
+  "node_modules/.pnpm/lock.yaml",
+  "node_modules/.pnpm-workspace-state-v1.json",
+]);
+
+function excludeRuntimeBuildArtifact(path: string): boolean {
+  const parts = path.split("/");
+  const name = parts.at(-1)!;
+  if (parts.includes("__pycache__") || /\.py[co]$/.test(name)) return true;
+  if (path.startsWith("node_modules/") && parts.includes(".bin")) return true;
+  return RUNTIME_BUILD_ARTIFACTS.has(path);
 }
 
 async function verifyOfficialReleaseSource(
