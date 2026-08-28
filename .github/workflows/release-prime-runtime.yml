@@ -46,7 +46,6 @@ jobs:
           test "$(uname -s)" = "Darwin"
           test "$(uname -m)" = "arm64"
           test "$(node -p 'process.version')" = "v$(jq -r '.target.nodeVersion' release/release.json)"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = "true"
           pnpm run release:check
           {
             printf 'PRIME_VERSION=%s\n' "$(jq -r '.primeAgent.version' release/release.json)"

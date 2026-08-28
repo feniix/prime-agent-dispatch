@@ -9,7 +9,7 @@ Prime Agent Dispatch publishes two separate immutable release identities from th
 
 ## Publication order
 
-Both workflows must run from `main` on GitHub-hosted `macos-15` arm64. They reject a reused tag or release, require repository release immutability, pin every action to a full commit SHA, and publish a draft only after all build, reproduction, installation, SBOM, and attestation checks pass.
+Both workflows must run from `main` on GitHub-hosted `macos-15` arm64. They reject a reused tag or release, pin every action to a full commit SHA, and publish a draft only after all build, reproduction, installation, SBOM, and attestation checks pass. Repository release immutability must be enabled before publication; each workflow verifies the published release's authoritative `.immutable` value before reporting success.
 
 1. Run **Release Prime runtime**.
 2. Verify that `prime-runtime-v0.8.0-r1` is immutable.
