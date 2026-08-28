@@ -59,7 +59,7 @@ for (const name of releaseWorkflows) {
   assert.match(source, new RegExp(`runs-on: ${release.target.runner}`));
   assert.match(source, /attestations:\s*write/);
   assert.match(source, /id-token:\s*write/);
-  assert.match(source, /immutable-releases/);
+  assert.match(source, /--jq '\.immutable'/);
   assert.doesNotMatch(source, /ADR-0022|0022-/);
 }
 
