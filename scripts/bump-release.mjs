@@ -1,0 +1,206 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import semver from "semver";
+
+const RELEASE_PATH = "release/release.json";
+const VERSION_PATHS = [
+  "package.json",
+  "openclaw-plugin/package.json",
+  "openclaw-plugin/openclaw.plugin.json",
+];
+const execFileAsync = promisify(execFile);
+
+export function assertReleaseVersion(value) {
+  if (
+    typeof value !== "string" ||
+    value.includes("+") ||
+    semver.valid(value) !== value
+  )
+    throw new Error(
+      `invalid release version ${JSON.stringify(value)}; expected SemVer without build metadata`,
+    );
+}
+
+export function expectedPackageArtifacts(release, version) {
+  const target = release.target;
+  assert.equal(typeof target?.platform, "string");
+  assert.equal(typeof target?.architecture, "string");
+  assert.equal(typeof target?.nodeVersion, "string");
+  const prefix = `prime-dispatch-openclaw-v${version}-${target.platform}-${target.architecture}-node-${target.nodeVersion}`;
+  return {
+    online: `${prefix}-online.tgz`,
+    offline: `${prefix}-offline.tgz`,
+  };
+}
+
+export async function bumpRelease({
+  root,
+  version,
+  dryRun = false,
+  validate,
+  writeDocument = atomicWrite,
+}) {
+  if (validate) await validate();
+  assertReleaseVersion(version);
+  const releaseFile = await readJsonFile(root, RELEASE_PATH);
+  const release = releaseFile.value;
+  const versionedFiles = await Promise.all(
+    VERSION_PATHS.map((path) => readJsonFile(root, path)),
+  );
+  const currentVersion = release.packageVersion;
+  assertReleaseVersion(currentVersion);
+  if (!semver.gt(version, currentVersion))
+    throw new Error(
+      `new release version ${version} must be greater than ${currentVersion}`,
+    );
+  assert.equal(release.packageReleaseTag, `v${currentVersion}`);
+  assert.deepEqual(
+    release.artifacts,
+    expectedPackageArtifacts(release, currentVersion),
+  );
+  for (const file of versionedFiles)
+    assert.equal(
+      file.value.version,
+      currentVersion,
+      `${file.path} version must match ${RELEASE_PATH}`,
+    );
+
+  const nextRelease = {
+    ...release,
+    packageVersion: version,
+    packageReleaseTag: `v${version}`,
+    artifacts: expectedPackageArtifacts(release, version),
+  };
+  const updates = [
+    {
+      path: RELEASE_PATH,
+      originalSource: releaseFile.source,
+      source: jsonSource(nextRelease),
+    },
+    ...versionedFiles.map((file) => ({
+      path: file.path,
+      originalSource: file.source,
+      source: jsonSource({ ...file.value, version }),
+    })),
+  ];
+  if (!dryRun)
+    await applyUpdatesWithRollback(root, updates, {
+      validate,
+      writeDocument,
+    });
+  return {
+    currentVersion,
+    nextVersion: version,
+    dryRun,
+    files: updates.map((update) => update.path),
+  };
+}
+
+async function applyUpdatesWithRollback(
+  root,
+  updates,
+  { validate, writeDocument },
+) {
+  const completed = [];
+  let attempted;
+  try {
+    for (const update of updates) {
+      attempted = update;
+      await writeDocument(resolve(root, update.path), update.source);
+      completed.push(update);
+      attempted = undefined;
+    }
+    if (validate) await validate();
+  } catch (error) {
+    const rollbackErrors = [];
+    const rollback = attempted ? [...completed, attempted] : completed;
+    for (const update of rollback.reverse()) {
+      const path = resolve(root, update.path);
+      try {
+        if ((await readFile(path, "utf8")) !== update.originalSource)
+          await atomicWrite(path, update.originalSource);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0)
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        "release bump failed and its original files could not be restored",
+      );
+    throw error;
+  }
+}
+
+async function readJsonFile(root, path) {
+  const source = await readFile(resolve(root, path), "utf8");
+  return { path, source, value: JSON.parse(source) };
+}
+
+function jsonSource(value) {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+async function atomicWrite(path, source) {
+  const temporary = `${path}.release-bump-${process.pid}.tmp`;
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(temporary, source, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+function usage() {
+  return "usage: pnpm release:bump <version> [--dry-run]";
+}
+
+async function main(arguments_) {
+  if (arguments_.includes("--help")) {
+    process.stdout.write(`${usage()}\n`);
+    return;
+  }
+  const dryRun = arguments_.includes("--dry-run");
+  const positional = arguments_.filter((argument) => argument !== "--dry-run");
+  const unknown = arguments_.filter(
+    (argument) => argument.startsWith("-") && argument !== "--dry-run",
+  );
+  if (positional.length !== 1 || unknown.length > 0) throw new Error(usage());
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const result = await bumpRelease({
+    root,
+    version: positional[0],
+    dryRun,
+    validate: () => runReleaseCheck(root),
+  });
+  process.stdout.write(
+    `${result.dryRun ? "would bump" : "bumped"} package release ${result.currentVersion} -> ${result.nextVersion}\n${result.files.join("\n")}\n`,
+  );
+}
+
+async function runReleaseCheck(root) {
+  await execFileAsync(
+    process.execPath,
+    [resolve(root, "scripts/check-release-config.mjs")],
+    { cwd: root, encoding: "utf8" },
+  );
+}
+
+if (
+  process.argv[1] &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+)
+  main(process.argv.slice(2)).catch((error) => {
+    process.stderr.write(
+      `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = 1;
+  });

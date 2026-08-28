@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  assertReleaseVersion,
+  expectedPackageArtifacts,
+} from "./bump-release.mjs";
 
 const root = new URL("../", import.meta.url);
 const readJson = async (path) =>
@@ -12,10 +16,15 @@ const plugin = await readJson("openclaw-plugin/package.json");
 const manifest = await readJson("openclaw-plugin/openclaw.plugin.json");
 
 assert.equal(release.schemaVersion, 1);
+assertReleaseVersion(release.packageVersion);
 assert.equal(core.version, release.packageVersion);
 assert.equal(plugin.version, release.packageVersion);
 assert.equal(manifest.version, release.packageVersion);
 assert.equal(release.packageReleaseTag, `v${release.packageVersion}`);
+assert.deepEqual(
+  release.artifacts,
+  expectedPackageArtifacts(release, release.packageVersion),
+);
 assert.equal(
   (await readFile(new URL(".node-version", root), "utf8")).trim(),
   release.target.nodeVersion,
