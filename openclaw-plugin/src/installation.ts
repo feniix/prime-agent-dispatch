@@ -248,24 +248,27 @@ async function downloadRuntime(
   urlValue: string,
   destination: string,
 ): Promise<void> {
-  const url = new URL(urlValue);
-  const loopback =
-    url.hostname === "localhost" ||
-    url.hostname === "127.0.0.1" ||
-    url.hostname === "[::1]";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+  const initialUrl = new URL(urlValue);
+  validateRuntimeUrl(initialUrl);
+  const signal = AbortSignal.timeout(300_000);
+  let url = initialUrl;
+  let response: Response | undefined;
+  for (let redirects = 0; redirects <= 3; redirects += 1) {
+    response = await fetch(url, { redirect: "manual", signal });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+    if (redirects === 3)
+      throw new Error("Prime runtime download exceeded its redirect limit");
+    const location = response.headers.get("location");
+    if (!location)
+      throw new Error("Prime runtime download redirect has no location");
+    const target = new URL(location, url);
+    validateRuntimeUrl(target);
+    validateRuntimeRedirect(initialUrl, url, target);
+    url = target;
+  }
+  if (!response || !response.ok || !response.body)
     throw new Error(
-      "Prime runtime download must use HTTPS (HTTP is allowed only for loopback acceptance)",
-    );
-  if (url.username || url.password)
-    throw new Error("Prime runtime URL cannot contain credentials");
-  const response = await fetch(url, {
-    redirect: "error",
-    signal: AbortSignal.timeout(300_000),
-  });
-  if (!response.ok || !response.body)
-    throw new Error(
-      `Prime runtime download failed with HTTP ${response.status}`,
+      `Prime runtime download failed with HTTP ${response?.status ?? "unknown"}`,
     );
   const contentLength = response.headers.get("content-length");
   if (contentLength && Number(contentLength) > MAX_RUNTIME_BYTES)
@@ -293,6 +296,41 @@ async function downloadRuntime(
   } finally {
     await handle.close();
   }
+}
+
+function validateRuntimeUrl(url: URL): void {
+  const loopback =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+    throw new Error(
+      "Prime runtime download must use HTTPS (HTTP is allowed only for loopback acceptance)",
+    );
+  if (url.username || url.password)
+    throw new Error("Prime runtime URL cannot contain credentials");
+  if (url.protocol === "https:" && url.port && url.port !== "443")
+    throw new Error("Prime runtime HTTPS URL must use the default port");
+}
+
+export function validateRuntimeRedirect(
+  initialUrl: URL,
+  sourceUrl: URL,
+  targetUrl: URL,
+): void {
+  if (sourceUrl.origin === targetUrl.origin) return;
+  if (
+    initialUrl.protocol === "https:" &&
+    initialUrl.hostname === "github.com" &&
+    sourceUrl.hostname === "github.com" &&
+    targetUrl.protocol === "https:" &&
+    targetUrl.hostname === "release-assets.githubusercontent.com" &&
+    !targetUrl.port
+  )
+    return;
+  throw new Error(
+    `Prime runtime download rejected redirect from ${sourceUrl.origin} to ${targetUrl.origin}`,
+  );
 }
 
 async function sha256File(path: string): Promise<string> {

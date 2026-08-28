@@ -38,7 +38,7 @@ Install a built online or offline artifact through OpenClaw's native plugin
 installer:
 
 ```bash
-openclaw plugins install ./prime-dispatch-openclaw-plugin-<release>-offline.tgz
+openclaw plugins install ./prime-dispatch-openclaw-<release>-offline.tgz
 openclaw gateway restart
 ```
 

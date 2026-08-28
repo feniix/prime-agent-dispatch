@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.1.0-rc.1",
+  "packageReleaseTag": "v0.1.0-rc.1",
+  "primeAgent": {
+    "version": "0.8.0",
+    "commit": "8d7deeab5861bf9d77bde3d8511046a5c799818d",
+    "officialUrl": "https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.8.0/prime-agent-0.8.0.tgz",
+    "officialSha256": "f5b0093c7e0fddb73f94773d74383585456adfa84f12a4082d3098f23bb8fab6",
+    "lockfile": "release/prime-agent-0.8.0/pnpm-lock.yaml",
+    "lockfileSha256": "c63544b7d17c23b86409202e0365d725f7674e13f5bf32e0beb40412a84609d3",
+    "runtimeReleaseTag": "prime-runtime-v0.8.0-r1",
+    "runtimeAsset": "prime-agent-0.8.0-darwin-arm64-node-24.18.0.runtime.tgz"
+  },
+  "target": {
+    "runner": "macos-15",
+    "platform": "darwin",
+    "architecture": "arm64",
+    "nodeVersion": "24.18.0",
+    "openclawVersion": "2026.7.1"
+  },
+  "artifacts": {
+    "online": "prime-dispatch-openclaw-v0.1.0-rc.1-darwin-arm64-node-24.18.0-online.tgz",
+    "offline": "prime-dispatch-openclaw-v0.1.0-rc.1-darwin-arm64-node-24.18.0-offline.tgz"
+  },
+  "syftVersion": "v1.51.1"
+}
