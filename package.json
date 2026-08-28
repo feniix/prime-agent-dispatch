@@ -30,6 +30,7 @@
     "test:live": "PRIME_DISPATCH_LIVE_ACCEPTANCE=1 node --test --test-concurrency=1 test/live-prime.acceptance.test.js test/live-prime-cancellation.acceptance.test.js test/live-prime-multichild.acceptance.test.js",
     "pretest:live:multi-child": "tsc -p tsconfig.json",
     "test:live:multi-child": "PRIME_DISPATCH_LIVE_MULTI_CHILD_ACCEPTANCE=1 node --test --test-concurrency=1 test/live-prime-multichild.acceptance.test.js",
+    "release:bump": "node scripts/bump-release.mjs",
     "release:check": "node scripts/check-release-config.mjs",
     "test:adapter": "corepack pnpm --dir openclaw-plugin run build && corepack pnpm --dir openclaw-plugin test"
   },

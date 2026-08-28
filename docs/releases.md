@@ -7,6 +7,21 @@ Prime Agent Dispatch publishes two separate immutable release identities from th
 
 [`release/release.json`](../release/release.json) is the machine-readable release contract. It pins the upstream Prime archive, reviewed Prime dependency lockfile and native-build policy, runtime release identity, supported host, package names, and release-candidate version. Changing any of those values requires a new immutable tag and asset name.
 
+## Preparing a package release
+
+Use the repository bump command instead of editing duplicated package identities by hand:
+
+```bash
+pnpm release:bump 0.1.0-rc.2 --dry-run
+pnpm release:bump 0.1.0-rc.2
+```
+
+The command requires a strictly greater SemVer version, derives the package release tag and both
+target-specific artifact names, updates the root and plugin package versions, and preserves the
+Prime runtime identity. A real bump runs `release:check` before returning. Commit the generated
+files in the release preparation PR. A new Prime runtime release remains a separate deliberate
+change to the runtime fields in `release/release.json`.
+
 ## Publication order
 
 Both workflows must run from `main` on GitHub-hosted `macos-15` arm64. They reject a reused tag or release, pin every action to a full commit SHA, and publish a draft only after all build, reproduction, installation, SBOM, and attestation checks pass. Repository release immutability must be enabled before publication; each workflow verifies the published release's authoritative `.immutable` value before reporting success.
