@@ -82,11 +82,11 @@ Uninstall disables the owned entry and removes activation links, but preserves r
 
 ### Confirmation
 
-[PR #23](https://github.com/feniix/prime-dispatch-prototype/pull/23) implemented the versioned lifecycle, stable paths, exact config planning, upgrade, rollback, audit, and state-preserving uninstall. [PR #25](https://github.com/feniix/prime-dispatch-prototype/pull/25) extended release verification to the complete published trees, enforced canonical symlink containment and process-bound lock recovery, propagated OpenClaw profile identity, and removed the remaining plugin dependency advisory.
+[PR #23](https://github.com/feniix/prime-agent-dispatch/pull/23) implemented the versioned lifecycle, stable paths, exact config planning, upgrade, rollback, audit, and state-preserving uninstall. [PR #25](https://github.com/feniix/prime-agent-dispatch/pull/25) extended release verification to the complete published trees, enforced canonical symlink containment and process-bound lock recovery, propagated OpenClaw profile identity, and removed the remaining plugin dependency advisory.
 
 Deterministic lifecycle tests cover idempotence, upgrades, rollback, configuration-only changes, failure restoration, state migration, permissions, path ownership, tampering, PID reuse, uninstall, and audit. The clean-host lifecycle acceptance exercises install, repeat install, audit, and state-preserving uninstall through the real lifecycle CLI.
 
-[Issue #21](https://github.com/feniix/prime-dispatch-prototype/issues/21) remains open only for managed-Gateway restart evidence and one fresh durable-install Discord preview-to-notification flow. Those are rollout confirmation gaps; they do not change the accepted host-layout and lifecycle decision.
+[Issue #21](https://github.com/feniix/prime-agent-dispatch/issues/21) remains open only for managed-Gateway restart evidence and one fresh durable-install Discord preview-to-notification flow. Those are rollout confirmation gaps; they do not change the accepted host-layout and lifecycle decision.
 
 ## More Information
 

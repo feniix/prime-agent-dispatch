@@ -47,7 +47,7 @@ The installed OpenClaw adapter must derive owner identity and delivery context f
 
 ### Confirmation
 
-Tests cover invalid hashes, mutation after preview, mutation across await boundaries, host-owned fixture defaults, rejection of `--yes` for real Prime, and a real disposable fixture launched through two-step confirmation. The standalone CLI implements the decision. The installed OpenClaw/Discord adapter remains tracked by [issue #5](https://github.com/feniix/prime-dispatch-prototype/issues/5).
+Tests cover invalid hashes, mutation after preview, mutation across await boundaries, host-owned fixture defaults, rejection of `--yes` for real Prime, and a real disposable fixture launched through two-step confirmation. The standalone CLI implements the decision. The installed OpenClaw/Discord adapter remains tracked by [issue #5](https://github.com/feniix/prime-agent-dispatch/issues/5).
 
 ## More Information
 

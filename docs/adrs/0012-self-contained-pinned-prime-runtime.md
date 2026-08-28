@@ -44,7 +44,7 @@ The former separately checked archive and ambient installed entrypoint path are 
 
 ### Confirmation
 
-Implementation in [issue #2](https://github.com/feniix/prime-dispatch-prototype/issues/2) added a reproducible artifact builder, strict archive preflight and complete manifest verification, atomic digest-addressed publication, ambient dependency isolation, persisted runtime identity, tamper coverage, and live Prime acceptance.
+Implementation in [issue #2](https://github.com/feniix/prime-agent-dispatch/issues/2) added a reproducible artifact builder, strict archive preflight and complete manifest verification, atomic digest-addressed publication, ambient dependency isolation, persisted runtime identity, tamper coverage, and live Prime acceptance.
 
 ## More Information
 

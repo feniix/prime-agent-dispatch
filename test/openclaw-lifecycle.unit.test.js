@@ -95,7 +95,7 @@ async function fixture() {
 async function writeSource(sourceRoot, marker) {
   await writeFileTree(sourceRoot, {
     "dist/cli.js": `// runtime ${marker}\n`,
-    "package.json": JSON.stringify({ name: "prime-dispatch-prototype" }),
+    "package.json": JSON.stringify({ name: "prime-agent-dispatch" }),
     "pnpm-lock.yaml": `lockfileVersion: '${marker}'\n`,
     "openclaw-plugin/dist/index.js": `// plugin ${marker}\n`,
     "openclaw-plugin/openclaw.plugin.json": JSON.stringify({

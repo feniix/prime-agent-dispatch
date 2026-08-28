@@ -115,7 +115,7 @@ await mkdir("dist", { recursive: true });
 await writeFile("dist/cli.js", "// compiled runtime\\n");
 `,
     "package.json": JSON.stringify({
-      name: "prime-dispatch-prototype",
+      name: "prime-agent-dispatch",
       version: "0.1.0",
       packageManager: "pnpm@11.21.0",
       scripts: { build: "node build.mjs" },

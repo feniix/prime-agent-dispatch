@@ -39,7 +39,7 @@ cd /var/lib/evie-agent/downloads/prime-agent-0.7.2/package
 corepack pnpm config set --location=project --json allowBuilds \
   '{"@google/genai":true,"koffi":true,"protobufjs":true,"zeromq":true}'
 corepack pnpm --config.blockExoticSubdeps=false install --prod
-cd /var/lib/evie-agent/src/prime-dispatch-prototype
+cd /path/to/prime-agent-dispatch
 node spikes/001-codex-subscription/run.mjs
 ```
 
